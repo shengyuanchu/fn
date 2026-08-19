@@ -615,15 +615,29 @@ fn buildAnthropicRequestBody(
 
     try out.writer.writeAll(",\"messages\":[");
     var wrote_message = false;
-    for (request.messages, 0..) |message, index| {
+    var index: usize = 0;
+    while (index < request.messages.len) {
         try checkBudget(request.budget);
-        if (message.role == .system) continue;
+        const message = request.messages[index];
+        if (message.role == .system) {
+            index += 1;
+            continue;
+        }
         if (wrote_message) try out.writer.writeByte(',');
+        if (message.role == .tool) {
+            var end = index + 1;
+            while (end < request.messages.len and request.messages[end].role == .tool) : (end += 1) {}
+            try writeAnthropicToolResultMessage(&out.writer, request.messages[index..end], request.budget);
+            index = end;
+            wrote_message = true;
+            continue;
+        }
         const verified_images = if (request.verified_images) |images|
             if (index + 1 == request.messages.len) images else null
         else
             null;
         try writeAnthropicMessage(alloc, &out.writer, message, verified_images, request.budget);
+        index += 1;
         wrote_message = true;
     }
     try out.writer.writeByte(']');
@@ -711,20 +725,39 @@ fn writeAnthropicMessage(
             }
         },
         .tool => {
-            try writer.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
-            try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
-            try writer.writeAll(",\"content\":");
-            try std.json.Stringify.value(message.content orelse "", .{}, writer);
-            if (message.tool_result_status == .failure) {
-                try writer.writeAll(",\"is_error\":true");
-            }
-            try writer.writeByte('}');
+            try writeAnthropicToolResultPart(writer, message);
             wrote_part = true;
         },
     }
 
     if (!wrote_part) try writeAnthropicTextPart(writer, "");
     try writer.writeAll("]}");
+}
+
+fn writeAnthropicToolResultMessage(
+    writer: *std.Io.Writer,
+    messages: []const types.ChatMessage,
+    budget: ?agent_stream_provider.BuildBudget,
+) !void {
+    try writer.writeAll("{\"role\":\"user\",\"content\":[");
+    for (messages, 0..) |message, result_index| {
+        try checkBudget(budget);
+        std.debug.assert(message.role == .tool);
+        if (result_index > 0) try writer.writeByte(',');
+        try writeAnthropicToolResultPart(writer, message);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeAnthropicToolResultPart(writer: *std.Io.Writer, message: types.ChatMessage) !void {
+    try writer.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
+    try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
+    try writer.writeAll(",\"content\":");
+    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+    if (message.tool_result_status == .failure) {
+        try writer.writeAll(",\"is_error\":true");
+    }
+    try writer.writeByte('}');
 }
 
 fn writeAnthropicTextPart(writer: *std.Io.Writer, text: []const u8) !void {
@@ -1752,6 +1785,44 @@ test "Anthropic request converts system tools and tool results" {
     const tool = parsed.value.object.get("tools").?.array.items[0];
     try std.testing.expectEqualStrings("read_file", tool.object.get("name").?.string);
     try std.testing.expect(tool.object.get("input_schema") != null);
+}
+
+test "Anthropic request groups parallel tool results into one user message" {
+    const calls = [_]types.ToolCall{
+        .{ .id = "toolu_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+        .{ .id = "toolu_2", .name = "list_files", .arguments_json = "{\"path\":\"b\"}" },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Inspect both paths." },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "toolu_1", .tool_name = "read_file", .content = "preflight failed", .tool_result_status = .failure },
+        .{ .role = .tool, .tool_call_id = "toolu_2", .tool_name = "list_files", .content = "[]", .tool_result_status = .success },
+    };
+    const body = try buildAgentRequestForProtocol(
+        std.testing.allocator,
+        .{
+            .model = "deepseek-v4-flash",
+            .serialized_tools = "[]",
+            .messages = &messages,
+            .tool_choice = .none,
+            .provider_options = .{},
+        },
+        .anthropic_messages,
+    );
+    defer std.testing.allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const messages_json = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), messages_json.len);
+    try std.testing.expectEqualStrings("assistant", messages_json[1].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages_json[2].object.get("role").?.string);
+    const results = messages_json[2].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("toolu_1", results[0].object.get("tool_use_id").?.string);
+    try std.testing.expect(results[0].object.get("is_error").?.bool);
+    try std.testing.expectEqualStrings("toolu_2", results[1].object.get("tool_use_id").?.string);
+    try std.testing.expect(results[1].object.get("is_error") == null);
 }
 
 test "OpenAI-compatible stream accumulates text tools and usage" {
