@@ -23,6 +23,16 @@ const Protocol = enum {
     anthropic_messages,
 };
 
+const ProviderKind = enum {
+    openai,
+    anthropic,
+};
+
+const ConfiguredEndpoint = struct {
+    kind: ProviderKind,
+    url: []const u8,
+};
+
 fn configuredUrlForEnv(env_name: []const u8) ?[]const u8 {
     const raw = io_mod.getenv(env_name) orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -38,23 +48,130 @@ pub fn enabled() bool {
     return configuredUrl() != null;
 }
 
-fn configuredProtocol() !Protocol {
+fn configuredEndpoint() !ConfiguredEndpoint {
     const openai_url = configuredUrlForEnv(openai_endpoint_env);
     const anthropic_url = configuredUrlForEnv(anthropic_endpoint_env);
     if (openai_url != null and anthropic_url != null) {
         return error.ConflictingDirectProviderEndpoints;
     }
-    if (openai_url) |url| {
-        const protocol = try protocolForUrl(url);
-        if (protocol == .anthropic_messages) return error.InvalidOpenAiEndpoint;
-        return protocol;
-    }
-    if (anthropic_url) |url| {
-        const protocol = try protocolForUrl(url);
-        if (protocol != .anthropic_messages) return error.InvalidAnthropicEndpoint;
-        return protocol;
-    }
+    if (openai_url) |url| return .{ .kind = .openai, .url = url };
+    if (anthropic_url) |url| return .{ .kind = .anthropic, .url = url };
     return error.DirectProviderNotConfigured;
+}
+
+fn configuredProtocol(alloc: Allocator) !Protocol {
+    const endpoint = try configuredEndpoint();
+    const resolved = try resolveEndpointAlloc(alloc, endpoint.url, endpoint.kind);
+    defer alloc.free(resolved);
+    return protocolForUrl(resolved);
+}
+
+fn resolveEndpointAlloc(
+    alloc: Allocator,
+    raw_url: []const u8,
+    kind: ProviderKind,
+) ![]u8 {
+    const prepared = try prepareEndpointUrlAlloc(alloc, raw_url);
+    defer alloc.free(prepared);
+
+    const query_start = std.mem.findScalar(u8, prepared, '?') orelse prepared.len;
+    var path_end = query_start;
+    while (path_end > 0 and prepared[path_end - 1] == '/') path_end -= 1;
+    const endpoint = prepared[0..path_end];
+    const query = prepared[query_start..];
+
+    const suffix: []const u8 = switch (kind) {
+        .openai => blk: {
+            if (std.mem.endsWith(u8, endpoint, "/messages")) {
+                return error.InvalidOpenAiEndpoint;
+            }
+            if (std.mem.endsWith(u8, endpoint, "/chat/completions") or
+                std.mem.endsWith(u8, endpoint, "/responses"))
+            {
+                break :blk "";
+            }
+            if (std.mem.endsWith(u8, endpoint, "/v1")) {
+                break :blk "/chat/completions";
+            }
+            break :blk "/v1/chat/completions";
+        },
+        .anthropic => blk: {
+            if (std.mem.endsWith(u8, endpoint, "/chat/completions") or
+                std.mem.endsWith(u8, endpoint, "/responses"))
+            {
+                return error.InvalidAnthropicEndpoint;
+            }
+            if (std.mem.endsWith(u8, endpoint, "/messages")) break :blk "";
+            if (std.mem.endsWith(u8, endpoint, "/v1")) break :blk "/messages";
+            break :blk "/v1/messages";
+        },
+    };
+
+    const resolved = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ endpoint, suffix, query });
+    errdefer alloc.free(resolved);
+    _ = try protocolForUrl(resolved);
+    return resolved;
+}
+
+fn prepareEndpointUrlAlloc(alloc: Allocator, raw_url: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_url, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidEndpoint;
+
+    const with_scheme = if (std.mem.find(u8, trimmed, "://") != null)
+        try alloc.dupe(u8, trimmed)
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "{s}://{s}",
+            .{ if (isBareLocalEndpoint(trimmed)) "http" else "https", trimmed },
+        );
+    defer alloc.free(with_scheme);
+
+    const uri = std.Uri.parse(with_scheme) catch return error.InvalidEndpoint;
+    if (uri.user != null or uri.password != null or uri.fragment != null) {
+        return error.InvalidEndpoint;
+    }
+    const host_component = uri.host orelse return error.InvalidEndpoint;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = host_component.toRaw(&host_buf) catch return error.InvalidEndpoint;
+    const replacement: ?[]const u8 = if (std.mem.eql(u8, host, "0.0.0.0"))
+        "127.0.0.1"
+    else if (std.mem.eql(u8, host, "[::]"))
+        "[::1]"
+    else
+        null;
+
+    const normalized = if (replacement) |loopback| blk: {
+        const scheme_end = std.mem.find(u8, with_scheme, "://") orelse
+            return error.InvalidEndpoint;
+        const host_start = scheme_end + "://".len;
+        if (!std.mem.startsWith(u8, with_scheme[host_start..], host)) {
+            return error.InvalidEndpoint;
+        }
+        break :blk try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}",
+            .{ with_scheme[0..host_start], loopback, with_scheme[host_start + host.len ..] },
+        );
+    } else try alloc.dupe(u8, with_scheme);
+    errdefer alloc.free(normalized);
+    try validateEndpointUrl(normalized);
+    return normalized;
+}
+
+fn isBareLocalEndpoint(url: []const u8) bool {
+    const authority_end = std.mem.findScalar(u8, url, '/') orelse url.len;
+    const authority = url[0..authority_end];
+    const host_end = if (std.mem.startsWith(u8, authority, "["))
+        (std.mem.findScalar(u8, authority, ']') orelse return false) + 1
+    else
+        std.mem.findScalar(u8, authority, ':') orelse authority.len;
+    const host = authority[0..host_end];
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "0.0.0.0") or
+        std.mem.eql(u8, host, "[::1]") or
+        std.mem.eql(u8, host, "[::]");
 }
 
 fn protocolForUrl(url: []const u8) !Protocol {
@@ -95,7 +212,7 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider.BuildRequest,
 ) ![]u8 {
-    return buildAgentRequestForProtocol(alloc, request, try configuredProtocol());
+    return buildAgentRequestForProtocol(alloc, request, try configuredProtocol(alloc));
 }
 
 fn buildAgentRequestForProtocol(
@@ -849,8 +966,11 @@ pub fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider.Request,
 ) !agent_stream_provider.Result {
-    const protocol = try protocolForUrl(request.chat_url);
-    const uri = std.Uri.parse(request.chat_url) catch return error.InvalidEndpoint;
+    const endpoint = try configuredEndpoint();
+    const resolved_url = try resolveEndpointAlloc(alloc, request.chat_url, endpoint.kind);
+    defer alloc.free(resolved_url);
+    const protocol = try protocolForUrl(resolved_url);
+    const uri = std.Uri.parse(resolved_url) catch return error.InvalidEndpoint;
     const retry_count = switch (request.provider_attempt_owner) {
         .agent => 1,
         .transport => @max(request.retry_count, 1),
@@ -1673,7 +1793,7 @@ fn appendCatalogEntry(
     });
 }
 
-test "direct provider endpoint validation and protocol selection are strict" {
+test "direct provider endpoint validation and protocol selection" {
     try validateEndpointUrl("https://api.openai.com/v1/chat/completions");
     try validateEndpointUrl("http://127.0.0.1:11434/v1/responses");
     try validateEndpointUrl("http://localhost:1234/v1/messages");
@@ -1683,6 +1803,55 @@ test "direct provider endpoint validation and protocol selection are strict" {
     try std.testing.expectEqual(Protocol.openai_responses, try protocolForUrl("https://example.com/v1/responses?trace=true"));
     try std.testing.expectEqual(Protocol.anthropic_messages, try protocolForUrl("http://localhost:8321/v1/messages/"));
     try std.testing.expectError(error.UnsupportedDirectProviderEndpoint, protocolForUrl("https://example.com/v1/completions"));
+}
+
+test "OpenAI endpoint resolver accepts base URLs and local address forms" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "http://localhost:11234", .expected = "http://localhost:11234/v1/chat/completions" },
+        .{ .input = "localhost:11234/v1", .expected = "http://localhost:11234/v1/chat/completions" },
+        .{ .input = "HTTP://LOCALHOST:11234/v1/", .expected = "HTTP://LOCALHOST:11234/v1/chat/completions" },
+        .{ .input = "http://0.0.0.0:11234/v1", .expected = "http://127.0.0.1:11234/v1/chat/completions" },
+        .{ .input = "https://api.openai.com", .expected = "https://api.openai.com/v1/chat/completions" },
+        .{ .input = "api.example.com/openai", .expected = "https://api.example.com/openai/v1/chat/completions" },
+        .{ .input = "https://api.example.com/v1/responses?trace=true", .expected = "https://api.example.com/v1/responses?trace=true" },
+        .{ .input = "https://api.example.com/v1/chat/completions/", .expected = "https://api.example.com/v1/chat/completions" },
+    };
+
+    for (cases) |case| {
+        const resolved = try resolveEndpointAlloc(std.testing.allocator, case.input, .openai);
+        defer std.testing.allocator.free(resolved);
+        try std.testing.expectEqualStrings(case.expected, resolved);
+    }
+    try std.testing.expectError(
+        error.InvalidOpenAiEndpoint,
+        resolveEndpointAlloc(std.testing.allocator, "https://api.example.com/v1/messages", .openai),
+    );
+}
+
+test "Anthropic endpoint resolver accepts base URLs and full routes" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "https://api.anthropic.com", .expected = "https://api.anthropic.com/v1/messages" },
+        .{ .input = "https://api.anthropic.com/v1", .expected = "https://api.anthropic.com/v1/messages" },
+        .{ .input = "api.deepseek.com/anthropic", .expected = "https://api.deepseek.com/anthropic/v1/messages" },
+        .{ .input = "http://0.0.0.0:8321", .expected = "http://127.0.0.1:8321/v1/messages" },
+        .{ .input = "localhost:8321/v1/messages/", .expected = "http://localhost:8321/v1/messages" },
+    };
+
+    for (cases) |case| {
+        const resolved = try resolveEndpointAlloc(std.testing.allocator, case.input, .anthropic);
+        defer std.testing.allocator.free(resolved);
+        try std.testing.expectEqualStrings(case.expected, resolved);
+    }
+    try std.testing.expectError(
+        error.InvalidAnthropicEndpoint,
+        resolveEndpointAlloc(std.testing.allocator, "https://api.example.com/v1/responses", .anthropic),
+    );
 }
 
 test "OpenAI-compatible request converts messages and flattened tools" {

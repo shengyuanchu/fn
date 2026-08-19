@@ -305,7 +305,7 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => if (directProviderEnabled())
-            (try directProviderCredentialValue()) != null or try directProviderUsesLoopback()
+            (try directProviderCredentialValue()) != null or try directProviderUsesLoopback(alloc)
         else
             nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
@@ -380,26 +380,33 @@ fn directProviderCredentialValue() !?[]const u8 {
     });
 }
 
-fn directProviderUsesLoopback() !bool {
+fn directProviderUsesLoopback(alloc: std.mem.Allocator) !bool {
     const kind = try directProviderKind() orelse return false;
     const raw_url = nonEmptyEnvValue(switch (kind) {
         .openai => openai_endpoint_env,
         .anthropic => anthropic_endpoint_env,
     }) orelse return false;
-    const url = std.mem.trim(u8, raw_url, " \t\r\n");
+    const trimmed = std.mem.trim(u8, raw_url, " \t\r\n");
+    const url = if (std.mem.find(u8, trimmed, "://") == null)
+        try std.fmt.allocPrint(alloc, "http://{s}", .{trimmed})
+    else
+        try alloc.dupe(u8, trimmed);
+    defer alloc.free(url);
     const uri = std.Uri.parse(url) catch return false;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or uri.port == null) return false;
     const host_component = uri.host orelse return false;
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const name = host_component.toRaw(&host_buf) catch return false;
     return std.mem.eql(u8, name, "127.0.0.1") or
+        std.mem.eql(u8, name, "0.0.0.0") or
         std.ascii.eqlIgnoreCase(name, "localhost") or
-        std.mem.eql(u8, name, "[::1]");
+        std.mem.eql(u8, name, "[::1]") or
+        std.mem.eql(u8, name, "[::]");
 }
 
 fn loadDirectProviderCredential(alloc: std.mem.Allocator) !?Credential {
     const value = (try directProviderCredentialValue()) orelse
-        if (try directProviderUsesLoopback()) "local" else return null;
+        if (try directProviderUsesLoopback(alloc)) "local" else return null;
     return .{
         .token = try alloc.dupe(u8, value),
         .source = .ai_gateway_api_key,
@@ -834,6 +841,17 @@ test "direct provider accepts its standard key and keyless loopback" {
     {
         const env = try CredentialTestEnv.install(alloc, &.{
             .{ "OPENAI_ENDPOINT", "  http://127.0.0.1:11434/v1/chat/completions  " },
+        });
+        defer env.deinit();
+
+        var credential = (try loadDirectProviderCredential(alloc)) orelse
+            return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("local", credential.token);
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "OPENAI_ENDPOINT", "0.0.0.0:11434" },
         });
         defer env.deinit();
 

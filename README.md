@@ -23,6 +23,10 @@ curl -fsSL https://raw.githubusercontent.com/shengyuanchu/fn/main/install.sh | s
 
 ## Configure
 
+Endpoints may be a bare host, a base URL, a `/v1` URL, or a full API route.
+OpenAI endpoints default to Chat Completions; use a full Responses route to
+select the Responses API.
+
 ### OpenAI Responses
 
 ```bash
