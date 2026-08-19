@@ -1,0 +1,85 @@
+name: fn Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v0.0.3-fn.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-linux
+          - name: linux-aarch64
+            target: aarch64-linux
+          - name: macos-x86_64
+            target: x86_64-macos
+          - name: macos-aarch64
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.16.0"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package
+        run: |
+          package_dir="$RUNNER_TEMP/fn-package-${{ matrix.name }}"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/fn LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "fn-${{ matrix.name }}.tar.gz" -C "$package_dir" fn LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum "fn-${{ matrix.name }}.tar.gz" > "fn-${{ matrix.name }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fn-${{ matrix.name }}
+          path: |
+            fn-${{ matrix.name }}.tar.gz
+            fn-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Validate version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-fn\.(0|[1-9][0-9]*)$ ]]
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fn-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: fn ${{ inputs.version }}
+          target_commitish: main
+          generate_release_notes: true
+          files: |
+            fn-*.tar.gz
+            fn-*.tar.gz.sha256

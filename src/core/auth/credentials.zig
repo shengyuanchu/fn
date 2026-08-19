@@ -222,6 +222,13 @@ pub fn resolvePreferring(
     mode: LoadMode,
     preferred: ?Source,
 ) !Resolution {
+    // A direct provider endpoint is an explicit provider choice. Do
+    // not let a stored Vercel credential silently take precedence over it.
+    if (directProviderEnabled()) {
+        const direct = try loadDirectProviderCredential(alloc);
+        return .{ .credential = direct };
+    }
+
     if (preferred) |source| {
         if (source != .stored_key or !secret_store.isDisabled()) {
             const chosen = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| blk: {
@@ -281,7 +288,10 @@ pub fn loadSource(
 ) !?Credential {
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
-        .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        .ai_gateway_api_key => if (directProviderEnabled())
+            loadDirectProviderCredential(alloc)
+        else
+            loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
     };
@@ -294,7 +304,10 @@ pub fn sourceExists(
 ) !bool {
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
-        .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        .ai_gateway_api_key => if (directProviderEnabled())
+            (try directProviderCredentialValue()) != null or try directProviderUsesLoopback()
+        else
+            nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -332,6 +345,64 @@ fn loadEnvCredential(
     return .{
         .token = try alloc.dupe(u8, value),
         .source = source,
+    };
+}
+
+const openai_endpoint_env = "OPENAI_ENDPOINT";
+const openai_api_key_env = "OPENAI_API_KEY";
+const anthropic_endpoint_env = "ANTHROPIC_ENDPOINT";
+const anthropic_api_key_env = "ANTHROPIC_API_KEY";
+
+const DirectProviderKind = enum {
+    openai,
+    anthropic,
+};
+
+fn directProviderEnabled() bool {
+    return nonEmptyEnvValue(openai_endpoint_env) != null or
+        nonEmptyEnvValue(anthropic_endpoint_env) != null;
+}
+
+fn directProviderKind() !?DirectProviderKind {
+    const openai_enabled = nonEmptyEnvValue(openai_endpoint_env) != null;
+    const anthropic_enabled = nonEmptyEnvValue(anthropic_endpoint_env) != null;
+    if (openai_enabled and anthropic_enabled) return error.ConflictingDirectProviderEndpoints;
+    if (openai_enabled) return .openai;
+    if (anthropic_enabled) return .anthropic;
+    return null;
+}
+
+fn directProviderCredentialValue() !?[]const u8 {
+    const kind = try directProviderKind() orelse return null;
+    return nonEmptyEnvValue(switch (kind) {
+        .openai => openai_api_key_env,
+        .anthropic => anthropic_api_key_env,
+    });
+}
+
+fn directProviderUsesLoopback() !bool {
+    const kind = try directProviderKind() orelse return false;
+    const raw_url = nonEmptyEnvValue(switch (kind) {
+        .openai => openai_endpoint_env,
+        .anthropic => anthropic_endpoint_env,
+    }) orelse return false;
+    const url = std.mem.trim(u8, raw_url, " \t\r\n");
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or uri.port == null) return false;
+    const host_component = uri.host orelse return false;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const name = host_component.toRaw(&host_buf) catch return false;
+    return std.mem.eql(u8, name, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(name, "localhost") or
+        std.mem.eql(u8, name, "[::1]");
+}
+
+fn loadDirectProviderCredential(alloc: std.mem.Allocator) !?Credential {
+    const value = (try directProviderCredentialValue()) orelse
+        if (try directProviderUsesLoopback()) "local" else return null;
+    return .{
+        .token = try alloc.dupe(u8, value),
+        .source = .ai_gateway_api_key,
     };
 }
 
@@ -468,7 +539,13 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
 pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
-        .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
+        .ai_gateway_api_key => if (nonEmptyEnvValue(anthropic_endpoint_env) != null and
+            nonEmptyEnvValue(openai_endpoint_env) == null)
+            "Anthropic API key"
+        else if (directProviderEnabled())
+            "OpenAI-compatible API key"
+        else
+            "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
     };
@@ -714,6 +791,115 @@ test "source-specific credential loading bypasses generic precedence" {
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .ai_gateway_api_key));
     try std.testing.expect(try sourceExists(alloc, host.unavailable_secret_store, .vercel_oidc_token));
     try std.testing.expect(!(try sourceExists(alloc, host.unavailable_secret_store, .stored_key)));
+}
+
+test "direct provider credential overrides Vercel sources" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "OPENAI_ENDPOINT", "https://example.com/v1/chat/completions" },
+        .{ "OPENAI_API_KEY", "direct-key" },
+        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
+        .{ "AI_GATEWAY_API_KEY", "gateway-key" },
+    });
+    defer env.deinit();
+
+    const resolution = try resolvePreferring(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .refresh_if_needed,
+        .fx_login,
+    );
+    var credential = resolution.credential orelse return error.TestExpectedCredential;
+    defer credential.deinit(alloc);
+    try std.testing.expectEqual(Source.ai_gateway_api_key, credential.source);
+    try std.testing.expectEqualStrings("direct-key", credential.token);
+    try std.testing.expectEqualStrings("OpenAI-compatible API key", sourceLabel(credential.source));
+}
+
+test "direct provider accepts its standard key and keyless loopback" {
+    const alloc = std.testing.allocator;
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "OPENAI_ENDPOINT", "https://example.com/v1/chat/completions" },
+            .{ "OPENAI_API_KEY", "standard-key" },
+        });
+        defer env.deinit();
+
+        var credential = (try loadDirectProviderCredential(alloc)) orelse
+            return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("standard-key", credential.token);
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "OPENAI_ENDPOINT", "  http://127.0.0.1:11434/v1/chat/completions  " },
+        });
+        defer env.deinit();
+
+        var credential = (try loadDirectProviderCredential(alloc)) orelse
+            return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("local", credential.token);
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "ANTHROPIC_ENDPOINT", "https://api.anthropic.com/v1/messages" },
+            .{ "ANTHROPIC_API_KEY", "anthropic-key" },
+        });
+        defer env.deinit();
+
+        var credential = (try loadDirectProviderCredential(alloc)) orelse
+            return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("anthropic-key", credential.token);
+        try std.testing.expectEqualStrings("Anthropic API key", sourceLabel(credential.source));
+    }
+    {
+        const env = try CredentialTestEnv.install(alloc, &.{
+            .{ "ANTHROPIC_ENDPOINT", "http://localhost:8321/v1/messages" },
+        });
+        defer env.deinit();
+
+        var credential = (try loadDirectProviderCredential(alloc)) orelse
+            return error.TestExpectedCredential;
+        defer credential.deinit(alloc);
+        try std.testing.expectEqualStrings("local", credential.token);
+    }
+}
+
+test "direct provider rejects simultaneous OpenAI and Anthropic endpoints" {
+    const env = try CredentialTestEnv.install(std.testing.allocator, &.{
+        .{ "OPENAI_ENDPOINT", "https://api.openai.com/v1/responses" },
+        .{ "ANTHROPIC_ENDPOINT", "https://api.anthropic.com/v1/messages" },
+        .{ "OPENAI_API_KEY", "openai-key" },
+        .{ "ANTHROPIC_API_KEY", "anthropic-key" },
+    });
+    defer env.deinit();
+
+    try std.testing.expectError(
+        error.ConflictingDirectProviderEndpoints,
+        loadDirectProviderCredential(std.testing.allocator),
+    );
+}
+
+test "hosted direct provider without a key does not fall back to stored Vercel credentials" {
+    const alloc = std.testing.allocator;
+    const env = try CredentialTestEnv.install(alloc, &.{
+        .{ "OPENAI_ENDPOINT", "https://example.com/v1/chat/completions" },
+        .{ "VERCEL_OIDC_TOKEN", "oidc-token" },
+    });
+    defer env.deinit();
+
+    var store = SecretStoreFixture{ .value = "stored-key" };
+    const resolution = try resolve(
+        alloc,
+        oauth_transport.unavailable_provider,
+        store.provider(),
+        .refresh_if_needed,
+    );
+    try std.testing.expect(resolution.credential == null);
+    try std.testing.expectEqual(@as(usize, 0), store.load_calls);
 }
 
 test "a remembered choice outranks the environment" {

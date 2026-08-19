@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+    const install_fn = b.addInstallArtifact(exe, .{ .dest_sub_path = "fn" });
+    b.getInstallStep().dependOn(&install_fn.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

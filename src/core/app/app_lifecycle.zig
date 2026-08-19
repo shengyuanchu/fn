@@ -1094,7 +1094,7 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
-    const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
+    const model = io_mod.getenv("MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
 }
@@ -1122,7 +1122,7 @@ test "maxxing mode defaults to minimal and accepts legacy settings" {
 }
 
 fn hasProcessModelOverride() bool {
-    const model = io_mod.getenv("FX_MODEL") orelse return false;
+    const model = io_mod.getenv("MODEL") orelse return false;
     return std.mem.trim(u8, model, " \t\r\n").len > 0;
 }
 
@@ -1954,7 +1954,7 @@ test "startup credential modes select a refresh policy, never a narrower source 
 
 test "loadStartupState applies core env overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
-        .{ .key = "FX_MODEL", .value = "  env-model  " },
+        .{ .key = "MODEL", .value = "  env-model  " },
         .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
         .{ .key = "FX_PERMISSION_MODE", .value = "auto" },
         .{ .key = "FX_MAX_AGENT_STEPS", .value = "37" },

@@ -1546,6 +1546,7 @@ const App = struct {
     }
 
     pub fn permissionReviewerProvider(_: *const App) ?permission_auto_classifier.Provider {
+        if (builtin_gateway.directProviderEnabled()) return null;
         return if (comptime host_profile.tools) builtin_gateway.permission_reviewer.provider else null;
     }
 
@@ -3194,7 +3195,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
+        .gateway_chat_url = builtin_gateway.defaultChatUrl(),
         .gateway_provider = builtin_gateway.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
@@ -3216,7 +3217,10 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
         .devbox_provider = builtin_devbox.provider,
-        .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
+        .permission_reviewer_provider = if (builtin_gateway.directProviderEnabled())
+            null
+        else
+            builtin_gateway.permission_reviewer.provider,
     };
 }
 
@@ -3230,7 +3234,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .default_agent_step_limit = default_max_agent_steps,
         .models_path = builtin_gateway.models_path,
         .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
+        .gateway_chat_url = builtin_gateway.defaultChatUrl(),
         .gateway_provider = builtin_gateway.provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,

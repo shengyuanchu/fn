@@ -12,6 +12,7 @@ const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 const gateway_client = @import("../gateway/client.zig");
+const openai_compatible = @import("../gateway/openai_compatible.zig");
 const gateway_failure_diagnostics = @import("../core/gateway/gateway_failure_diagnostics.zig");
 const gateway_json = @import("../core/gateway/gateway_json.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -144,6 +145,10 @@ pub fn buildAgentRequest(
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
+    if (openai_compatible.enabled()) {
+        return openai_compatible.buildAgentRequest(alloc, request);
+    }
+
     const budget: ?gateway_json.BuildBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -425,6 +430,16 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
+    if (openai_compatible.enabled()) {
+        return openai_compatible.streamAgentCompletion(alloc, request) catch |err| {
+            request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+                err,
+                request.delivery.load(),
+            );
+            return err;
+        };
+    }
+
     const result = gateway_client.streamGatewayCompletion(
         alloc,
         .{
@@ -709,11 +724,16 @@ fn executeWebSearchProvider(
 }
 
 pub fn chatUrl(fallback: []const u8) []const u8 {
+    if (openai_compatible.configuredUrl()) |url| return url;
     return resolveChatUrl(fallback, io_mod.getenv(chat_url_env));
 }
 
 pub fn defaultChatUrl() []const u8 {
     return chatUrl(default_chat_url);
+}
+
+pub fn directProviderEnabled() bool {
+    return openai_compatible.enabled();
 }
 
 fn resolveChatUrlForProvider(_: ?*anyopaque, fallback: []const u8) []const u8 {
@@ -2012,6 +2032,13 @@ fn fetchCatalogForProvider(
     alloc: std.mem.Allocator,
     input: model_catalog.FetchInput,
 ) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    if (openai_compatible.enabled()) {
+        const catalog = openai_compatible.catalogFromEnvironment(alloc, default_model) catch {
+            return .{ .failure = .{ .category = .resource_exhausted } };
+        };
+        return .{ .catalog = catalog };
+    }
+
     const response = fetchModelCatalogResponse(
         alloc,
         input.access,
@@ -2053,6 +2080,13 @@ fn fetchModelCatalogForView(
     cancel_flag: ?*std.atomic.Value(bool),
     view: ModelCatalogView,
 ) !std.ArrayList(ModelCatalogEntry) {
+    if (openai_compatible.enabled()) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.seq_cst)) return error.Cancelled;
+        }
+        return openai_compatible.catalogFromEnvironment(alloc, default_model);
+    }
+
     const response = try fetchModelCatalogResponse(alloc, access, path, cancel_flag);
     const json_text = switch (response) {
         .success => |body| body,
