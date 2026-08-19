@@ -112,7 +112,7 @@ function fixtureEnv(
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: activeGateway.chatUrl,
-    FX_MODEL: MODEL,
+    MODEL: MODEL,
     FX_TRACE_LOG: root.traceLogPath,
     FX_TRACE_SCOPES: "mcp",
   };

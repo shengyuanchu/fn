@@ -117,7 +117,7 @@ async function startFx(
       FX_E2E_GATEWAY_MODELS_URL: gateway
         ? `${gateway.baseUrl}/coding-agent/v1/models`
         : undefined,
-      FX_MODEL: withGateway ? FAKE_GATEWAY_MODEL : undefined,
+      MODEL: withGateway ? FAKE_GATEWAY_MODEL : undefined,
       FX_AUTO_UPGRADE: "0",
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: traceScopes,

@@ -450,7 +450,7 @@ describe("cli: status", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_DISABLE_KEYCHAIN: "1",
           FX_AUTO_UPGRADE: "0",
-          FX_MODEL: FAKE_GATEWAY_MODEL,
+          MODEL: FAKE_GATEWAY_MODEL,
           FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
         };
         const cwd = realpathSync(workspace);
@@ -836,7 +836,7 @@ describe("cli: status", () => {
         const env = {
           ...NO_GATEWAY_AUTH,
           HOME: homeRoot,
-          FX_MODEL: undefined,
+          MODEL: undefined,
           FX_PERMISSION_MODE: undefined,
           FX_MAX_AGENT_STEPS: undefined,
         };
@@ -2010,7 +2010,7 @@ describe("cli: Keychain authentication", () => {
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
             timeoutMs: TIMEOUT,
@@ -2154,7 +2154,7 @@ describe("cli: missing durable home", () => {
               AI_GATEWAY_API_KEY: "missing-home-key",
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
             },
             timeoutMs: TIMEOUT,
           },
@@ -3766,7 +3766,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
             timeoutMs: TIMEOUT,
@@ -3822,7 +3822,7 @@ describe("cli: ask success", () => {
                 VERCEL_OIDC_TOKEN: undefined,
                 FX_GATEWAY_BASE_URL: gateway.baseUrl,
                 FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-                FX_MODEL: FAKE_GATEWAY_MODEL,
+                MODEL: FAKE_GATEWAY_MODEL,
                 FX_AUTO_UPGRADE: "0",
               },
               stdin: prompt,
@@ -3987,7 +3987,7 @@ describe("cli: ask success", () => {
             cwd: realpathSync(workspace),
             env: {
               HOME: home,
-              FX_MODEL: undefined,
+              MODEL: undefined,
               FX_TRACE: "1",
               FX_TRACE_LOG: tracePath,
               FX_GATEWAY_BASE_URL: undefined,
@@ -4042,7 +4042,7 @@ describe("cli: ask success", () => {
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
             timeoutMs: 60_000,
@@ -4083,7 +4083,7 @@ describe("cli: ask success", () => {
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
             timeoutMs: 60_000,
@@ -4122,7 +4122,7 @@ describe("cli: ask success", () => {
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
             timeoutMs: 60_000,
@@ -4181,7 +4181,7 @@ describe("cli: error handling", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
+          MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
         };
 
@@ -4258,7 +4258,7 @@ describe("cli: error handling", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
+          MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
         };
 

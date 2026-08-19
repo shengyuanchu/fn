@@ -581,7 +581,7 @@ function baseEnv(root: ReturnType<typeof createRoot>) {
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
     FX_PERMISSION_MODE: "auto",
-    FX_MODEL: MODEL,
+    MODEL: MODEL,
     FX_TRACE_LOG: root.trace,
     FX_TRACE_SCOPES: "mcp,core",
   };

@@ -426,7 +426,7 @@ try {
       VERCEL_OIDC_TOKEN: undefined,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_MODEL: "openai/gpt-5",
+      MODEL: "openai/gpt-5",
       FX_PERMISSION_MODE: "ask",
       FX_AUTO_UPGRADE: "0",
       FX_RECORD: tapePath,

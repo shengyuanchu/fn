@@ -120,7 +120,7 @@ Profile configuration and runtime state lives under `~/.fx/`. Project `.fx.json`
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+1. Environment variables such as `MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
 2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
 3. `~/.fx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
@@ -393,7 +393,7 @@ Whether automated or manual, the changelog is public product copy. Describe obse
 
 Public changelog entries must:
 
-* Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
+* Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MAX_AGENT_STEPS`.
 * Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
 * Bold a short feature or fix name, then describe the user-visible change after a colon.
 * Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.

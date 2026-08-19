@@ -58,7 +58,7 @@ function notificationEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
+    MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
     // Sound behavior under test: skip the harness-wide FX_SOUND=0 default so
     // the fixture settings and platform default stay authoritative.

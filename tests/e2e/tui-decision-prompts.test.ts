@@ -424,7 +424,7 @@ function fakeGatewayEnv(
     AI_GATEWAY_API_KEY: "fake-e2e-key",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: OUTER_MODEL,
+    MODEL: OUTER_MODEL,
     FX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
     ...extra,

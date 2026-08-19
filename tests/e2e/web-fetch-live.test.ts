@@ -141,7 +141,7 @@ function fakeGatewayEnv(
     FX_AUTO_UPGRADE: "0",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: OUTER_MODEL,
+    MODEL: OUTER_MODEL,
   };
 }
 

@@ -1136,7 +1136,7 @@ describe.skipIf(!HAS_API_KEY)("eval: auto permission reliability", () => {
             env: {
               HOME: root.home,
               PATH: `${root.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
-              FX_MODEL: MODEL,
+              MODEL: MODEL,
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,

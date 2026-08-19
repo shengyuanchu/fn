@@ -29,7 +29,7 @@ const TIMEOUT = 20_000;
 const NO_AUTH = {
   AI_GATEWAY_API_KEY: "",
   VERCEL_OIDC_TOKEN: "",
-  FX_MODEL: undefined,
+  MODEL: undefined,
   NO_COLOR: "1",
 };
 
@@ -384,7 +384,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           cwd: workspaceBRoot,
           env: {
             ...catalogEnv,
-            FX_MODEL: "openai/gpt-5",
+            MODEL: "openai/gpt-5",
           },
           stderrPath: stderrBPath,
         });
@@ -2332,7 +2332,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_MODEL: FAKE_GATEWAY_MODEL,
+              MODEL: FAKE_GATEWAY_MODEL,
             },
             stderrPath,
           });

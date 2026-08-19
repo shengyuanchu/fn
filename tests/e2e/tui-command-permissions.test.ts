@@ -967,7 +967,7 @@ function gatewayEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: MODEL,
+    MODEL: MODEL,
     FX_AUTO_UPGRADE: "0",
     FX_DIRECT_SECRET: "must-not-be-inherited",
     NO_COLOR: "1",

@@ -23,7 +23,7 @@ try {
         env: {
           AI_GATEWAY_API_KEY: "worker-termination-key",
           FX_GATEWAY_CHAT_URL: workerData.gatewayUrl,
-          FX_MODEL: "native/test-model",
+          MODEL: "native/test-model",
         },
       });
       const session = await agent.createSession();

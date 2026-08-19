@@ -308,7 +308,7 @@ function fakeGatewayEnv(
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_E2E_GATEWAY_CREDITS_URL: undefined,
-    FX_MODEL: OUTER_MODEL,
+    MODEL: OUTER_MODEL,
     ...extra,
   };
 }
@@ -701,7 +701,7 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: PARALLEL_OUTER_MODEL,
+              MODEL: PARALLEL_OUTER_MODEL,
               FX_WEB_SEARCH_BACKEND: "ai_gateway_parallel_search",
             }),
             timeoutMs: TIMEOUT,
@@ -753,7 +753,7 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: "anthropic/claude-opus-4.6",
+              MODEL: "anthropic/claude-opus-4.6",
             }),
             timeoutMs: TIMEOUT,
           },
@@ -793,7 +793,7 @@ describe("web_search Gateway fixture", () => {
           ["ask", "--auto", "--json", "--no-save", "Reply with a short confirmation."],
           {
             cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, { FX_MODEL: undefined }),
+            env: fakeGatewayEnv(root, gateway, { MODEL: undefined }),
             timeoutMs: TIMEOUT,
           },
         );
@@ -839,7 +839,7 @@ describe("web_search Gateway fixture", () => {
             {
               cwd: root.workspace,
               env: fakeGatewayEnv(root, gateway, {
-                FX_MODEL: testCase.model,
+                MODEL: testCase.model,
               }),
               timeoutMs: TIMEOUT,
             },
@@ -990,7 +990,7 @@ describe("web_search Gateway fixture", () => {
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, {
-              FX_MODEL: PARALLEL_OUTER_MODEL,
+              MODEL: PARALLEL_OUTER_MODEL,
               FX_PERMISSION_MODE: "auto",
               FX_MAX_AGENT_STEPS: "1",
             }),

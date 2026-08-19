@@ -214,7 +214,7 @@ function gatewayEnv(
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_MODEL: MODEL,
+    MODEL: MODEL,
     FX_AUTO_UPGRADE: "0",
     ...extra,
   };
@@ -677,7 +677,7 @@ describe("filesystem path handling", () => {
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: undefined,
               FX_GATEWAY_CHAT_URL: undefined,
-              FX_MODEL: process.env.FX_WORKSPACE_ACCESS_LIVE_MODEL ?? EVAL_MODEL,
+              MODEL: process.env.FX_WORKSPACE_ACCESS_LIVE_MODEL ?? EVAL_MODEL,
             },
             timeoutMs: 120_000,
           },

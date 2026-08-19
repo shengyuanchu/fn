@@ -158,7 +158,7 @@ export function buildEvalProcessEnv(
     NO_COLOR: "1",
     HOME: home,
     PATH: process.env.PATH ?? "",
-    FX_MODEL: model,
+    MODEL: model,
   };
 }
 

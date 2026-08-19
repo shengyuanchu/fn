@@ -34,7 +34,7 @@ const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_BASE_URL",
   "FX_GATEWAY_CHAT_URL",
   "FX_MAX_AGENT_STEPS",
-  "FX_MODEL",
+  "MODEL",
 ] as const;
 
 export function terminalFixtureShell(): string {

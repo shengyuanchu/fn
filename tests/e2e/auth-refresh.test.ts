@@ -170,7 +170,7 @@ test(
       FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_MODEL: FAKE_GATEWAY_MODEL,
+      MODEL: FAKE_GATEWAY_MODEL,
     };
 
     try {
@@ -247,7 +247,7 @@ test(
             FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
+            MODEL: FAKE_GATEWAY_MODEL,
           },
           timeoutMs: TIMEOUT,
         },
@@ -380,7 +380,7 @@ test(
             FX_TRACE_LOG: tracePath,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
+            MODEL: FAKE_GATEWAY_MODEL,
           },
           timeoutMs: TIMEOUT,
         },
@@ -444,7 +444,7 @@ test(
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_MODEL: FAKE_GATEWAY_MODEL,
+      MODEL: FAKE_GATEWAY_MODEL,
     };
 
     try {

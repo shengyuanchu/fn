@@ -265,7 +265,7 @@ function fixtureEnv(
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: MODEL,
+    MODEL: MODEL,
     FX_TRACE_LOG: tracePath,
     FX_TRACE_SCOPES: "agent,core,gateway,stream",
   };
@@ -828,7 +828,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_MODEL: undefined,
+            MODEL: undefined,
             FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
@@ -937,7 +937,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_AUTO_UPGRADE: "0",
-            FX_MODEL: "anthropic/claude-sonnet-4.6",
+            MODEL: "anthropic/claude-sonnet-4.6",
           },
           timeoutMs: 30_000,
         },
@@ -2390,7 +2390,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, firstTracePath),
-            FX_MODEL: undefined,
+            MODEL: undefined,
           },
           timeoutMs: 15_000,
         },
@@ -2425,7 +2425,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, resumeTracePath),
-            FX_MODEL: undefined,
+            MODEL: undefined,
           },
           timeoutMs: 15_000,
         },
@@ -3152,7 +3152,7 @@ describe("gateway stream lifecycle", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_E2E_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
-              FX_MODEL: MODEL,
+              MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
               FX_TRACE_SCOPES: "agent,core,gateway,stream",
             },
@@ -3283,7 +3283,7 @@ describe("gateway stream lifecycle", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_E2E_GATEWAY_CHAT_URL:
               `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
-            FX_MODEL: MODEL,
+            MODEL: MODEL,
             FX_TRACE_LOG: tracePath,
             FX_TRACE_SCOPES: "agent,core,gateway,stream",
           },

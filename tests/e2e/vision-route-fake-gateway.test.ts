@@ -352,7 +352,7 @@ function fakeGatewayEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: model,
+    MODEL: model,
   };
 }
 

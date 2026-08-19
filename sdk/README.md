@@ -35,7 +35,7 @@ const agent = await createFxAgent({
 });
 ```
 
-Node tries a compatible native addon first (`libfx.node`, then a platform-specific `libfx.<platform>-<arch>.node`). The current native addon implements `createFxAgent()` in-process through the ACP core, while Gateway requests use the host's `fetch` implementation and `AbortController`, matching the WebAssembly host boundary. Pass `fetch` to override Node's global implementation. Configure its API key, model, and Gateway URL through `env.AI_GATEWAY_API_KEY`, `env.FX_MODEL`, and `env.FX_GATEWAY_CHAT_URL`. `createFxTerminal()` falls back to WebAssembly. Missing native surfaces always fall back independently.
+Node tries a compatible native addon first (`libfx.node`, then a platform-specific `libfx.<platform>-<arch>.node`). The current native addon implements `createFxAgent()` in-process through the ACP core, while Gateway requests use the host's `fetch` implementation and `AbortController`, matching the WebAssembly host boundary. Pass `fetch` to override Node's global implementation. Configure its API key, model, and Gateway URL through `env.AI_GATEWAY_API_KEY`, `env.MODEL`, and `env.FX_GATEWAY_CHAT_URL`. `createFxTerminal()` falls back to WebAssembly. Missing native surfaces always fall back independently.
 
 `nativeAddon` and `env.FX_GATEWAY_CHAT_URL` are trusted host configuration, not request or tenant input. The native backend sends production credentials only to the canonical Vercel AI Gateway endpoint. Custom endpoints are limited to explicit loopback HTTP URLs for local development. Never pass user-controlled module paths, URLs, or environment objects into these options.
 

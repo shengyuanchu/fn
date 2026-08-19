@@ -35,7 +35,7 @@ describe("agent quality A/B harness helpers", () => {
 
   test("redacts credential-looking values", () => {
     expect(redactSensitiveValue("AI_GATEWAY_API_KEY", "secret-value")).toBe("[redacted]");
-    expect(redactSensitiveValue("FX_MODEL", "provider/test-model")).toBe("provider/test-model");
+    expect(redactSensitiveValue("MODEL", "provider/test-model")).toBe("provider/test-model");
   });
 
   test("scores focused rows using first tool forbidden tools and row predicate", () => {

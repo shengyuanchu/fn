@@ -73,7 +73,7 @@ try {
     env: {
       AI_GATEWAY_API_KEY: "native-core-stream-key",
       FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${port}/chat`,
-      FX_MODEL: "native/test-model",
+      MODEL: "native/test-model",
     },
   });
   const session = await agent.createSession();

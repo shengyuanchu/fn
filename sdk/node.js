@@ -127,7 +127,7 @@ function validateGatewayChatUrl(value) {
 
 function createNativeCoreRuntime(addon, options) {
   const apiKey = options.env?.AI_GATEWAY_API_KEY;
-  const model = options.env?.FX_MODEL;
+  const model = options.env?.MODEL;
   const gatewayChatUrl = options.env?.FX_GATEWAY_CHAT_URL;
   validateGatewayChatUrl(gatewayChatUrl);
   const core = addon.createCore({

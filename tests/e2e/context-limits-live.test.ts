@@ -59,7 +59,7 @@ describe.skipIf(!LIVE_ENABLED || !HAS_API_KEY)("live source context limits", () 
             cwd: workspace,
             env: {
               HOME: home,
-              FX_MODEL: MODEL,
+              MODEL: MODEL,
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: undefined,
               FX_GATEWAY_CHAT_URL: undefined,
