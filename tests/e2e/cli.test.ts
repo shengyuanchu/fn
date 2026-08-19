@@ -250,7 +250,7 @@ describe("cli: help", () => {
       expect(r.stderr).toBe("");
       expect(r.stdout).not.toContain("\x1b[");
       expect(r.stdout).toStartWith(
-        `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
+        `fn v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
       expect(r.stdout).toContain("Commands:\n");
       expect(r.stdout).toContain("Run one noninteractive request");
@@ -268,10 +268,10 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("-v, --version");
       expect(r.stdout).not.toContain("Must appear before the command");
       expect(r.stdout).toContain("Examples:\n");
-      expect(r.stdout).toContain("https://fx.sh/docs");
-      expect(r.stdout).toContain("run `/feedback` inside 𝒇x");
+      expect(r.stdout).toContain("https://github.com/shengyuanchu/fn");
+      expect(r.stdout).toContain("https://github.com/shengyuanchu/fn/issues");
       expect(r.stdout).not.toContain("  Work      ");
-      expect(r.stdout).not.toContain("\n\n\nRun `fx <command> --help`");
+      expect(r.stdout).not.toContain("\n\n\nRun `fn <command> --help`");
     },
     TIMEOUT,
   );
@@ -303,12 +303,12 @@ describe("cli: help", () => {
         ...NO_GATEWAY_AUTH,
         FX_DISABLE_KEYCHAIN: "1",
       };
-      const expected = `fx ask
+      const expected = `fn ask
 
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--json] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fn ask [--auto|--yolo] [--image PATH] [--json] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto               Automatically review unresolved permission requests
@@ -345,7 +345,7 @@ Operational progress and diagnostics are written to stderr. JSON output keeps ra
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  fn acp [--model <id>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--log-file <path>");
@@ -4303,7 +4303,7 @@ describe("cli: workspace access", () => {
         { env: enabled },
       );
       expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+      expect(help.stdout.startsWith("fn ask\n\n")).toBe(true);
       expect(help.stderr).toBe("");
 
       const missing = await runFx(["--add-dir"], { env: enabled });

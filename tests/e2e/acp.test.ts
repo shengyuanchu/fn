@@ -196,7 +196,7 @@ function fakeGatewayEnv(
     VERCEL_OIDC_TOKEN: "",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_MODEL: FAKE_GATEWAY_MODEL,
+    MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
   };
 }
@@ -6811,7 +6811,7 @@ describe("acp: model catalog authentication", () => {
         client = await AcpClient.create({
           args: ["acp", "--model", "provider/fast-override"],
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: undefined },
+          env: { ...fakeGatewayEnv(root, gateway), MODEL: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const resp = await client.request("session/new", { mcpServers: [] }, 2) as any;
