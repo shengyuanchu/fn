@@ -130,9 +130,9 @@ fn failureResult(
 
 fn failureMessage(err: RunError) []const u8 {
     return switch (err) {
-        error.FetchFailed => "failed to fetch latest version from CDN",
+        error.FetchFailed => "failed to fetch latest fn release",
         error.DownloadFailed => "failed to download release archive",
-        error.ChecksumFetchFailed => "failed to fetch checksum from CDN",
+        error.ChecksumFetchFailed => "failed to fetch release checksum",
         error.ChecksumMismatch => "downloaded archive failed integrity check",
         error.ExtractionFailed => "failed to extract release archive",
         error.SelfExeNotFound => "could not determine path of running binary",
@@ -193,7 +193,7 @@ fn upgradeWorkerInner(
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
-    const tmp_dir = try std.fmt.allocPrint(alloc, "{s}/fx-upgrade-{s}", .{ tmp_base, rand_hex });
+    const tmp_dir = try std.fmt.allocPrint(alloc, "{s}/fn-upgrade-{s}", .{ tmp_base, rand_hex });
     defer alloc.free(tmp_dir);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
@@ -202,10 +202,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir});
+    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fn.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fn-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -221,7 +221,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fn-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
@@ -237,7 +237,7 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fn", .{tmp_dir});
     defer alloc.free(extracted_bin);
 
     var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -364,7 +364,7 @@ fn formatProgressStatusLine(buf: []u8, snapshot: ProgressSnapshot, current: []co
         .found => blk: {
             const latest = latest_label orelse return null;
             var out: std.Io.Writer = .fixed(buf);
-            out.print("fx {s} -> {s}", .{ current, versionLabel(latest) }) catch return out.buffered();
+            out.print("fn {s} -> {s}", .{ current, versionLabel(latest) }) catch return out.buffered();
             break :blk out.buffered();
         },
         .downloading_known => if (snapshot.total > 0)
@@ -542,7 +542,7 @@ test "formatProgressStatusLine renders found update before download starts" {
     var buf: [128]u8 = undefined;
 
     try std.testing.expectEqualStrings(
-        "fx 0.3.39 -> 0.3.40",
+        "fn 0.3.39 -> 0.3.40",
         formatProgressStatusLine(&buf, .{
             .phase = .found,
             .downloaded = 0,

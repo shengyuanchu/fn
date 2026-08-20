@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v0.0.4-fn.1
+        description: Release version, for example v0.0.4-fn.2
         required: true
         type: string
 
@@ -34,6 +34,13 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: "0.16.0"
+
+      - name: Validate source version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          source_version="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/main.zig)"
+          test "$RELEASE_VERSION" = "v$source_version"
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
@@ -73,6 +80,11 @@ jobs:
           pattern: fn-*
           merge-multiple: true
 
+      - name: Create latest version manifest
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: printf '%s\n' "$RELEASE_VERSION" > latest.txt
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -83,3 +95,4 @@ jobs:
           files: |
             fn-*.tar.gz
             fn-*.tar.gz.sha256
+            latest.txt

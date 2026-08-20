@@ -73,6 +73,7 @@ cd your-project
 fn                                  # Interactive session
 fn ask "hello"                      # One request
 fn --resume                         # Resume a session
+fn update                           # Update fn
 fn --help                           # Show all options
 ```
 

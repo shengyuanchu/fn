@@ -158,40 +158,54 @@ pub fn versionsEqual(a: []const u8, b: []const u8) bool {
 }
 
 pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
-    const av = parseVersionParts(a);
-    const bv = parseVersionParts(b);
-    if (av[0] != bv[0]) return std.math.order(av[0], bv[0]);
-    if (av[1] != bv[1]) return std.math.order(av[1], bv[1]);
-    return std.math.order(av[2], bv[2]);
+    const av = parseStableVersion(a) orelse ParsedStableVersion{};
+    const bv = parseStableVersion(b) orelse ParsedStableVersion{};
+    if (av.parts[0] != bv.parts[0]) return std.math.order(av.parts[0], bv.parts[0]);
+    if (av.parts[1] != bv.parts[1]) return std.math.order(av.parts[1], bv.parts[1]);
+    if (av.parts[2] != bv.parts[2]) return std.math.order(av.parts[2], bv.parts[2]);
+    return std.math.order(av.fn_revision, bv.fn_revision);
 }
 
 fn validVersion(raw: []const u8) bool {
-    if (raw.len == 0 or raw.len > max_version_bytes) return false;
+    return parseStableVersion(raw) != null;
+}
+
+const ParsedStableVersion = struct {
+    parts: [3]u32 = .{ 0, 0, 0 },
+    fn_revision: u32 = 0,
+};
+
+fn parseStableVersion(raw: []const u8) ?ParsedStableVersion {
+    const normalized = normalizeVersion(raw);
+    if (normalized.len == 0 or normalized.len > max_version_bytes) return null;
+
+    var core = normalized;
+    var fn_revision: u32 = 0;
+    if (std.mem.find(u8, normalized, "-fn.")) |suffix_index| {
+        core = normalized[0..suffix_index];
+        const revision_text = normalized[suffix_index + "-fn.".len ..];
+        if (revision_text.len == 0) return null;
+        for (revision_text) |byte| if (!std.ascii.isDigit(byte)) return null;
+        fn_revision = std.fmt.parseUnsigned(u32, revision_text, 10) catch return null;
+    }
+
     var count: usize = 0;
-    var parts = std.mem.splitScalar(u8, raw, '.');
+    var values = [_]u32{ 0, 0, 0 };
+    var parts = std.mem.splitScalar(u8, core, '.');
     while (parts.next()) |part| {
-        if (count == 3 or part.len == 0) return false;
-        for (part) |byte| if (!std.ascii.isDigit(byte)) return false;
-        _ = std.fmt.parseUnsigned(u32, part, 10) catch return false;
+        if (count == 3 or part.len == 0) return null;
+        for (part) |byte| if (!std.ascii.isDigit(byte)) return null;
+        values[count] = std.fmt.parseUnsigned(u32, part, 10) catch return null;
         count += 1;
     }
-    return count == 3;
+    if (count != 3) return null;
+    return .{ .parts = values, .fn_revision = fn_revision };
 }
 
 fn validRevision(raw: []const u8) bool {
     if (raw.len < min_revision_bytes or raw.len > max_revision_bytes) return false;
     for (raw) |byte| if (!std.ascii.isHex(byte)) return false;
     return true;
-}
-
-fn parseVersionParts(raw: []const u8) [3]u32 {
-    var values = [_]u32{ 0, 0, 0 };
-    var parts = std.mem.splitScalar(u8, normalizeVersion(raw), '.');
-    for (&values) |*value| {
-        const part = parts.next() orelse break;
-        value.* = std.fmt.parseUnsigned(u32, part, 10) catch 0;
-    }
-    return values;
 }
 
 fn revisionsEqual(full: []const u8, current: []const u8) bool {
@@ -289,6 +303,46 @@ test "stable release ordering rejects older targets and preserves channel switch
         .version = "0.0.2",
         .revision = "abcdef012345",
     }));
+}
+
+test "stable fn releases preserve their tag and compare fork revisions" {
+    const alloc = std.testing.allocator;
+    var target = try Target.initStable(alloc, "v0.0.4-fn.2\n");
+    defer target.deinit(alloc);
+
+    try std.testing.expectEqualStrings("0.0.4-fn.2", target.version());
+    try std.testing.expectEqualStrings("v0.0.4-fn.2", target.artifactRef());
+    try std.testing.expect(target.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.4",
+        .revision = "unknown",
+    }));
+    try std.testing.expect(target.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.4-fn.1",
+        .revision = "unknown",
+    }));
+    try std.testing.expect(!target.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.4-fn.2",
+        .revision = "unknown",
+    }));
+    try std.testing.expect(!target.shouldInstall(.{
+        .channel = .stable,
+        .version = "0.0.4-fn.3",
+        .revision = "unknown",
+    }));
+    try std.testing.expectEqual(
+        std.math.Order.gt,
+        compareVersions("0.0.5", "0.0.4-fn.999"),
+    );
+}
+
+test "stable fn releases reject malformed suffixes" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "v0.0.4-fn."));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "v0.0.4-fn.x"));
+    try std.testing.expectError(error.InvalidVersion, Target.initStable(alloc, "v0.0.4-other.1"));
 }
 
 test "target freshness uses version for stable and revision for dev" {

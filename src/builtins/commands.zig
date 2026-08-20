@@ -228,6 +228,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .upgrade,
         .token = "upgrade",
+        .aliases = &.{"update"},
         .usage = "upgrade [--channel <stable|dev>] [--json]",
         .summary = "Upgrade fn on the selected release channel",
         .options = &.{

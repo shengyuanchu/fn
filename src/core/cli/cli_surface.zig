@@ -1328,7 +1328,7 @@ fn runNonInteractiveWithDeps(
                 if (opts.format == .json) {
                     try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
                 } else {
-                    try writeStderr(deps, "fx upgrade: failed to load update settings\n");
+                    try writeStderr(deps, "fn update: failed to load update settings\n");
                 }
                 return .handled_failure;
             };
@@ -1341,7 +1341,7 @@ fn runNonInteractiveWithDeps(
                     if (opts.format == .json) {
                         try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to save update channel");
                     } else {
-                        try writeStderr(deps, "fx upgrade: failed to save update channel\n");
+                        try writeStderr(deps, "fn update: failed to save update channel\n");
                     }
                     return .handled_failure;
                 };
@@ -1361,7 +1361,7 @@ fn runNonInteractiveWithDeps(
                 .text => .text,
                 .json => .json,
             }) catch {
-                try writeStderr(deps, "fx upgrade: render failed\n");
+                try writeStderr(deps, "fn update: render failed\n");
                 return .handled_failure;
             };
             defer alloc.free(text);
@@ -3218,6 +3218,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("upgrade")})) {
+        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{@constCast("update")})) {
         .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
         else => return error.TestExpectedEqual,
     }

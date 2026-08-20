@@ -19,6 +19,7 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
 }
 
 pub const cdn_base = "https://github.com/shengyuanchu/fn/releases/download";
+pub const latest_release_asset_url = "https://github.com/shengyuanchu/fn/releases/latest/download/latest.txt";
 
 pub fn resolveCdnBase() []const u8 {
     if (io_mod.getenv("FX_E2E_UPGRADE_BASE_URL")) |url| {
@@ -95,7 +96,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8) !Ta
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
+    const url = try latestVersionUrlAlloc(alloc, base_url);
     defer alloc.free(url);
 
     const raw = try fetchTextBounded(
@@ -110,6 +111,13 @@ fn fetchLatestVersion(alloc: Allocator, base_url: []const u8) ![]u8 {
     const duped = try alloc.dupe(u8, trimmed);
     alloc.free(raw);
     return duped;
+}
+
+fn latestVersionUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {
+    if (std.mem.eql(u8, base_url, cdn_base)) {
+        return alloc.dupe(u8, latest_release_asset_url);
+    }
+    return std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
 }
 
 fn fetchTextBounded(
@@ -333,8 +341,22 @@ test "production upgrade base never targets upstream fx releases" {
     try std.testing.expectEqualStrings("https://github.com/shengyuanchu/fn/releases/download", resolveCdnBase());
 }
 
+test "latest version URL uses the fn release asset in production" {
+    const alloc = std.testing.allocator;
+    const production = try latestVersionUrlAlloc(alloc, cdn_base);
+    defer alloc.free(production);
+    try std.testing.expectEqualStrings(
+        "https://github.com/shengyuanchu/fn/releases/latest/download/latest.txt",
+        production,
+    );
+
+    const loopback = try latestVersionUrlAlloc(alloc, "http://127.0.0.1:1234");
+    defer alloc.free(loopback);
+    try std.testing.expectEqualStrings("http://127.0.0.1:1234/latest.txt", loopback);
+}
+
 test "extractChecksumHex parses sha256sum format" {
-    const with_filename = "abc123def456  fx-macos-aarch64.tar.gz\n";
+    const with_filename = "abc123def456  fn-macos-aarch64.tar.gz\n";
     const hex = extractChecksumHex(with_filename).?;
     try std.testing.expectEqualStrings("abc123def456", hex);
 }
