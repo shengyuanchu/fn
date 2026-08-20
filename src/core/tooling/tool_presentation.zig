@@ -211,14 +211,15 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return std.fmt.allocPrint(alloc, "Working: {s}", .{call.name});
     };
 
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (spec.executor_kind == .web_search) {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ spec.action_label, try formatWebSearchActionDetail(scratch, args) });
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     if (try copyRenameLabel(scratch, call.name, args)) |value| {
-        return std.fmt.allocPrint(alloc, "{s} {s}", .{ spec.action_label, value });
+        return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
     }
-    const value = tool_dispatch.toolLabelValue(spec.*, args) orelse spec.label_arg_default;
-    return std.fmt.allocPrint(alloc, "{s} {s}", .{ spec.action_label, value });
+    const value = tool_dispatch.presentationLabelValue(presentation, args) orelse presentation.label_arg_default;
+    return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.

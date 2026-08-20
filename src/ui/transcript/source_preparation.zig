@@ -1,6 +1,7 @@
 const std = @import("std");
 const command_output_runtime = @import("command_output_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const transcript_release = @import("../../core/output/transcript_release.zig");
 const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const tool_group_projection = @import("tool_group_projection.zig");
 const render_engine = @import("../render_engine.zig");
@@ -27,39 +28,6 @@ const visualRowsForLine = transcript_blocks.visualRowsForLine;
 test {
     _ = tool_group_projection;
 }
-
-/// Byte offset where an unfenced tool turn's first rendered entry begins.
-/// Whether the turn is still open is a frame-fresh fact (the lifecycle
-/// watermark), so every retained turn keeps a candidate and the planner
-/// selects against the live watermark.
-pub const ToolTurnFloor = struct {
-    turn_id: u64,
-    start_byte: usize,
-};
-
-/// Activity-independent finality boundary candidates for the prepared flow.
-/// Each offset addresses the source's `bytes` at its `cols`.
-/// Selection against frame-fresh producer facts (lifecycle watermark,
-/// assistant-tail writability) happens in the scroll planner, outside any
-/// source cache.
-pub const FinalityCandidates = struct {
-    mutation_pin_start: ?usize = null,
-    assistant_tail_start: ?usize = null,
-    tool_turn_floors: []ToolTurnFloor = &.{},
-
-    pub fn deinit(self: *FinalityCandidates, alloc: Allocator) void {
-        if (self.tool_turn_floors.len > 0) alloc.free(self.tool_turn_floors);
-        self.* = .{};
-    }
-
-    pub fn clone(self: *const FinalityCandidates, alloc: Allocator) !FinalityCandidates {
-        return .{
-            .mutation_pin_start = self.mutation_pin_start,
-            .assistant_tail_start = self.assistant_tail_start,
-            .tool_turn_floors = try alloc.dupe(ToolTurnFloor, self.tool_turn_floors),
-        };
-    }
-};
 
 const FinalityNominationKind = enum { mutation_pin, tool_turn, assistant_tail };
 
@@ -214,7 +182,7 @@ pub const TranscriptPreparationSource = struct {
     transcript_visible_lines: []viewport_selection.VisibleTranscriptLine = &.{},
     transcript_line_visual_rows: []u16 = &.{},
     transcript_visual_row_offsets: []u32 = &.{},
-    finality: FinalityCandidates = .{},
+    finality: transcript_release.Candidates = .{},
 
     pub fn deinit(self: *TranscriptPreparationSource, alloc: Allocator) void {
         if (self.bytes.len > 0) alloc.free(self.bytes);
@@ -511,7 +479,7 @@ fn prepareTranscriptSourceInternal(
     else
         aligned_actions;
 
-    var finality: FinalityCandidates = .{};
+    var finality: transcript_release.Candidates = .{};
     errdefer finality.deinit(alloc);
     if (self.entries.items.len > 0 and self.layout.cols > 0) {
         rendered_from_entries = true;
@@ -567,7 +535,7 @@ fn prepareTranscriptSourceInternal(
         trailing_boundary_blank_rows = rendered.trailing_boundary_blank_rows;
         tracked_entry_start_line = rendered.target_entry_start_line;
         replaceable_entry_start_byte = rendered.target_entry_start_byte;
-        var tool_turn_floors: std.ArrayList(ToolTurnFloor) = .empty;
+        var tool_turn_floors: std.ArrayList(transcript_release.ToolTurnFloor) = .empty;
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
             const start_byte = finality_entry_start_bytes[index] orelse blk: {

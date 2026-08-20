@@ -4076,12 +4076,9 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     var accepted_review = TestReviewTurn.init("Create desktop-test.txt with hello.", accepted_call);
     const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{});
 
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expect(fake.saw_file_mutation_context);
-    try std.testing.expectEqualStrings(
-        "Create desktop-test.txt with hello.",
-        fake.root_text,
-    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(!fake.saw_file_mutation_context);
+    try std.testing.expectEqualStrings("", fake.root_text);
     try std.testing.expectEqual(ToolPermissionDecision.once, accepted.decision);
     const authorization = switch (accepted.execution_authority orelse return error.TestExpectedEqual) {
         .file_mutation => |authorization| authorization,
@@ -4090,6 +4087,15 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     try std.testing.expect(authorization.prepared != null);
     try std.testing.expectEqualStrings(target_path, authorization.input.path());
 
+    {
+        var existing = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "external/desktop-test.txt",
+            .{ .truncate = true },
+        );
+        defer existing.close(io_mod.getIo());
+        try existing.writeStreamingAll(io_mod.getIo(), "existing\n");
+    }
     fake.decision = .ask;
     const blocked_call: ToolCall = .{
         .id = "external-write-check",
@@ -4098,7 +4104,7 @@ test "ACP auto mode automatic review allows or asks prepared external file mutat
     };
     var blocked_review = TestReviewTurn.init("Create desktop-test.txt with hello.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.auto_denied, blocked.denial_reason.?);
     try std.testing.expect(blocked.execution_authority == null);

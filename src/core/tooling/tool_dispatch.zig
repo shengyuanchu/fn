@@ -29,6 +29,7 @@ const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
+const tool_args = @import("tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -406,6 +407,18 @@ pub const RuntimeProviderKind = enum {
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
 
+pub const CallPresentation = struct {
+    activity_kind: core_types.ToolActivityKind,
+    action_label: []const u8,
+    completed_action_label: []const u8,
+    label_arg_kind: LabelArgKind,
+    label_arg_default: []const u8,
+};
+
+/// Optional call-aware presentation override. Returned strings must outlive the
+/// parsed arguments supplied to the callback.
+pub const PresentationFn = *const fn (std.json.ObjectMap) ?CallPresentation;
+
 /// Descriptor for a core tool's model-facing metadata and runtime callbacks.
 pub const Tool = struct {
     name: []const u8,
@@ -424,6 +437,7 @@ pub const Tool = struct {
     completed_action_label: []const u8 = "Completed",
     label_arg_kind: LabelArgKind = .none,
     label_arg_default: []const u8 = "",
+    presentation_fn: ?PresentationFn = null,
     permission_target_kind: PermissionTargetKind = .none,
     decode: DecodeFn,
     validate: ?ValidateFn = null,
@@ -506,8 +520,58 @@ pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.To
     return if (registry.lookup(tool_name)) |tool| tool.activity_kind else .command;
 }
 
+pub fn staticPresentation(tool: Tool) CallPresentation {
+    return .{
+        .activity_kind = tool.activity_kind,
+        .action_label = tool.action_label,
+        .completed_action_label = tool.completed_action_label,
+        .label_arg_kind = tool.label_arg_kind,
+        .label_arg_default = tool.label_arg_default,
+    };
+}
+
+pub fn presentationForArgs(tool: Tool, args: std.json.ObjectMap) CallPresentation {
+    if (tool.presentation_fn) |resolve| {
+        if (resolve(args)) |presentation| return presentation;
+    }
+    return staticPresentation(tool);
+}
+
+pub fn toolCallPresentation(
+    alloc: Allocator,
+    registry: Registry,
+    call: core_types.ToolCall,
+) ?CallPresentation {
+    const tool = registry.lookup(call.name) orelse return null;
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const args = tool_args.parseToolArgsObject(
+        scratch_state.allocator(),
+        call.arguments_json,
+    ) catch return staticPresentation(tool.*);
+    return presentationForArgs(tool.*, args);
+}
+
+pub fn toolActivityKindForCall(
+    alloc: Allocator,
+    registry: Registry,
+    call: core_types.ToolCall,
+) core_types.ToolActivityKind {
+    const presentation = toolCallPresentation(alloc, registry, call) orelse
+        return .command;
+    return presentation.activity_kind;
+}
+
 pub fn toolLabelValue(tool: Tool, args: std.json.ObjectMap) ?[]const u8 {
-    return switch (tool.label_arg_kind) {
+    return labelValueForKind(tool.label_arg_kind, args);
+}
+
+pub fn presentationLabelValue(presentation: CallPresentation, args: std.json.ObjectMap) ?[]const u8 {
+    return labelValueForKind(presentation.label_arg_kind, args);
+}
+
+fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
+    return switch (kind) {
         .none => null,
         .name => optionalStringArg(args, "name"),
         .path => optionalStringArg(args, "path"),

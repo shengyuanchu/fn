@@ -64,7 +64,7 @@ pub const Runtime = struct {
                 .history_reset_uses_ris = shell_runtime.detectHistoryResetUsesRis(alloc),
                 .layout = layout,
                 .maxxing_mode = presentation_mode.MaxxingMode.minimal,
-                .history_release_policy = .append_only,
+                .transcript_release = .{ .policy = .append_only },
             },
             .no_color = no_color,
         };

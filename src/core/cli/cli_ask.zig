@@ -105,22 +105,38 @@ const supports_headless_interrupt = switch (std_builtin.os.tag) {
 
 const HeadlessInterruptInstallError = error{HeadlessInterruptBusy};
 const headless_interrupt_exit_code: u8 = 130;
+const headless_termination_exit_code: u8 = 143;
 
 const headless_interrupt = if (supports_headless_interrupt) struct {
     var coordinator_mutex: std.Io.Mutex = .init;
     var coordinator_active = false;
     var cancel_requested = std.atomic.Value(bool).init(false);
+    var requested_signal = std.atomic.Value(u8).init(0);
     var test_after_reset_before_install: if (std_builtin.is_test) ?*const fn () void else void =
         if (std_builtin.is_test) null else {};
     var test_after_restore: if (std_builtin.is_test) ?*const fn () void else void =
         if (std_builtin.is_test) null else {};
 
-    fn handle(_: std.posix.SIG) callconv(.c) void {
+    fn handle(signal: std.posix.SIG) callconv(.c) void {
+        _ = requested_signal.cmpxchgStrong(
+            0,
+            @intCast(@intFromEnum(signal)),
+            .seq_cst,
+            .seq_cst,
+        );
         cancel_requested.store(true, .seq_cst);
     }
 
+    fn exitCode() u8 {
+        return switch (@as(std.posix.SIG, @enumFromInt(requested_signal.load(.seq_cst)))) {
+            std.posix.SIG.TERM => headless_termination_exit_code,
+            else => headless_interrupt_exit_code,
+        };
+    }
+
     const Scope = struct {
-        old_action: std.posix.Sigaction = undefined,
+        old_sigint_action: std.posix.Sigaction = undefined,
+        old_sigterm_action: std.posix.Sigaction = undefined,
         installed: bool = false,
 
         fn install(enabled: bool) HeadlessInterruptInstallError!Scope {
@@ -135,11 +151,13 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
                 .flags = 0,
             };
             var scope = Scope{};
+            requested_signal.store(0, .seq_cst);
             cancel_requested.store(false, .seq_cst);
             if (std_builtin.is_test) {
                 if (test_after_reset_before_install) |hook| hook();
             }
-            std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_action);
+            std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_sigint_action);
+            std.posix.sigaction(std.posix.SIG.TERM, &action, &scope.old_sigterm_action);
             coordinator_active = true;
             scope.installed = true;
             return scope;
@@ -150,12 +168,14 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             coordinator_mutex.lockUncancelable(io_mod.getIo());
             defer coordinator_mutex.unlock(io_mod.getIo());
             std.debug.assert(coordinator_active);
-            std.posix.sigaction(std.posix.SIG.INT, &self.old_action, null);
+            std.posix.sigaction(std.posix.SIG.INT, &self.old_sigint_action, null);
+            std.posix.sigaction(std.posix.SIG.TERM, &self.old_sigterm_action, null);
             if (std_builtin.is_test) {
                 if (test_after_restore) |hook| hook();
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
-                _ = std.c.raise(std.posix.SIG.INT);
+                const signal: std.posix.SIG = @enumFromInt(requested_signal.load(.seq_cst));
+                _ = std.c.raise(signal);
             }
             coordinator_active = false;
             self.installed = false;
@@ -174,6 +194,10 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
         }
     };
 } else struct {
+    fn exitCode() u8 {
+        return headless_interrupt_exit_code;
+    }
+
     const Scope = struct {
         fn install(_: bool) HeadlessInterruptInstallError!Scope {
             return .{};
@@ -287,6 +311,7 @@ const AskOptions = struct {
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
     json_output: bool = false,
+    prompt_permissions: bool = false,
     timeout_ms: ?usize = null,
     quiet: bool = false,
     verbose: bool = false,
@@ -398,14 +423,11 @@ const OutputMode = enum {
     fn capturesJson(self: OutputMode) bool {
         return self == .json;
     }
-
-    fn permitsPermissionPrompt(self: OutputMode) bool {
-        return self == .raw or self.isTerminal();
-    }
 };
 
 const RunOptions = struct {
     output_mode: OutputMode,
+    prompt_permissions: bool = false,
     images: []const ImageAttachment = &.{},
     command_timeout_ms: ?usize = null,
     save_session: bool = true,
@@ -470,6 +492,7 @@ const AskContext = struct {
     typed_error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
+    prompt_permissions: bool = false,
     presenter: ?*ask_presentation.Runtime = null,
     pending_tool_progress: std.ArrayList(PendingToolProgress) = .empty,
     deferred_tool_progress: std.ArrayList([]u8) = .empty,
@@ -477,6 +500,7 @@ const AskContext = struct {
     raw_boundary_pending: bool = false,
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
+    command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
@@ -593,7 +617,10 @@ const AskContext = struct {
             return;
         };
         debug_trace.logf("notifications", "sound play kind={s} cue={s}", .{ @tagName(kind), @tagName(cue) });
-        player.play(cue);
+        switch (kind) {
+            .attention_required => player.playAttention(cue),
+            .turn_end => player.play(cue),
+        }
     }
 
     fn deinit(self: *AskContext) void {
@@ -883,6 +910,7 @@ const AskContext = struct {
             .subagent_caller_id = if (self.writable) |*writable| writable.active_id else null,
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
+            .cancel_flag = self.cancelFlag(),
             .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
@@ -1131,13 +1159,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     };
     defer options.deinit(alloc);
 
-    if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
     if (options.image_paths.items.len > 0) {
         const workspace_root = try io_mod.realpathAlloc(alloc, ".");
         defer alloc.free(workspace_root);
         if (!try preflightAskImages(alloc, workspace_root, &options, deps)) return 1;
     }
-    if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
 
     var effective_cfg = cfg;
     if (options.system_prompt_override) |sp| {
@@ -1152,6 +1180,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     );
     const result = runPromptInternal(alloc, options.prompt, options.permission_override, effective_cfg, .{
         .output_mode = output_mode,
+        .prompt_permissions = options.prompt_permissions,
         .images = if (options.images.items.len > 0) options.images.items else &.{},
         .command_timeout_ms = options.timeout_ms,
         .save_session = !options.no_save,
@@ -1160,7 +1189,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .continue_recovery = options.continue_recovery,
         .deps = deps,
     }) catch |err| {
-        if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         if (err == error.OutOfMemory) return err;
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
@@ -1178,18 +1207,18 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     defer result.deinit(alloc);
 
     if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt_exit_code;
+        return headless_interrupt.exitCode();
     }
 
     if (options.json_output) {
         const json = try renderFinalJsonResult(alloc, result);
         defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         try deps.write_stdout(deps.stdout_ctx, json);
     }
 
     return if (interrupt_scope.requested())
-        headless_interrupt_exit_code
+        headless_interrupt.exitCode()
     else
         result.exit_code;
 }
@@ -1334,6 +1363,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var worker_events_drained = false;
     ctx.workspace_access = startup.takeWorkspaceAccess();
     ctx.output_mode = options.output_mode;
+    ctx.prompt_permissions = options.prompt_permissions;
     ctx.mcp_elicitation_capabilities = askElicitationCapabilities(
         options.output_mode,
         options.deps.stdin_is_tty(options.deps.stdin_ctx),
@@ -1936,7 +1966,7 @@ fn cliAdmissionContext(
         advertised_dynamic_tool_names,
     );
     tool_ctx.permission_review_turn = review_turn;
-    if (cliPermissionPromptAllowed(ctx)) {
+    if (cliContextPermissionPromptAllowed(ctx)) {
         tool_ctx.permission_prompter = .{
             .context = @ptrCast(ctx),
             .request_fn = requestCliPermission,
@@ -2154,7 +2184,7 @@ fn promptCliPermissionApproval(
     ctx: *AskContext,
     label: []const u8,
 ) !PermissionApprovalPromptResult {
-    if (!cliPermissionPromptAllowed(ctx)) return .unavailable;
+    if (!cliContextPermissionPromptAllowed(ctx)) return .unavailable;
     return try ctx.deps.permission_approval_prompt(
         ctx.deps.permission_approval_prompt_ctx,
         ctx.deps.stderr_ctx,
@@ -2182,8 +2212,23 @@ fn emitAskNotificationBell(raw: *anyopaque) void {
     };
 }
 
-fn cliPermissionPromptAllowed(ctx: *const AskContext) bool {
-    return ctx.output_mode.permitsPermissionPrompt();
+fn cliPermissionPromptAllowed(
+    output_mode: OutputMode,
+    prompt_permissions: bool,
+    stdin_is_tty: bool,
+) bool {
+    return switch (output_mode) {
+        .raw, .terminal, .terminal_no_color => true,
+        .json, .quiet => prompt_permissions and stdin_is_tty,
+    };
+}
+
+fn cliContextPermissionPromptAllowed(ctx: *const AskContext) bool {
+    return cliPermissionPromptAllowed(
+        ctx.output_mode,
+        ctx.prompt_permissions,
+        ctx.deps.stdin_is_tty(ctx.deps.stdin_ctx),
+    );
 }
 
 fn describeToolAction(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -2788,7 +2833,12 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
     try ctx.writeStderr(payload.preview);
 }
 
-fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
+fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.output_mode.isTerminal() or !ctx.command_output_line_open) return;
+    try ctx.writeStderr("\n");
+    ctx.command_output_line_open = false;
+}
 
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
@@ -2817,6 +2867,7 @@ fn onCommandOutputChunk(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: comma
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.output_mode.isTerminal()) return;
     try ctx.writeStderr(chunk);
+    if (chunk.len > 0) ctx.command_output_line_open = chunk[chunk.len - 1] != '\n';
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
@@ -3172,6 +3223,8 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             opts.system_prompt_override = try alloc.dupe(u8, args[i]);
         } else if (std.mem.eql(u8, arg, "--json")) {
             opts.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--prompt-permissions")) {
+            opts.prompt_permissions = true;
         } else if (std.mem.eql(u8, arg, "--timeout")) {
             i += 1;
             if (i >= args.len) return error.MissingPrompt;
@@ -3648,7 +3701,7 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
 
 fn testConfig() Config {
     return .{
-        .command_usage = "ask [--auto|--yolo] [--image PATH] [--json] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
+        .command_usage = "ask [--auto|--yolo] [--image PATH] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>",
         .default_model = "model",
         .default_agent_step_limit = 4,
         .gateway_retry_count = 1,
@@ -4572,6 +4625,7 @@ test "parse options preserves active ask flags and operands" {
         "--system",
         "second",
         "--json",
+        "--prompt-permissions",
         "--quiet",
         "--verbose",
         "--no-save",
@@ -4585,6 +4639,7 @@ test "parse options preserves active ask flags and operands" {
 
     try std.testing.expectEqual(@as(?PermissionMode, .auto), options.permission_override);
     try std.testing.expect(options.json_output);
+    try std.testing.expect(options.prompt_permissions);
     try std.testing.expect(options.quiet);
     try std.testing.expect(options.verbose);
     try std.testing.expect(options.no_save);
@@ -5905,6 +5960,85 @@ test "fx ask captured and quiet permission paths bypass terminal prompt" {
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "noninteractive_permission_prompt_unavailable") != null);
 }
 
+test "fx ask permission prompt policy requires explicit captured-mode opt in and TTY stdin" {
+    const Case = struct {
+        output_mode: OutputMode,
+        prompt_permissions: bool,
+        stdin_is_tty: bool,
+        expected: bool,
+    };
+    const cases = [_]Case{
+        .{ .output_mode = .raw, .prompt_permissions = false, .stdin_is_tty = false, .expected = true },
+        .{ .output_mode = .terminal, .prompt_permissions = false, .stdin_is_tty = false, .expected = true },
+        .{ .output_mode = .terminal_no_color, .prompt_permissions = false, .stdin_is_tty = false, .expected = true },
+        .{ .output_mode = .json, .prompt_permissions = false, .stdin_is_tty = true, .expected = false },
+        .{ .output_mode = .quiet, .prompt_permissions = false, .stdin_is_tty = true, .expected = false },
+        .{ .output_mode = .json, .prompt_permissions = true, .stdin_is_tty = false, .expected = false },
+        .{ .output_mode = .quiet, .prompt_permissions = true, .stdin_is_tty = false, .expected = false },
+        .{ .output_mode = .json, .prompt_permissions = true, .stdin_is_tty = true, .expected = true },
+        .{ .output_mode = .quiet, .prompt_permissions = true, .stdin_is_tty = true, .expected = true },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            cliPermissionPromptAllowed(
+                case.output_mode,
+                case.prompt_permissions,
+                case.stdin_is_tty,
+            ),
+        );
+    }
+}
+
+test "fx ask captured permission prompt opt in uses the existing prompter" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var prompt = TestPermissionPrompt{ .result = .approve };
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+    deps.permission_approval_prompt_ctx = @ptrCast(&prompt);
+    deps.permission_approval_prompt = TestPermissionPrompt.prompt;
+    deps.stdin_is_tty = TestTty.yes;
+    var ctx = AskContext.init(alloc, testConfig(), deps, "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.prompt_permissions = true;
+
+    ctx.output_mode = .json;
+    const approved = try requestToolPermissionOutcome(&ctx, arena, .{
+        .id = "captured-approved",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch captured-approved.txt\"}",
+    }, .ask, &.{}, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, approved.decision);
+    try std.testing.expectEqual(@as(usize, 1), prompt.calls);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
+    try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+
+    prompt.result = .deny;
+    ctx.output_mode = .quiet;
+    const denied = try requestToolPermissionOutcome(&ctx, arena, .{
+        .id = "quiet-denied",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch quiet-denied.txt\"}",
+    }, .ask, &.{}, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.deny, denied.decision);
+    try std.testing.expectEqual(@as(usize, 2), prompt.calls);
+
+    ctx.deps.stdin_is_tty = TestTty.no;
+    try std.testing.expectError(error.NonInteractivePermissionRequired, requestToolPermissionOutcome(&ctx, arena, .{
+        .id = "quiet-non-tty",
+        .name = "terminal",
+        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch quiet-non-tty.txt\"}",
+    }, .ask, &.{}, &.{}));
+    try std.testing.expectEqual(@as(usize, 2), prompt.calls);
+}
+
 test "fx ask terminal permission prompt propagates prompt hook errors" {
     const FailingPrompt = struct {
         fn prompt(
@@ -6130,11 +6264,8 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
     var review_turn = TestReviewTurn.init("Write hello to desktop-test.txt.", call);
     const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{});
 
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqualStrings(
-        "Write hello to desktop-test.txt.",
-        fake.root_text,
-    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqualStrings("", fake.root_text);
     try std.testing.expectEqual(ToolPermissionDecision.once, accepted.decision);
     const authorization = switch (accepted.execution_authority orelse return error.TestExpectedEqual) {
         .file_mutation => |authorization| authorization,
@@ -8878,6 +9009,34 @@ test "CLI tagged stream routes source output rendering and diagnostics by mode" 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rendered, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(source_output, parsed.value.object.get("output").?.string);
+}
+
+test "CLI command output completion terminates only an open display line" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+
+    try onCommandOutputChunk(&ctx, null, .stdout, "no-final");
+    try pushCommandOutputComplete(&ctx, null);
+    try std.testing.expectEqualStrings("no-final\n", stderr_capture.bytes.items);
+
+    try onCommandOutputChunk(&ctx, null, .stdout, "with-final\n");
+    try pushCommandOutputComplete(&ctx, null);
+    try pushCommandOutputComplete(&ctx, null);
+    try std.testing.expectEqualStrings(
+        "no-final\nwith-final\n",
+        stderr_capture.bytes.items,
+    );
 }
 
 test "CLI nonterminal progress preserves distinct deferred labels without duplicates" {

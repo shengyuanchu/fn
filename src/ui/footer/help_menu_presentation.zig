@@ -238,7 +238,7 @@ fn composeCommandRow(
     try row.appendSlice(alloc, ui_render.reset_style);
     try row_text.appendSpacesToColumn(alloc, &row, description_col);
 
-    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row_text.appendSingleLineEllipsized(
         alloc,
         &row,
@@ -305,6 +305,11 @@ test "help menu renders each command on one linear row at wide and narrow widths
     try std.testing.expect(std.mem.find(u8, selected.items, "show available slash commands") != null);
     try std.testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, selected.items, '\n'));
     const description_start = std.mem.find(u8, selected.items, "show available slash commands").?;
+    const selected_style_start = description_start - ui_render.selected_completion_style.len;
+    try std.testing.expectEqualStrings(
+        ui_render.selected_completion_style,
+        selected.items[selected_style_start..description_start],
+    );
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(selected.items[0..description_start]) >= 100 * 2 / 3);
 
     const narrow_rows = menuRowCount(projection, 22, 20);

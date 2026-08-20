@@ -1121,11 +1121,17 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModelRuntime(app: *App, resolved: []const u8, announce: bool) !void {
-            app.selected_model.clearRetainingCapacity();
-            try app.selected_model.appendSlice(app.alloc, resolved);
-            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, resolved);
-            if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(resolved);
-            terminalTitle(app).setModel(resolved);
+            if (!std.mem.eql(u8, app.selected_model.items, resolved)) {
+                const stable = try app.alloc.dupe(u8, resolved);
+                defer app.alloc.free(stable);
+                try app.selected_model.ensureTotalCapacity(app.alloc, stable.len);
+                app.selected_model.clearRetainingCapacity();
+                app.selected_model.appendSliceAssumeCapacity(stable);
+            }
+            const selected = app.selected_model.items;
+            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
+            if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
+            terminalTitle(app).setModel(selected);
 
             if (announce) {
                 const active_response = if (comptime @hasField(App, "stream"))
@@ -1133,7 +1139,7 @@ pub fn Commands(comptime App: type) type {
                 else
                     false;
                 const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
-                const line = try std.fmt.allocPrint(app.alloc, "{s}{s}", .{ prefix, resolved });
+                const line = try std.fmt.allocPrint(app.alloc, "{s}{s}", .{ prefix, selected });
                 defer app.alloc.free(line);
                 try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
                 if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
@@ -2737,6 +2743,27 @@ test "session_commands selectModelFromPicker skips effort changes for models wit
     try std.testing.expectEqualStrings("openai/gpt-4o", app.worker.synced_model.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(!app.fast_mode);
+}
+
+test "session_commands model picker accepts the current selected model slice" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
+    app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        app.selected_model.items,
+        types.ReasoningEffort.literal("high"),
+        false,
+    );
+
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.selected_model.items);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.terminalTitleModelText());
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
 }
 
 test "session_commands selectModelFromPicker persists portable Gateway reasoning effort" {

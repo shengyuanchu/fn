@@ -18,6 +18,7 @@ const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const render_engine = @import("../render_engine.zig");
 const source_preparation = @import("source_preparation.zig");
+const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_writer = @import("writer.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -1125,7 +1126,7 @@ pub const PreparedTranscriptSurfacePaint = struct {
     // Owned copy of the source's finality boundary candidates; the scroll
     // planner selects the release floor from these against frame-fresh
     // producer facts. Empty candidates mean the whole flow is final.
-    finality_candidates: source_preparation.FinalityCandidates = .{},
+    finality_candidates: transcript_release.Candidates = .{},
     cursor: ViewportCursorResult = .{ .cursor_row = 1, .cursor_col = 1, .replaceable_row = 1 },
 
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {

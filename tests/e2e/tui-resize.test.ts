@@ -20,6 +20,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   fakeGatewayToolCall,
   hasEmptyComposer,
   paneExitMatches,
@@ -1704,6 +1705,137 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(session.isPaneAlive()).toBe(true);
     },
     TIMEOUT,
+  );
+
+  test(
+    "structured retention keeps native scrollback complete before resize",
+    async () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-retention-native-scrollback-")),
+      );
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      tempDirs.push(root);
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      );
+      writeFileSync(stderrPath, "");
+
+      const begin = "RETENTION_SCROLLBACK_BEGIN";
+      const end = "RETENTION_SCROLLBACK_END";
+      const beforeMarkers = Array.from(
+        { length: 120 },
+        (_, index) => `RETENTION_A_${String(index).padStart(3, "0")}`,
+      );
+      const afterMarkers = Array.from(
+        { length: 120 },
+        (_, index) => `RETENTION_B_${String(index).padStart(3, "0")}`,
+      );
+      const markers = [
+        begin,
+        ...beforeMarkers,
+        ...afterMarkers,
+        end,
+      ];
+      const response = fakeGatewaySse([
+        {
+          type: "text-delta",
+          id: "retention-text-a",
+          delta: `${begin}\n${beforeMarkers.map((marker) =>
+            `${marker} retained before semantic code block`
+          ).join("\n")}\n`,
+        },
+        {
+          type: "text-delta",
+          id: "retention-code",
+          delta: "```zig\nconst retained_scrollback = true;\n```\n",
+        },
+        {
+          type: "text-delta",
+          id: "retention-text-b",
+          delta: `${afterMarkers.map((marker) =>
+            `${marker} retained after semantic code block`
+          ).join("\n")}\n`,
+        },
+        {
+          type: "text-delta",
+          id: "retention-tail",
+          delta:
+            "| phase | state |\n| --- | --- |\n| middle | retained |\n\n---\n" +
+            `${end}\n`,
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 3 },
+            outputTokens: { total: 5_000 },
+          },
+        },
+      ]);
+      const command =
+        `awk 'BEGIN { for (i = 0; i < 13500; i++) printf "RETENTION_SEED_%05d alpha beta gamma delta epsilon zeta eta theta iota kappa lambda\\n", i }'`;
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("retention-seed", "terminal", { action: "exec", command }),
+        response,
+      ]);
+      gateways.push(gateway);
+
+      session = await createResizeSession({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-retention-scrollback-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          MODEL: FAKE_GATEWAY_MODEL,
+          FX_MAX_AGENT_STEPS: "4",
+          FX_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        },
+        width: 120,
+        height: 40,
+        stderrPath,
+        minimumHistoryLines: MINIMUM_RESIZE_HISTORY_LINES,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("exercise structured retention scrollback");
+      await waitForLiveScrollbackText(session, end, 60_000);
+      await waitForGatewayRequestCount(gateway, 2, 60_000);
+      await session.waitForPane(
+        (pane) => pane.includes(end) && hasEmptyComposer(pane),
+        60_000,
+      );
+
+      const assertMarkersExactlyOnce = (scrollback: string) => {
+        for (const marker of markers) {
+          expect(countOccurrences(scrollback, marker)).toBe(1);
+        }
+      };
+      const beforeResize = await session.captureFullScrollback();
+      assertMarkersExactlyOnce(beforeResize);
+
+      await session.resizeWindow(72, 24, 700);
+      await waitForSettledFooter(session);
+      assertMarkersExactlyOnce(await session.captureFullScrollback());
+
+      await session.resizeWindow(120, 40, 700);
+      const grid = await waitForSettledFooter(session);
+      assertMarkersExactlyOnce(await session.captureFullScrollback());
+      expect(grid.filter(isInputRow)).toHaveLength(1);
+      expect(findFooter(grid)).not.toBeNull();
+      expect(gateway.requests).toHaveLength(2);
+      expect(session.isPaneAlive()).toBe(true);
+      expectEmptyStderr(stderrPath);
+    },
+    LARGE_SKILL_TIMEOUT,
   );
 
   test(

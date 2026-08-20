@@ -944,7 +944,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendKeys("-l '/m'");
-      await session.waitForText("Commands 3", 5_000);
+      await session.waitForPane(
+        (pane) => pane.includes("Commands ") && pane.includes("/model"),
+        5_000,
+      );
 
       const initialGrid = await session.capturePaneGrid();
       const modelRow = initialGrid.find((line) =>
@@ -1021,7 +1024,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
       await session.sendLiteralText("/m");
-      await session.waitForText("Results 7", 5_000);
+      await session.waitForPane(
+        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        5_000,
+      );
       grid = await session.capturePaneGrid();
       const modelRow = grid.find((line) => line.includes("/model"));
       const mcpRow = grid.find((line) => line.includes("/mcp"));
@@ -1046,7 +1052,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       session = await launch();
       await session.waitForComposer(10_000);
       await session.sendLiteralText("/m");
-      await session.waitForText("Results 7", 5_000);
+      await session.waitForPane(
+        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        5_000,
+      );
       grid = await session.capturePaneGrid();
       const restartedModelRow = grid.find((line) => line.includes("/model"));
       const restartedMcpRow = grid.find((line) => line.includes("/mcp"));
@@ -1135,7 +1144,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       mkdirSync(workspace, { recursive: true });
       writeFileSync(
         join(skillDir, "SKILL.md"),
-        "---\nname: resume-helper\ndescription: resume a saved workflow\n---\n\nResume helper body\n",
+        "---\nname: resume-helper\ndescription: resume a named saved workflow\n---\n\nResume helper body\n",
       );
 
       session = await TmuxSession.create({
@@ -1165,6 +1174,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           !current.includes("no matching slash commands"),
         5_000,
       );
+
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("/name");
+      pane = await session.waitForPane(
+        (current) => current.includes("/rename") && current.includes("resume-helper"),
+        5_000,
+      );
+      expect(pane.indexOf("/rename")).toBeLessThan(pane.indexOf("resume-helper"));
 
       await session.sendKeys("C-u");
       await session.pasteText("\n   ");
@@ -2677,6 +2694,62 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(new Set(rows).size).toBe(modelIds.length);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker skips effort stage for reasoning models without declared tiers",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const selectedModel = "deepseek/deepseek-v4-pro-0813";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          MODEL: "openai/gpt-4o",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("/model ");
+      await session.waitForText(selectedModel, 10_000);
+      await session.sendLiteralText(selectedModel);
+      await session.sendKeys("Enter");
+      await session.waitForText(`● Switched to ${selectedModel}`, 5_000);
+
+      const pane = (await session.capturePaneGrid()).join("\n");
+      expect(hasEmptyComposer(pane)).toBe(true);
+      expect(pane).not.toContain("Reasoning effort");
+      expect(pane).not.toContain("default");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).model).toBe(selectedModel);
+      expect(capturePaneTitle(session)).toBe(`fx · ${selectedModel}`);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
     },
     TEST_TIMEOUT,
   );

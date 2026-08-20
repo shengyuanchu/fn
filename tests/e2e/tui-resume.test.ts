@@ -738,6 +738,90 @@ test("volatile status rows normalize before stable-grid comparison", () => {
   expect(normalizeVolatileStatusRows(["  0s (↑6 ↓5)"])).toEqual(["<status>"]);
 });
 
+test.skipIf(!tmuxAvailable())(
+  "session resume command group opens last and explicit session ids",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-session-resume-command-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const seedStderrPath = join(root, "seed-stderr.log");
+    const exactStderrPath = join(root, "exact-stderr.log");
+    const lastStderrPath = join(root, "last-stderr.log");
+    const title = "Save the grouped session resume fixture.";
+    const marker = "GROUPED_SESSION_RESUME_FIXTURE";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(seedStderrPath, "");
+    writeFileSync(exactStderrPath, "");
+    writeFileSync(lastStderrPath, "");
+
+    const seedGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    const resumeGateway = startFakeGateway([]);
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: realpathSync(workspace),
+        env: gatewayEnv(home, seedGateway),
+        stderrPath: seedStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText(title);
+      await active.waitForText(marker, TIMEOUT);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      const cases = [
+        {
+          command: `${FX_BIN} session resume --id ${sessionId}`,
+          stderrPath: exactStderrPath,
+        },
+        {
+          command: `${FX_BIN} session resume last`,
+          stderrPath: lastStderrPath,
+        },
+      ];
+      for (const resumeCase of cases) {
+        active = await TmuxSession.create({
+          cmd: resumeCase.command,
+          cwd: realpathSync(workspace),
+          env: gatewayEnv(home, resumeGateway),
+          stderrPath: resumeCase.stderrPath,
+          width: 100,
+          height: 30,
+        });
+        const resumed = await waitForScrollbackMarkers(
+          active,
+          [`● Session resumed: ${title}`, marker],
+          TIMEOUT,
+        );
+        expect(resumed).toContain(marker);
+        expect(active.isPaneAlive()).toBe(true);
+        expect(readFileSync(resumeCase.stderrPath, "utf8")).toBe("");
+        await active.sendText("/quit");
+        expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+        await active.kill();
+        active = null;
+      }
+
+      expect(seedGateway.requests).toHaveLength(1);
+      expect(resumeGateway.requests).toHaveLength(0);
+      expect(readFileSync(seedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      seedGateway.stop();
+      resumeGateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);
+
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
   const tape = readFileSync(tapePath);
   const leaveAlternate = Buffer.from("\x1b[?1049l");

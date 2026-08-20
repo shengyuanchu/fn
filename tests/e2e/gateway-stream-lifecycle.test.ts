@@ -2635,6 +2635,86 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("SIGTERM drains an active headless terminal command without panic or survivors", async () => {
+    const root = createFixtureRoot("headless-sigterm");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "active-command.pid");
+    const command = [
+      'trap "" TERM',
+      `printf "%s %s" "$$" "$PPID" > ${JSON.stringify(pidPath)}`,
+      "while :; do sleep 1; done",
+    ].join("; ");
+    const gateway = startGateway(() =>
+      fakeGatewayToolCall("headless_sigterm_1", "terminal", {
+        action: "exec",
+        command,
+      })
+    );
+    const proc = Bun.spawn([
+      FX_BIN,
+      "ask",
+      "--json",
+      "--yolo",
+      "--no-save",
+      "Run the active command fixture.",
+    ], {
+      cwd: root.workspace,
+      env: {
+        ...process.env,
+        ...fixtureEnv(root, gateway, tracePath),
+        FX_AUTO_UPGRADE: "0",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    let targetPid: number | null = null;
+    let helperPid: number | null = null;
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!existsSync(pidPath)) {
+        if (Date.now() >= startDeadline) {
+          throw new Error("active terminal command did not start");
+        }
+        await Bun.sleep(10);
+      }
+      const pids = readFileSync(pidPath, "utf8").trim().split(/\s+/).map(Number);
+      expect(pids).toHaveLength(2);
+      [targetPid, helperPid] = pids;
+      expect(Number.isSafeInteger(targetPid) && targetPid > 0).toBe(true);
+      expect(Number.isSafeInteger(helperPid) && helperPid > 0).toBe(true);
+
+      const signalAt = Date.now();
+      proc.kill("SIGTERM");
+      const exitCode = await proc.exited;
+      const elapsedMs = Date.now() - signalAt;
+
+      await waitForProcessExit(targetPid, 3_000);
+      await waitForProcessExit(helperPid, 3_000);
+      const stderr = await new Response(proc.stderr).text();
+
+      expect(exitCode).toBe(143);
+      expect(proc.signalCode).toBe("SIGTERM");
+      expect(elapsedMs).toBeLessThan(3_000);
+      expect(stderr).not.toContain("panic: reached unreachable code");
+    } finally {
+      proc.kill("SIGKILL");
+      if (helperPid !== null && isProcessAlive(helperPid)) {
+        try {
+          process.kill(-helperPid, "SIGKILL");
+        } catch {}
+      }
+      if (targetPid !== null && isProcessAlive(targetPid)) {
+        try {
+          process.kill(targetPid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test(
     "nine saved turns stay canonical while the next request uses bounded context",
     async () => {

@@ -820,9 +820,8 @@ fn buildAuthorizedRequest(
         } },
         .write => .{ .write = .{
             .session_id = session_id,
-            .payload = if (input.lease == .use)
-                try buildWritePayload(arena, input.write orelse
-                    return error.InvalidWritePayload)
+            .payload = if (input.write) |write|
+                try buildWritePayload(arena, write)
             else
                 null,
             .lease = input.lease,
@@ -1757,6 +1756,7 @@ test "registered terminal validation enforces action-specific input before execu
         "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}",
         "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}",
         "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"acquire\"}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"text\",\"text\":\"input\\n\"}}",
         "{\"action\":\"wait\",\"session_id\":\"terminal-a\",\"return_when\":{\"kind\":\"exit\"},\"wait_ceiling_ms\":1000}",
         "{\"action\":\"monitor\",\"session_id\":\"terminal-a\",\"monitor\":{\"kind\":\"remove\",\"monitor_id\":\"monitor-a\"}}",
         "{\"action\":\"inspect\",\"session_id\":\"terminal-a\"}",
@@ -1775,6 +1775,32 @@ test "registered terminal validation enforces action-specific input before execu
             else => {},
         };
         try std.testing.expectEqual(.valid, accepted);
+    }
+
+    inline for (&.{
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"acquire\",\"write\":{\"kind\":\"text\",\"text\":\"input\\n\"}}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"release\",\"write\":{\"kind\":\"text\",\"text\":\"input\\n\"}}",
+        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"revoke\",\"write\":{\"kind\":\"text\",\"text\":\"input\\n\"}}",
+    }) |arguments_json| {
+        const rejected_lease_payload = try tool_dispatch.validateRegisteredToolCall(
+            ctx,
+            registry,
+            .{
+                .id = "terminal-invalid-lease-payload",
+                .name = "terminal",
+                .arguments_json = arguments_json,
+            },
+        );
+        defer switch (rejected_lease_payload) {
+            .failure => |reason| std.testing.allocator.free(reason),
+            else => {},
+        };
+        switch (rejected_lease_payload) {
+            .failure => |reason| try std.testing.expect(
+                std.mem.find(u8, reason, "InvalidWritePayload") != null,
+            ),
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     const mixed = try tool_dispatch.validateRegisteredToolCall(ctx, registry, .{

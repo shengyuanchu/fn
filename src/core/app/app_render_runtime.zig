@@ -60,6 +60,19 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 
+fn set_transcript_assistant_tail_writable(
+    runtime: *transcript_runtime.TranscriptRuntime,
+    writable: bool,
+) void {
+    if (runtime.transcript_release.assistant_tail_writable == writable) return;
+    runtime.transcript_release = runtime.transcript_release.with_assistant_tail_writable(writable);
+    debug_trace.logf(
+        "scroll",
+        "assistant tail writability changed writable={s}",
+        .{if (writable) "true" else "false"},
+    );
+}
+
 pub const VisualEpochResetTrigger = enum {
     native_clear_probe,
     ctrl_l,
@@ -1146,7 +1159,7 @@ pub fn Runtime(comptime App: type) type {
             const runtime = app.subagents.childConversationRuntime().?;
             // A live child can still stream into its trailing assistant
             // entry; a finished child's tail is final.
-            runtime.setAssistantTailWritable(view.chat.live != null);
+            set_transcript_assistant_tail_writable(runtime, view.chat.live != null);
             if (!std.meta.eql(runtime.layout, app.shell.layout)) {
                 runtime.layout = app.shell.layout;
                 runtime.markTranscriptDirty();
@@ -1578,7 +1591,8 @@ pub fn Runtime(comptime App: type) type {
             // Frame-fresh producer fact for the finality floor: the trailing
             // assistant entry stays non-final while the stream is open or
             // the pacer still holds undelivered output.
-            app.shell.setAssistantTailWritable(
+            set_transcript_assistant_tail_writable(
+                &app.shell,
                 app.stream.active or app.pacer.hasPending(),
             );
             const presentation_shell: *transcript_runtime.TranscriptRuntime =
@@ -3638,6 +3652,40 @@ fn solveFixedPointForTest(
         FixedPointTestContext.prepareCandidate,
         FixedPointTestContext.resolveCandidate,
     );
+}
+
+test "assistant tail writability changes remain traceable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const trace_path = try std.fs.path.join(alloc, &.{ root, "assistant-tail.log" });
+    defer alloc.free(trace_path);
+
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, trace_path, "scroll");
+
+    var runtime = transcript_runtime.TranscriptRuntime{};
+    set_transcript_assistant_tail_writable(&runtime, false);
+    set_transcript_assistant_tail_writable(&runtime, true);
+    debug_trace.shutdown();
+
+    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer trace_file.close(std.testing.io);
+    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=false",
+    ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        trace,
+        "assistant tail writability changed writable=true",
+    ) != null);
 }
 
 test "core.app_render_runtime makes selected child display names terminal safe" {

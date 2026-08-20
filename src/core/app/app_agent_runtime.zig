@@ -1177,8 +1177,9 @@ fn formatToolAction(
         return formatInvalidArgsToolAction(arena, state, denied_label, call.name);
     };
 
-    const value = tool_dispatch.toolLabelValue(spec.*, args) orelse spec.label_arg_default;
-    return formatToolActionValue(arena, specLabel(spec, state, denied_label), value);
+    const presentation = tool_dispatch.presentationForArgs(spec.*, args);
+    const value = tool_dispatch.presentationLabelValue(presentation, args) orelse presentation.label_arg_default;
+    return formatToolActionValue(arena, presentationLabel(presentation, state, denied_label), value);
 }
 
 fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
@@ -1216,6 +1217,14 @@ fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_lab
     return switch (state) {
         .active => spec.action_label,
         .completed => spec.completed_action_label,
+        .denied => denied_label.?,
+    };
+}
+
+fn presentationLabel(presentation: tool_dispatch.CallPresentation, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
+    return switch (state) {
+        .active => presentation.action_label,
+        .completed => presentation.completed_action_label,
         .denied => denied_label.?,
     };
 }
@@ -2098,6 +2107,19 @@ test "tool labels preserve memory action value and invalid argument fallback" {
     const completed = try app.describeToolActionCompleted(arena, memory_call);
     try std.testing.expect(std.mem.find(u8, completed, "Remembered") != null);
     try std.testing.expect(std.mem.find(u8, completed, "save") != null);
+
+    const list_call: ToolCall = .{
+        .id = "memory_list",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+    const list_active = try app.describeToolAction(arena, list_call);
+    try std.testing.expect(std.mem.find(u8, list_active, "Listing") != null);
+    try std.testing.expect(std.mem.find(u8, list_active, "memories") != null);
+
+    const list_completed = try app.describeToolActionCompleted(arena, list_call);
+    try std.testing.expect(std.mem.find(u8, list_completed, "Listed") != null);
+    try std.testing.expect(std.mem.find(u8, list_completed, "memories") != null);
 
     const invalid_call: ToolCall = .{
         .id = "memory_invalid",

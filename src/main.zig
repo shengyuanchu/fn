@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.3";
+pub const version = "0.0.4";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -533,7 +533,9 @@ const App = struct {
     context_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
-    auto_upgrade_enabled: bool = true,
+    // fn releases are distributed by this fork's installer. Do not let the
+    // inherited fx updater replace fn with an upstream binary.
+    auto_upgrade_enabled: bool = false,
     effort: ReasoningEffort = .auto,
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
@@ -966,6 +968,7 @@ const App = struct {
             app_callbacks.Bindings(App).workerEventHandlers(self),
             flushRequestedFrame,
         );
+        try SessionAppRuntime.settlePendingLiveSessionTransition(self);
     }
 
     fn flushRequestedFrame(self: *App) !void {
@@ -1178,9 +1181,9 @@ const App = struct {
 
     pub fn historicalToolActivityKind(
         self: *App,
-        tool_name: []const u8,
+        call: types.ToolCall,
     ) types.ToolActivityKind {
-        return tool_dispatch.toolActivityKind(self.toolRegistry(), tool_name);
+        return tool_dispatch.toolActivityKindForCall(self.alloc, self.toolRegistry(), call);
     }
 
     pub fn commitStartupResumeReplayAnchor(self: *App) !void {
@@ -1895,7 +1898,7 @@ const App = struct {
         call: types.ToolCall,
         result: types.PersistedToolResult,
     ) !void {
-        const activity_kind = tool_dispatch.toolActivityKind(self.toolRegistry(), call.name);
+        const activity_kind = tool_dispatch.toolActivityKindForCall(self.alloc, self.toolRegistry(), call);
         try self.shell.attachHistoricalToolDetail(self.alloc, entry_id, call, activity_kind, result);
     }
 
@@ -1906,7 +1909,7 @@ const App = struct {
         result: types.PersistedToolResult,
         lifecycle_id: types.ToolLifecycleId,
     ) !void {
-        const activity_kind = tool_dispatch.toolActivityKind(self.toolRegistry(), call.name);
+        const activity_kind = tool_dispatch.toolActivityKindForCall(self.alloc, self.toolRegistry(), call);
         try self.shell.attachHistoricalToolDetailWithLifecycle(
             self.alloc,
             entry_id,
@@ -1923,7 +1926,7 @@ const App = struct {
         call: types.ToolCall,
         result: types.PersistedToolResult,
     ) !void {
-        const activity_kind = tool_dispatch.toolActivityKind(self.toolRegistry(), call.name);
+        const activity_kind = tool_dispatch.toolActivityKindForCall(self.alloc, self.toolRegistry(), call);
         try self.shell.attachHistoricalToolDetailAfterCommandOutput(
             self.alloc,
             entry_id,

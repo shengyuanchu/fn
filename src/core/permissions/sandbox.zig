@@ -267,7 +267,6 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
     const term = waitForForegroundTarget(&target) catch |err| {
         target.kill(zio);
-        _ = target.wait(zio) catch {};
         writeForegroundSessionReplaceFailure(args[1], err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
@@ -470,12 +469,14 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
     switch (term) {
         .exited => |code| std.process.exit(code),
         .signal => |signal| {
-            const default_action: std.posix.Sigaction = .{
-                .handler = .{ .handler = std.posix.SIG.DFL },
-                .mask = std.posix.sigemptyset(),
-                .flags = 0,
-            };
-            std.posix.sigaction(signal, &default_action, null);
+            if (signal != std.posix.SIG.KILL and signal != std.posix.SIG.STOP) {
+                const default_action: std.posix.Sigaction = .{
+                    .handler = .{ .handler = std.posix.SIG.DFL },
+                    .mask = std.posix.sigemptyset(),
+                    .flags = 0,
+                };
+                std.posix.sigaction(signal, &default_action, null);
+            }
             var signal_mask = std.posix.sigemptyset();
             std.posix.sigaddset(&signal_mask, signal);
             std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
@@ -2739,9 +2740,6 @@ fn cleanupChild(child: *std.process.Child) void {
     }
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         child.kill(io_mod.getIo());
-        _ = child.wait(io_mod.getIo()) catch |err| {
-            debug_trace.logf("core", "command cleanup wait failed err={s}", .{@errorName(err)});
-        };
         return;
     }
     const pid = child.id orelse return;

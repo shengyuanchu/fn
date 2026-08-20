@@ -65,6 +65,7 @@ const latestCacheAbort = latest_pointer.latestCacheAbort;
 const latestCacheDeinit = latest_pointer.latestCacheDeinit;
 const latestCachePrepare = latest_pointer.latestCachePrepare;
 const latestCachePublish = latest_pointer.latestCachePublish;
+const latestCacheWriteDeferred = latest_pointer.latestCacheWriteDeferred;
 const latest_sessions_lock_file = latest_pointer.latest_sessions_lock_file;
 const latest_sessions_dir = latest_pointer.latest_sessions_dir;
 const recovery_staging_dir = "recovery+staging";
@@ -843,6 +844,17 @@ pub const Store = struct {
             );
             return .indeterminate;
         };
+        latest_pointer.removeDeferredToken(
+            sessions,
+            loaded.active_id,
+        ) catch |err| {
+            debug_trace.logf(
+                "session",
+                "event=pristine_session_discard disposition=indeterminate stage=deferred_token_cleanup err={s}",
+                .{@errorName(err)},
+            );
+            return .indeterminate;
+        };
         debug_trace.logf(
             "session",
             "event=pristine_session_discard disposition=discarded",
@@ -875,6 +887,14 @@ pub const Store = struct {
         return switch (target) {
             .id => |id| try root.admitResumeView(alloc, id),
             .last => blk: {
+                if (self.deferredCacheInvalidatesReads()) {
+                    var latest = try self.latestReadOnlyWorkspaceSummary(alloc);
+                    defer latest.deinit(alloc);
+                    break :blk try root.admitResumeView(
+                        alloc,
+                        latest.id,
+                    );
+                }
                 var latest = (try readLatestPointer(self, alloc, self.workspace_root)) orelse
                     return null;
                 defer latest.deinit(alloc);
@@ -988,6 +1008,13 @@ pub const Store = struct {
         workspace_root: []const u8,
         options: ResumeOptions,
     ) !LoadedWritableSession {
+        if (self.deferredCacheInvalidatesReads()) {
+            return self.resumeLatestDiscoveryAfterBarrier(
+                alloc,
+                workspace_root,
+                options,
+            );
+        }
         const cached = readLatestPointer(self, alloc, workspace_root) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
@@ -1147,7 +1174,12 @@ pub const Store = struct {
             options,
         );
         errdefer loaded.deinit(alloc);
-        self.repairLatestPointer(alloc, loaded.state, options.log) catch |err| {
+        self.repairLatestPointer(
+            alloc,
+            loaded.state,
+            loaded.position,
+            options.log,
+        ) catch |err| {
             debug_trace.logf(
                 "session",
                 "event=latest_cache_repair_failed err={s}",
@@ -1523,6 +1555,7 @@ pub const Store = struct {
             .context = cache,
             .prepare_fn = latestCachePrepare,
             .publish_fn = latestCachePublish,
+            .write_deferred_fn = latestCacheWriteDeferred,
             .abort_fn = latestCacheAbort,
             .deinit_fn = latestCacheDeinit,
         };
@@ -1547,11 +1580,13 @@ pub const Store = struct {
         self: Store,
         alloc: Allocator,
         state: session_codec.DurableSessionState,
+        position: session_log.CommitPosition,
         options: session_log.Options,
     ) !void {
         try self.publishLatestPointer(
             alloc,
             state,
+            position,
             options,
             .maintain,
         );
@@ -1561,6 +1596,7 @@ pub const Store = struct {
         self: Store,
         alloc: Allocator,
         state: session_codec.DurableSessionState,
+        position: session_log.CommitPosition,
         source_session_id: []const u8,
         options: session_log.Options,
     ) !void {
@@ -1586,6 +1622,7 @@ pub const Store = struct {
             self.publishLatestPointer(
                 alloc,
                 state,
+                position,
                 options,
                 .{ .replace_latest_if_current = .{
                     .expected_current_id = source_session_id,
@@ -1608,6 +1645,7 @@ pub const Store = struct {
         self: Store,
         alloc: Allocator,
         state: session_codec.DurableSessionState,
+        position: session_log.CommitPosition,
         options: session_log.Options,
         effect: InitialIndexEffect,
     ) !void {
@@ -1626,7 +1664,7 @@ pub const Store = struct {
             state.workspace_root,
             options.commit_lock_deadline_ms,
         );
-        try cache.publish(alloc, state);
+        try cache.publish(alloc, state, position);
     }
 
     /// Loads a session's summary, state, and storage format read-only, handling
@@ -1673,6 +1711,11 @@ pub const Store = struct {
     /// Lists all readable sessions newest-first. Caller frees each item and the list.
     pub fn list(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
         return self.scanSessionSummaries(alloc, .read_only_list);
+    }
+
+    fn deferredCacheInvalidatesReads(self: Store) bool {
+        const sessions = &(self.canonical_root.sessions orelse return false);
+        return summary_codec.deferredCachePresent(sessions) catch true;
     }
 
     /// Invalidates the derived resume catalog after managed child ownership
@@ -1723,6 +1766,15 @@ pub const Store = struct {
         alloc: Allocator,
         continuation: RelationshipMigrationCursor,
     ) ListSubagentControlIdsError!RelationshipMigrationCandidatePage {
+        if (self.deferredCacheInvalidatesReads()) {
+            return self.listRelationshipMigrationCandidatesFromCanonical(
+                alloc,
+                continuation,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SessionStoreUnavailable,
+            };
+        }
         var sessions = self.canonical_root.sessions orelse
             return error.SessionStoreUnavailable;
         if (self.canonical_root.mode == .read_only) {
@@ -1768,6 +1820,40 @@ pub const Store = struct {
                 };
             },
         };
+    }
+
+    fn listRelationshipMigrationCandidatesFromCanonical(
+        self: Store,
+        alloc: Allocator,
+        continuation: RelationshipMigrationCursor,
+    ) !RelationshipMigrationCandidatePage {
+        var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
+        defer freeSummaries(alloc, &summaries);
+        const total = std.math.cast(u64, summaries.items.len) orelse
+            return error.SessionStoreUnavailable;
+        const same_snapshot = continuation.inode == 0 and
+            continuation.mtime_ns == 0 and
+            continuation.size == total and
+            continuation.offset <= total;
+        const start = if (same_snapshot) continuation.offset else 0;
+        const remaining = total - start;
+        const count = @min(
+            remaining,
+            summary_codec.relationship_migration_candidate_limit,
+        );
+        const end = start + count;
+        var page = RelationshipMigrationCandidatePage{
+            .cursor = .{
+                .size = total,
+                .offset = end,
+            },
+            .has_more = end < total,
+        };
+        errdefer page.deinit(alloc);
+        for (summaries.items[@intCast(start)..@intCast(end)]) |summary| {
+            try page.ids.append(alloc, try alloc.dupe(u8, summary.id));
+        }
+        return page;
     }
 
     /// Persists the unresolved marker before its matching session checkpoint.
@@ -2188,29 +2274,83 @@ pub const Store = struct {
         continuation: ?ResumableSessionContinuation,
     ) !ResumableSessionPage {
         var sessions = self.canonical_root.sessions orelse return error.SessionStoreUnavailable;
-        var cache_lock = try io_mod.acquireTimedAdvisoryLock(
-            &sessions,
-            latest_sessions_lock_file,
-            2000,
-        );
-        defer cache_lock.release();
-
-        if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |page| {
-            return page;
-        }
-
         var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
         defer freeSummaries(alloc, &summaries);
         try self.refreshMissingDisplayMetadata(alloc, &summaries);
-        try writeSessionIndex(alloc, &sessions, summaries.items);
-        try removeSessionIndexMarker(&sessions);
-        return try self.resumablePageFromSummariesForScope(
+        var page = try self.resumablePageFromSummariesForScope(
             alloc,
             scope,
             summaries.items,
             active_id,
             continuation,
         );
+        errdefer page.deinit(alloc);
+
+        var cache_lock = io_mod.acquireTimedAdvisoryLock(
+            &sessions,
+            latest_sessions_lock_file,
+            0,
+        ) catch return page;
+        var cache_lock_held = true;
+        defer if (cache_lock_held) cache_lock.release();
+
+        if (try self.tryListResumableIndexPageForScope(alloc, scope, active_id, continuation)) |indexed| {
+            page.deinit(alloc);
+            return indexed;
+        }
+        var observed = summary_codec.readDeferredCacheTokens(
+            alloc,
+            &sessions,
+        ) catch return page;
+        defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
+        var repair_summaries = try self.scanSessionSummaries(alloc, .read_only_list);
+        defer freeSummaries(alloc, &repair_summaries);
+        try self.refreshMissingDisplayMetadata(alloc, &repair_summaries);
+        try writeSessionIndex(alloc, &sessions, repair_summaries.items);
+        try removeSessionIndexMarker(&sessions);
+        cache_lock.release();
+        cache_lock_held = false;
+        for (observed.items) |token| {
+            var root = self.canonical_root;
+            var boundary = root.captureReadBoundary(
+                alloc,
+                token.session_id,
+                .{ .commit_lock_deadline_ms = 0 },
+            ) catch |err| switch (err) {
+                error.SessionNotFound => {
+                    latest_pointer.clearObservedDeferredToken(
+                        alloc,
+                        &sessions,
+                        token,
+                    ) catch |clear_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_cache_orphan_clear_failed err={s}",
+                            .{@errorName(clear_err)},
+                        );
+                    };
+                    continue;
+                },
+                else => continue,
+            };
+            defer boundary.deinit();
+            if (!latest_pointer.commitPositionCovers(
+                boundary.position,
+                token.position,
+            )) continue;
+            latest_pointer.clearObservedDeferredToken(
+                alloc,
+                &sessions,
+                token,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=deferred_cache_token_clear_failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
+        return page;
     }
 
     fn listResumablePageFromDiscoveryForScope(
@@ -2457,6 +2597,7 @@ pub const Store = struct {
     ) !SessionSummaryScan {
         var scan = SessionSummaryScan{};
         errdefer scan.deinit(alloc);
+        const replay_schema_v3 = self.deferredCacheInvalidatesReads();
         var metadata: std.ArrayList(DiscoveryCandidateMetadata) = .empty;
         defer metadata.deinit(alloc);
         if (self.canonical_root.sessions == null) return scan;
@@ -2491,6 +2632,32 @@ pub const Store = struct {
                 },
             };
             session_dir.close();
+            if (replay_schema_v3 and candidate.storage == .schema_v3) {
+                var detail = self.loadReadOnlyDetail(
+                    alloc,
+                    entry.name,
+                    .{},
+                ) catch |err| {
+                    candidate.deinit(alloc);
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            logDiscoveryError(mode, entry.name, null, null, err);
+                            scan.skipped_invalid += 1;
+                            continue;
+                        },
+                    }
+                };
+                candidate.deinit(alloc);
+                candidate = .{
+                    .summary = detail.summary,
+                    .storage = .schema_v3,
+                    .projection_state = .current,
+                };
+                detail.summary = undefined;
+                detail.state.deinit(alloc);
+                detail = undefined;
+            }
             candidate.summary.has_managed_children =
                 self.sessionHasManagedChildren(alloc, entry.name) catch |err| switch (err) {
                     error.OutOfMemory => {
@@ -2922,6 +3089,7 @@ pub const Store = struct {
     ) !?[]u8 {
         try validateWorkspaceRoot(workspace_root);
         if (self.canonical_root.sessions == null) return null;
+        const replay_schema_v3 = self.deferredCacheInvalidatesReads();
 
         var selected: ?WritableCandidate = null;
         defer if (selected) |*candidate| candidate.deinit(alloc);
@@ -2953,6 +3121,27 @@ pub const Store = struct {
                     return err;
                 },
             };
+            if (replay_schema_v3 and candidate.storage == .schema_v3) {
+                var root = self.canonical_root;
+                var state = root.loadReadOnly(
+                    alloc,
+                    entry.name,
+                    options.log,
+                ) catch |err| {
+                    candidate.deinit(alloc);
+                    return mapReplayError(err);
+                };
+                defer state.deinit(alloc);
+                candidate.deinit(alloc);
+                candidate = try dupeWritableCandidate(
+                    alloc,
+                    state.id,
+                    state.workspace_root,
+                    state.updated_at_ms,
+                    .schema_v3,
+                    .current,
+                );
+            }
             if (!std.mem.eql(u8, candidate.workspace_root, workspace_root)) {
                 logDiscovery(
                     .workspace_writable_last,
@@ -3711,6 +3900,7 @@ pub const Store = struct {
         self.publishRecoveredLatestPointer(
             alloc,
             recovered,
+            target.position,
             source_id,
             options,
         ) catch |err| {
@@ -4572,6 +4762,9 @@ fn readLatestPointer(
     workspace_root: []const u8,
 ) !?LatestPointer {
     const sessions = self.canonical_root.sessions orelse return null;
+    if (try summary_codec.deferredCachePresent(&sessions)) {
+        return error.InvalidSessionIndex;
+    }
     return readLatestPointerFromSessions(&sessions, alloc, workspace_root);
 }
 
@@ -4663,6 +4856,22 @@ fn testDurableState(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
     };
+}
+
+fn expectDeferredCacheTokenMissing(
+    alloc: Allocator,
+    sessions: *const io_mod.VerifiedDir,
+    session_id: []const u8,
+) !void {
+    if (try summary_codec.readDeferredCacheToken(
+        alloc,
+        sessions,
+        session_id,
+    )) |token_value| {
+        var token = token_value;
+        defer token.deinit(alloc);
+        return error.TestExpectedEqual;
+    }
 }
 
 fn testIndexedSessionSummary(
@@ -7041,7 +7250,7 @@ test "workspace rebind honors an immediate latest cache lock deadline" {
     try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
 }
 
-test "existing session lifecycle honors a per-operation latest cache deadline" {
+test "same-workspace append defers latest cache contention and marks cache dirty" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7060,9 +7269,88 @@ test "existing session lifecycle honors a per-operation latest cache deadline" {
     );
     defer latest_lock.release();
 
+    const prior = loaded.position;
     const started_at_ms = io_mod.milliTimestamp();
+    const committed = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+    try std.testing.expect(committed.through_seq > prior.through_seq);
+    try std.testing.expectEqual(@as(?bool, true), loaded.state.preferences.fast_mode);
+
+    var latest = try sessions.dir.openDir(io_mod.getIo(), latest_sessions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer latest.close(io_mod.getIo());
+    var deferred = try latest.openDir(io_mod.getIo(), "deferred", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer deferred.close(io_mod.getIo());
+    var token = try deferred.openFile(io_mod.getIo(), state.id, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    defer token.close(io_mod.getIo());
+    const token_stat = try token.stat(io_mod.getIo());
+    try std.testing.expectEqual(std.Io.File.Kind.file, token_stat.kind);
+    try std.testing.expectEqual(@as(u32, 0o600), token_stat.permissions.toMode() & 0o777);
+    const token_bytes = try io_mod.readFileToEnd(
+        alloc,
+        &token,
+        summary_codec.max_deferred_cache_token_bytes,
+    );
+    defer alloc.free(token_bytes);
+    var decoded = try summary_codec.decodeDeferredCacheToken(alloc, token_bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(state.id, decoded.session_id);
+    try std.testing.expectEqualStrings(ctx.workspace, decoded.workspace_root);
+    try std.testing.expectEqualDeep(committed, decoded.position);
+}
+
+test "deferred token failure prevents a same-workspace canonical commit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "deferred-token-failure", ctx.workspace);
+    defer state.deinit(alloc);
+    var loaded = try ctx.store.startWritableSession(alloc, state);
+    defer loaded.deinit(alloc);
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest = try sessions.dir.openDir(io_mod.getIo(), latest_sessions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer latest.close(io_mod.getIo());
+    var obstacle = try latest.createFile(io_mod.getIo(), "deferred", .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .resolve_beneath = true,
+    });
+    obstacle.close(io_mod.getIo());
+
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    const prior = loaded.position;
+    const prior_fast_mode = loaded.state.preferences.fast_mode;
     try std.testing.expectError(
-        error.SessionCommitBoundaryUnavailable,
+        error.DurablePathUnsafe,
         loaded.appendEvent(
             alloc,
             .{ .preferences_changed = .{ .fast_mode = true } },
@@ -7071,7 +7359,584 @@ test "existing session lifecycle honors a per-operation latest cache deadline" {
             .{ .commit_lock_deadline_ms = 0 },
         ),
     );
-    try std.testing.expect(io_mod.milliTimestamp() - started_at_ms < 1000);
+    try std.testing.expectEqualDeep(prior, loaded.position);
+    try std.testing.expectEqual(prior_fast_mode, loaded.state.preferences.fast_mode);
+}
+
+test "same-workspace compaction replacement defers latest cache contention" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "deferred-replacement", ctx.workspace);
+    defer state.deinit(alloc);
+    var loaded = try ctx.store.startWritableSession(alloc, state);
+    defer loaded.deinit(alloc);
+    var replacement = try loaded.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    replacement.updated_at_ms = 30;
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    const committed = try loaded.commitStateReplacement(
+        alloc,
+        replacement,
+        .compaction,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    try std.testing.expectEqual(@as(i64, 30), loaded.state.updated_at_ms);
+
+    var latest = try sessions.dir.openDir(io_mod.getIo(), latest_sessions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer latest.close(io_mod.getIo());
+    var deferred = try latest.openDir(io_mod.getIo(), "deferred", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer deferred.close(io_mod.getIo());
+    var token = try deferred.openFile(io_mod.getIo(), state.id, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    defer token.close(io_mod.getIo());
+    const token_bytes = try io_mod.readFileToEnd(
+        alloc,
+        &token,
+        summary_codec.max_deferred_cache_token_bytes,
+    );
+    defer alloc.free(token_bytes);
+    var decoded = try summary_codec.decodeDeferredCacheToken(alloc, token_bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(committed, decoded.position);
+}
+
+test "migration and recovery replacements keep latest cache contention strict" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "strict-replacement-cache-lock", ctx.workspace);
+    defer state.deinit(alloc);
+    var loaded = try ctx.store.startWritableSession(alloc, state);
+    defer loaded.deinit(alloc);
+    var replacement = try loaded.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    replacement.updated_at_ms = 30;
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    const prior = loaded.position;
+    for ([_]session_event.ReplacementReason{ .migration, .recovery }) |reason| {
+        try std.testing.expectError(
+            error.SessionCommitBoundaryUnavailable,
+            loaded.commitStateReplacement(
+                alloc,
+                replacement,
+                reason,
+                .retry_expected_tail,
+                .{ .commit_lock_deadline_ms = 0 },
+            ),
+        );
+        try std.testing.expectEqualDeep(prior, loaded.position);
+    }
+}
+
+test "session creation keeps latest cache contention strict" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "strict-creation-cache-lock", ctx.workspace);
+    defer state.deinit(alloc);
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    try std.testing.expectError(
+        error.SessionCommitBoundaryUnavailable,
+        ctx.store.startWritableSessionWithOptions(
+            alloc,
+            state,
+            .{ .commit_lock_deadline_ms = 0 },
+        ),
+    );
+    try std.testing.expectError(
+        error.SessionNotFound,
+        ctx.store.openSessionDir(state.id),
+    );
+}
+
+test "read-only session page replays canonical state for a deferred token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "dirty-read-only-page", ctx.workspace);
+    defer state.deinit(alloc);
+    var loaded = try ctx.store.startWritableSession(alloc, state);
+    defer loaded.deinit(alloc);
+
+    var warm = try ctx.store.listResumablePage(alloc, null, null);
+    warm.deinit(alloc);
+    var session_dir = try ctx.store.openSessionDir(state.id);
+    defer session_dir.close();
+    var manifest_file = try session_dir.dir.openFile(io_mod.getIo(), "session.json", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    const stale_manifest = try io_mod.readFileToEnd(
+        alloc,
+        &manifest_file,
+        session_projection.manifest_max_bytes + 1,
+    );
+    manifest_file.close(io_mod.getIo());
+    defer alloc.free(stale_manifest);
+
+    var replacement = try loaded.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    replacement.updated_at_ms = 30;
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    _ = try loaded.commitStateReplacement(
+        alloc,
+        replacement,
+        .compaction,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    try io_mod.durableReplaceVerified(
+        alloc,
+        &session_dir,
+        "session.json",
+        stale_manifest,
+    );
+
+    var read_only = try Store.initReadOnlyFromHome(alloc, ctx.home, ctx.workspace);
+    defer read_only.deinit(alloc);
+    var page = try read_only.listSessionPage(
+        alloc,
+        .all_workspaces,
+        null,
+        session_list_default_limit,
+    );
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqual(@as(i64, 30), page.summaries.items[0].updated_at_ms);
+}
+
+test "writable picker returns canonical results while deferred repair is busy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "dirty-writable-picker",
+        ctx.workspace,
+        20,
+        "picker prompt",
+    );
+    var warm = try ctx.store.listResumablePage(alloc, null, null);
+    warm.deinit(alloc);
+    var writer = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .{ .id = "dirty-writable-picker" },
+        ctx.workspace,
+        .{},
+    );
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    _ = try writer.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    writer.deinit(alloc);
+
+    var page = try ctx.store.listResumablePage(alloc, null, null);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.summaries.items.len);
+    try std.testing.expectEqual(@as(i64, 30), page.summaries.items[0].updated_at_ms);
+
+    var latest = try sessions.dir.openDir(io_mod.getIo(), latest_sessions_dir, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer latest.close(io_mod.getIo());
+    var deferred = try latest.openDir(io_mod.getIo(), "deferred", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer deferred.close(io_mod.getIo());
+    var token = try deferred.openFile(io_mod.getIo(), "dirty-writable-picker", .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    });
+    token.close(io_mod.getIo());
+
+    latest_lock.release();
+    var repaired = try ctx.store.listResumablePage(alloc, null, null);
+    repaired.deinit(alloc);
+    try std.testing.expectError(
+        error.FileNotFound,
+        deferred.openFile(io_mod.getIo(), "dirty-writable-picker", .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }),
+    );
+}
+
+test "writable resume last selects canonically while deferred repair is busy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "dirty-resume-a",
+        ctx.workspace,
+        20,
+        "first prompt",
+    );
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "dirty-resume-b",
+        ctx.workspace,
+        25,
+        "second prompt",
+    );
+    var writer = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .{ .id = "dirty-resume-a" },
+        ctx.workspace,
+        .{},
+    );
+
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    _ = try writer.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    writer.deinit(alloc);
+
+    var admission = (try ctx.store.admitResumeView(alloc, .last)) orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("dirty-resume-a", admission.sessionId());
+    admission.deinit(alloc);
+
+    var resumed = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .last,
+        ctx.workspace,
+        .{ .log = .{ .commit_lock_deadline_ms = 0 } },
+    );
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqualStrings("dirty-resume-a", resumed.active_id);
+    try std.testing.expectEqual(@as(i64, 30), resumed.state.updated_at_ms);
+}
+
+test "incremental cache publication clears a stable deferred token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try writeWritableHistoryFixture(
+        alloc,
+        ctx.store,
+        "incremental-clears-deferred",
+        ctx.workspace,
+        20,
+        "incremental prompt",
+    );
+    var warm = try ctx.store.listResumablePage(alloc, null, null);
+    warm.deinit(alloc);
+    var writer = try ctx.store.resumeTargetForWrite(
+        alloc,
+        .{ .id = "incremental-clears-deferred" },
+        ctx.workspace,
+        .{},
+    );
+    defer writer.deinit(alloc);
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    _ = try writer.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    latest_lock.release();
+    _ = try writer.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = false } },
+        40,
+        .retry_expected_tail,
+        .{},
+    );
+    try expectDeferredCacheTokenMissing(alloc, &sessions, writer.active_id);
+}
+
+test "deferred token compare-before-clear retains a newer token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "newer-deferred-token", ctx.workspace);
+    defer state.deinit(alloc);
+    var writer = try ctx.store.startWritableSession(alloc, state);
+    var writer_open = true;
+    defer if (writer_open) writer.deinit(alloc);
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    _ = try writer.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        30,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    latest_lock.release();
+    var observed = try summary_codec.readDeferredCacheTokens(alloc, &sessions);
+    defer summary_codec.freeDeferredCacheTokens(alloc, &observed);
+    try std.testing.expectEqual(@as(usize, 1), observed.items.len);
+    writer.deinit(alloc);
+    writer_open = false;
+
+    var newer = observed.items[0].position;
+    newer.through_seq += 1;
+    newer.through_event_id = [_]u8{0xcd} ** 16;
+    newer.through_event_log_bytes += 1;
+    const cache = try LatestCache.init(alloc, &sessions, .{}, .maintain);
+    defer cache.deinit(alloc);
+    try cache.writeDeferredToken(
+        alloc,
+        state.id,
+        ctx.workspace,
+        newer,
+    );
+    try latest_pointer.clearObservedDeferredToken(
+        alloc,
+        &sessions,
+        observed.items[0],
+    );
+    var current = (try summary_codec.readDeferredCacheToken(
+        alloc,
+        &sessions,
+        state.id,
+    )) orelse return error.TestExpectedEqual;
+    defer current.deinit(alloc);
+    try std.testing.expectEqualDeep(newer, current.position);
+}
+
+test "failed canonical publication retains a safe false-positive deferred token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "false-positive-deferred", ctx.workspace);
+    defer state.deinit(alloc);
+    var writer = try ctx.store.startWritableSession(alloc, state);
+    defer writer.deinit(alloc);
+    const prior = writer.position;
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    var failure = MigrationBoundaryFailure{ .target = .after_event_sync };
+    var options = failure.options().log;
+    options.commit_lock_deadline_ms = 0;
+    try std.testing.expectError(
+        error.SessionPersistenceDegraded,
+        writer.appendEvent(
+            alloc,
+            .{ .preferences_changed = .{ .fast_mode = true } },
+            30,
+            .retry_expected_tail,
+            options,
+        ),
+    );
+    latest_lock.release();
+    try std.testing.expectEqualDeep(prior, writer.position);
+
+    var page = try ctx.store.listResumablePage(alloc, null, null);
+    page.deinit(alloc);
+    var token = (try summary_codec.readDeferredCacheToken(
+        alloc,
+        &sessions,
+        state.id,
+    )) orelse return error.TestExpectedEqual;
+    defer token.deinit(alloc);
+    try std.testing.expect(token.position.through_seq > prior.through_seq);
+}
+
+test "dirty relationship and managed-child candidates use canonical summaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "dirty-candidate-summary", ctx.workspace);
+    defer state.deinit(alloc);
+    var writer = try ctx.store.startWritableSession(alloc, state);
+    defer writer.deinit(alloc);
+    var replacement = try writer.state.dupe(alloc);
+    defer replacement.deinit(alloc);
+    replacement.updated_at_ms = 30;
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    var latest_lock = try io_mod.acquireTimedAdvisoryLock(
+        &sessions,
+        latest_sessions_lock_file,
+        2000,
+    );
+    defer latest_lock.release();
+    _ = try writer.commitStateReplacement(
+        alloc,
+        replacement,
+        .compaction,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+
+    var managed = try ctx.store.listManagedChildCandidatesForWorkspace(alloc);
+    defer freeSummaries(alloc, &managed);
+    try std.testing.expectEqual(@as(usize, 1), managed.items.len);
+    try std.testing.expectEqual(@as(i64, 30), managed.items[0].updated_at_ms);
+
+    var relationship = try ctx.store.listRelationshipMigrationCandidates(
+        alloc,
+        .{},
+    );
+    defer relationship.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), relationship.ids.items.len);
+    try std.testing.expectEqualStrings(
+        "dirty-candidate-summary",
+        relationship.ids.items[0],
+    );
+}
+
+test "writable repair removes a stable orphan deferred token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    const cache = try LatestCache.init(alloc, &sessions, .{}, .maintain);
+    defer cache.deinit(alloc);
+    try cache.writeDeferredToken(
+        alloc,
+        "orphan-deferred-token",
+        ctx.workspace,
+        .{
+            .log_generation = [_]u8{0x12} ** 16,
+            .through_seq = 1,
+            .through_event_id = [_]u8{0xab} ** 16,
+            .through_event_log_bytes = 100,
+        },
+    );
+
+    var page = try ctx.store.listResumablePage(alloc, null, null);
+    page.deinit(alloc);
+    try expectDeferredCacheTokenMissing(
+        alloc,
+        &sessions,
+        "orphan-deferred-token",
+    );
+}
+
+test "pristine discard removes its deferred token" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    var state = try testDurableState(alloc, "discard-deferred-token", ctx.workspace);
+    defer state.deinit(alloc);
+    var loaded = try ctx.store.startWritableSession(alloc, state);
+    var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
+    const cache = try LatestCache.init(alloc, &sessions, .{}, .maintain);
+    defer cache.deinit(alloc);
+    try cache.writeDeferredToken(
+        alloc,
+        loaded.active_id,
+        loaded.state.workspace_root,
+        loaded.position,
+    );
+
+    try std.testing.expectEqual(
+        PristineDiscardDisposition.discarded,
+        ctx.store.discardPristineStartedSession(alloc, &loaded),
+    );
+    try expectDeferredCacheTokenMissing(alloc, &sessions, state.id);
 }
 
 test "degraded-tail recovery republishes the workspace latest pointer" {

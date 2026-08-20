@@ -5,6 +5,7 @@ const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
+const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const worker_status = @import("../../core/output/worker_status.zig");
 const footer_viewport_runtime = @import("../footer/viewport.zig");
@@ -60,11 +61,6 @@ pub const ResizeObservationPhase = enum {
     live,
     settle_pending,
     reset_queued,
-};
-
-pub const HistoryReleasePolicy = enum {
-    finality_gated,
-    append_only,
 };
 
 pub const ResizeObservationResult = union(enum) {
@@ -4163,16 +4159,8 @@ pub const TranscriptRuntime = struct {
     entries: std.ArrayList(TranscriptEntry) = .empty,
     lifecycle_state: activity_runtime.ToolActivityState = .{},
     worker_status: worker_status.State = .none,
-    /// Frame-fresh producer fact: whether a trailing assistant entry can
-    /// still receive bytes (stream open or pacer holding pending/deferred
-    /// output). Drivers set it before each frame; the scroll planner treats
-    /// a writable tail as non-final. Defaults to writable so a driver that
-    /// never reports closure over-holds instead of releasing mutable rows.
-    assistant_tail_writable: bool = true,
-    /// Interactive transcripts gate native-history release on producer
-    /// finality. One-shot presenters use append-only release because they do
-    /// not revisit rows after writing them.
-    history_release_policy: HistoryReleasePolicy = .finality_gated,
+    /// Core-owned producer state and policy for native-history release.
+    transcript_release: transcript_release.State = .{},
     /// Sorted by entry id so exact lookup stays bounded as history grows.
     tool_details: std.ArrayList(ToolDetailRecord) = .empty,
     /// Monotonically increasing id stamped onto each new entry by the
@@ -6710,16 +6698,6 @@ pub const TranscriptRuntime = struct {
         return self.planTranscriptScrollForFrame(prepared, false, false);
     }
 
-    pub fn setAssistantTailWritable(self: *TranscriptRuntime, writable: bool) void {
-        if (self.assistant_tail_writable == writable) return;
-        self.assistant_tail_writable = writable;
-        debug_trace.logf(
-            "scroll",
-            "assistant tail writability changed writable={s}",
-            .{if (writable) "true" else "false"},
-        );
-    }
-
     /// Selects the finality floor in flow bytes from the prepared paint's
     /// activity-independent candidates plus the frame-fresh producer facts
     /// (lifecycle watermark, assistant-tail writability, replaceable tail).
@@ -6729,32 +6707,11 @@ pub const TranscriptRuntime = struct {
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
     ) ?usize {
-        if (self.history_release_policy == .append_only) return null;
-        const candidates = prepared.finality_candidates;
-        var floor: ?usize = null;
-        if (candidates.mutation_pin_start) |start| {
-            floor = if (floor) |value| @min(value, start) else start;
-        }
-        const watermark = self.finalizedToolTurnWatermark();
-        for (candidates.tool_turn_floors) |turn_floor| {
-            if (turn_floor.turn_id <= watermark) continue;
-            floor = if (floor) |value|
-                @min(value, turn_floor.start_byte)
-            else
-                turn_floor.start_byte;
-        }
-        if (prepared.replaceable_last_line) {
-            floor = if (floor) |value|
-                @min(value, prepared.replaceable_start)
-            else
-                prepared.replaceable_start;
-        }
-        if (candidates.assistant_tail_start) |start| {
-            if (self.assistant_tail_writable) {
-                floor = if (floor) |value| @min(value, start) else start;
-            }
-        }
-        return floor;
+        return self.transcript_release.finality_floor(
+            prepared.finality_candidates,
+            self.finalizedToolTurnWatermark(),
+            if (prepared.replaceable_last_line) prepared.replaceable_start else null,
+        );
     }
 
     /// Visual rows contributed by the flow prefix [0..flow_offset). The
@@ -10735,42 +10692,6 @@ test "owned stable transition traces a superseded pending resume source" {
         u8,
         trace,
         "pending resume flow dropped reason=superseded bytes=5",
-    ) != null);
-}
-
-test "assistant tail writability transitions are traceable" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "assistant-tail.log" });
-    defer alloc.free(trace_path);
-
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "scroll");
-    debug_trace.logf("scroll", "assistant tail trace test start", .{});
-
-    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(8) };
-    defer runtime.deinit(alloc);
-    runtime.setAssistantTailWritable(false);
-    runtime.setAssistantTailWritable(true);
-    debug_trace.shutdown();
-
-    var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
-    defer trace_file.close(std.testing.io);
-    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 4096);
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "assistant tail writability changed writable=false",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        trace,
-        "assistant tail writability changed writable=true",
     ) != null);
 }
 

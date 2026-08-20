@@ -1819,6 +1819,141 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "TUI terminal write lease payload contract rejects combined acquire and delivers after valid acquisition",
+  async () => {
+    const fixture = createFixture("fx-tui-terminal-lease-payload-");
+    const payload = "LEASE_PAYLOAD_INPUT\n";
+    let terminalSessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("tui_terminal_lease_start", "terminal", {
+        action: "start",
+        cwd: fixture.workspace,
+        command:
+          "printf 'TUI_PUBLIC_LEASE_PAYLOAD_READY\\n'; " +
+          "while IFS= read -r line; do " +
+          "printf 'TUI_PUBLIC_LEASE_PAYLOAD_ECHO:%s\\n' \"$line\"; done",
+        shell: {
+          kind: "executable",
+          path: TERMINAL_FIXTURE_SHELL,
+          clean_start: true,
+        },
+        backend: "native",
+        return_when: {
+          kind: "match",
+          pattern: "TUI_PUBLIC_LEASE_PAYLOAD_READY",
+        },
+        wait_ceiling_ms: 20_000,
+        dimensions: { rows: 24, columns: 80 },
+      }),
+      (body) => {
+        const result = JSON.parse(
+          toolResultText(body, "tui_terminal_lease_start"),
+        ) as {
+          success: { start: { session: { session_id: string } } };
+        };
+        terminalSessionId = result.success.start.session.session_id;
+        return fakeGatewayToolCall(
+          "tui_terminal_lease_invalid_acquire",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "acquire",
+            write: { kind: "text", text: payload },
+          },
+        );
+      },
+      (body) => {
+        expect(
+          toolResultText(body, "tui_terminal_lease_invalid_acquire"),
+        ).toContain("InvalidWritePayload");
+        return fakeGatewayToolCall(
+          "tui_terminal_lease_premature_use",
+          "terminal",
+          {
+            action: "write",
+            session_id: terminalSessionId,
+            lease: "use",
+            write: { kind: "text", text: payload },
+          },
+        );
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_lease_premature_use"))
+          .toContain('"code":"lease_conflict"');
+        return fakeGatewayToolCall("tui_terminal_lease_read_before", "terminal", {
+          action: "read",
+          session_id: terminalSessionId,
+          cursor_segment: 1,
+          cursor_offset: 0,
+        });
+      },
+      (body) => {
+        const output = toolResultText(body, "tui_terminal_lease_read_before");
+        expect(output).toContain("TUI_PUBLIC_LEASE_PAYLOAD_READY");
+        expect(output).not.toContain("TUI_PUBLIC_LEASE_PAYLOAD_ECHO");
+        return fakeGatewayToolCall("tui_terminal_lease_acquire", "terminal", {
+          action: "write",
+          session_id: terminalSessionId,
+          lease: "acquire",
+        });
+      },
+      (body) => {
+        const acquired = toolResultText(body, "tui_terminal_lease_acquire");
+        expect(acquired).toContain('"write_lease":"agent"');
+        expect(acquired).toContain('"accepted_bytes":0');
+        return fakeGatewayToolCall("tui_terminal_lease_use", "terminal", {
+          action: "write",
+          session_id: terminalSessionId,
+          lease: "use",
+          write: { kind: "text", text: payload },
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_lease_use"))
+          .toContain('"accepted_bytes":20');
+        return fakeGatewayToolCall("tui_terminal_lease_wait", "terminal", {
+          action: "wait",
+          session_id: terminalSessionId,
+          return_when: {
+            kind: "match",
+            pattern: "TUI_PUBLIC_LEASE_PAYLOAD_ECHO:LEASE_PAYLOAD_INPUT",
+          },
+          wait_ceiling_ms: 20_000,
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_lease_wait"))
+          .toContain('"outcome":{"condition_met":{}}');
+        return fakeGatewayToolCall("tui_terminal_lease_close", "terminal", {
+          action: "close",
+          session_id: terminalSessionId,
+          close_policy: "force",
+        });
+      },
+      (body) => {
+        expect(toolResultText(body, "tui_terminal_lease_close"))
+          .toContain('"lifecycle":"closed"');
+        return fakeGatewayFinalText("TUI terminal lease payload complete");
+      },
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+
+    await active.sendText("Exercise terminal lease and payload validation.");
+    const pane = await active.waitForText(
+      "TUI terminal lease payload complete",
+      TIMEOUT,
+    );
+    expect(pane).toContain("Failed write");
+    expect(pane).toContain("Used terminal write");
+    expect(gateway.requests).toHaveLength(9);
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
   "TUI public terminal controls reject encoded bytes and deliver key designators",
   async () => {
     const fixture = createFixture("fx-tui-terminal-public-controls-");

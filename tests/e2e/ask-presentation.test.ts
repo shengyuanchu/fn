@@ -137,6 +137,48 @@ function fakeGatewayStreamingText(lines: string[], delayMs: number) {
 }
 
 describe("fx ask presentation", () => {
+  test("redirected command output separates the next tool header", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      fakeGatewaySse([
+        {
+          type: "tool-call",
+          toolCallId: "no-final-newline",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf no-final-newline" },
+        },
+        {
+          type: "tool-call",
+          toolCallId: "next-command",
+          toolName: "terminal",
+          input: { action: "exec", command: "printf 'next-output\\n'" },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: "tool-calls" },
+        },
+      ]),
+      fakeGatewayFinalText("Commands complete.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "--no-color", "Run both commands."],
+      {
+        cwd: root.workspace,
+        env: gatewayEnv(root.home, gateway),
+        timeoutMs: TIMEOUT,
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(
+      "no-final-newline\nRunning printf 'next-output\\n'\nnext-output\n",
+    );
+    expect(result.stderr).not.toContain("no-final-newlineRunning printf");
+    expect(JSON.parse(result.stdout).output).toBe("Commands complete.\n");
+  }, TIMEOUT);
+
   test("fresh binary defaults terminal exec and start to the user profile", async () => {
     const configuredShell = userInfo().shell;
     if (!configuredShell.endsWith("/bash") && !configuredShell.endsWith("/zsh")) return;
@@ -385,6 +427,45 @@ describe("fx ask presentation", () => {
       expect(pane).not.toContain("# Ask presentation");
       expect(pane).not.toContain("**bold**");
       expect(escaped).toContain("\x1b[");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "memory list is presented as a read-only tool call",
+    async () => {
+      const root = createRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("memory_list", "memory", { action: "list" }),
+        fakeGatewayFinalText("Memory list complete.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--auto",
+          "--no-save",
+          "List saved memories.",
+        ]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const pane = await session.captureFullScrollback();
+      expect(pane).toContain("● 1 tool call · 1 read");
+      expect(pane).toContain("Listing memories");
+      expect(pane).not.toContain("1 write");
+      expect(pane).not.toContain("Remembered list");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

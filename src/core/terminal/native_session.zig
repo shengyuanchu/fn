@@ -1102,10 +1102,14 @@ const SupportedRegistry = struct {
             );
             return self.failure(
                 .start,
-                if (err == error.CapacityExceeded)
-                    .capacity_exceeded
-                else
-                    .authority_denied,
+                switch (err) {
+                    error.CapacityExceeded => .capacity_exceeded,
+                    error.MissingLoginShell => .shell_unavailable,
+                    error.RelativeShellPath,
+                    error.UnsupportedShell,
+                    => .invalid_request,
+                    else => .authority_denied,
+                },
                 null,
             );
         };
@@ -3193,11 +3197,9 @@ const Session = struct {
         persistence: contracts.StartPersistence,
     ) !Session {
         var login_shell_buffer: [4096]u8 = undefined;
-        const shell_path = switch (request.shell) {
-            .user_login => shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse "",
-            .executable => |value| value.path,
-        };
-        const shell = try alloc.dupe(u8, shell_path);
+        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+        const invocation = try shell_resolver.resolve(configured, request.shell);
+        const shell = try alloc.dupe(u8, invocation.path);
         errdefer alloc.free(shell);
         const cwd = try alloc.dupe(u8, request.cwd);
         errdefer alloc.free(cwd);
@@ -3372,13 +3374,10 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !void {
-        var login_shell_buffer: [4096]u8 = undefined;
-        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-        var invocation = try shell_resolver.resolve(configured, request.shell);
-        if (!std.mem.eql(u8, self.shell, invocation.path)) {
-            self.alloc.free(self.shell);
-            self.shell = try self.alloc.dupe(u8, invocation.path);
-        }
+        var invocation = try shell_resolver.resolve(
+            null,
+            pinnedShell(request.shell, self.shell),
+        );
 
         const executable = try std.process.executablePathAlloc(
             io_mod.getIo(),
@@ -3705,16 +3704,10 @@ const Session = struct {
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
-        var login_shell_buffer: [4096]u8 = undefined;
-        const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
         var invocation = try shell_resolver.resolve(
-            configured,
-            request.shell,
+            null,
+            pinnedShell(request.shell, self.shell),
         );
-        if (!std.mem.eql(u8, self.shell, invocation.path)) {
-            self.alloc.free(self.shell);
-            self.shell = try self.alloc.dupe(u8, invocation.path);
-        }
 
         var nonce_bytes: [16]u8 = undefined;
         io_mod.getIo().random(&nonce_bytes);
@@ -4724,6 +4717,19 @@ const Session = struct {
         return true;
     }
 };
+
+fn pinnedShell(
+    requested: contracts.ShellSpec,
+    resolved_path: []const u8,
+) contracts.ShellSpec {
+    return .{ .executable = .{
+        .path = resolved_path,
+        .clean_start = switch (requested) {
+            .user_login => false,
+            .executable => |value| value.clean_start,
+        },
+    } };
+}
 
 fn screenAction(
     session: *Session,

@@ -585,6 +585,13 @@ export class TmuxSession {
       : [
         ";",
         "set-option",
+        "-w",
+        "-t",
+        `${name}:0`,
+        "history-limit",
+        String(Math.max(serverHistoryLines!, minimumHistoryLines)),
+        ";",
+        "set-option",
         "-g",
         "history-limit",
         String(serverHistoryLines!),
@@ -887,6 +894,24 @@ export class TmuxSession {
     } catch {
       return "";
     }
+  }
+
+  /**
+   * Copy subsequent raw pane output to a file. Unlike capture-pane, this
+   * preserves control bytes such as BEL before tmux applies them to its grid.
+   */
+  startPaneOutputCapture(path: string): void {
+    execFileSync(
+      "tmux",
+      this.tmuxArgs([
+        "pipe-pane",
+        "-O",
+        "-t",
+        this.name,
+        `cat >> ${shellQuote(path)}`,
+      ]),
+      { stdio: "pipe" },
+    );
   }
 
   /**

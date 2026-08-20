@@ -2539,6 +2539,48 @@ test "processQueuedPrompt uses one available capability snapshot for history and
     try expectBodyContains(&gateway, 0, "\"maxOutputTokens\":16000");
 }
 
+test "processQueuedPrompt projects bounded output limits into gateway requests" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        context_window: ?u32,
+        max_output_tokens: ?u32,
+        expected_json: ?[]const u8,
+    }{
+        .{ .context_window = 256_000, .max_output_tokens = 32_000, .expected_json = "\"maxOutputTokens\":32000" },
+        .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576, .expected_json = null },
+    };
+
+    for (cases) |case| {
+        const available_overrides = [_]ModelCapabilityOverride{.{
+            .model = "provider/model",
+            .capabilities = .{
+                .context_window = case.context_window,
+                .max_output_tokens = case.max_output_tokens,
+            },
+        }};
+        const completions = [_]FakeCompletion{.{ .content = "Done" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("provider/model");
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        if (case.expected_json) |expected| {
+            try expectBodyContains(&gateway, 0, expected);
+        } else {
+            try expectBodyNotContains(&gateway, 0, "\"maxOutputTokens\"");
+        }
+        try std.testing.expectEqual(case.context_window, available_overrides[0].capabilities.context_window);
+        try std.testing.expectEqual(case.max_output_tokens, available_overrides[0].capabilities.max_output_tokens);
+    }
+}
+
 test "processQueuedPrompt resolves catalog capabilities for opaque effort" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

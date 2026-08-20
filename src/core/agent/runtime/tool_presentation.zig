@@ -669,6 +669,15 @@ pub fn activityKind(registry: tool_dispatch.Registry, tool_name: []const u8) typ
     return tool_dispatch.toolActivityKind(registry, tool_name);
 }
 
+pub fn activityKindForCall(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+) types.ToolActivityKind {
+    if (tooling_presentation.isProviderSearchAlias(call.name)) return .read;
+    return tool_dispatch.toolActivityKindForCall(alloc, registry, call);
+}
+
 fn formatProvisionalProgressLabel(
     buf: []u8,
     tool_name: []const u8,
@@ -717,7 +726,7 @@ pub noinline fn startToolVisibleLifecycle(
     file_display_path: ?[]const u8,
     advertised_dynamic_tool_names: []const []const u8,
 ) !bool {
-    const activity_kind = activityKind(hooks.tool_registry, call.name);
+    const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     if (activity_kind == .ask) return false;
     const redacted_arguments = try text_utils.maskSecrets(arena, call.arguments_json);
     const activity_line = try hooks.describe_tool_action(
@@ -842,7 +851,7 @@ fn finishDeniedToolStatusInternal(
         label,
         advertised_dynamic_tool_names,
     );
-    const command_artifact_handle = if (activityKind(hooks.tool_registry, call.name) == .command)
+    const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
         try commandArtifactHandle(arena, command_result_json)
     else
         null;
@@ -884,7 +893,7 @@ pub fn finishCancelledToolStatus(
         "Cancelled",
         advertised_dynamic_tool_names,
     );
-    const command_artifact_handle = if (activityKind(hooks.tool_registry, call.name) == .command)
+    const command_artifact_handle = if (activityKindForCall(arena, hooks.tool_registry, call) == .command)
         commandArtifactHandle(arena, result.command_result_json) catch |err| blk: {
             debug_trace.logf("tool", "cancelled command artifact handle omitted err={s}", .{@errorName(err)});
             break :blk null;
@@ -915,7 +924,7 @@ pub fn finishExecutedToolStatus(
     advertised_dynamic_tool_names: []const []const u8,
 ) !void {
     if (!status_started) return;
-    const activity_kind = activityKind(hooks.tool_registry, call.name);
+    const activity_kind = activityKindForCall(arena, hooks.tool_registry, call);
     const command_process_ran = activity_kind == .command and
         result_memory.command_process_presentation != null;
     const base_line = switch (if (command_process_ran) .success else result.status) {
@@ -1414,6 +1423,41 @@ test "tool lifecycle uses activity metadata from the supplied registry" {
         &.{},
     ));
     try std.testing.expectEqual(types.ToolActivityKind.open, capture.events.items[0].authoritative_started.activity_kind);
+}
+
+test "memory list authoritative lifecycle is classified as a read" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{
+        .alloc = alloc,
+        .tool_registry = .{ .tools = &.{test_builtin_tools.memory} },
+    };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+
+    try std.testing.expect(try startToolVisibleLifecycle(
+        &hooks,
+        arena,
+        1,
+        null,
+        .{
+            .id = "memory_list",
+            .name = "memory",
+            .arguments_json = "{\"action\":\"list\"}",
+        },
+        null,
+        &.{},
+    ));
+
+    switch (capture.events.items[0]) {
+        .authoritative_started => |event| try std.testing.expectEqual(
+            types.ToolActivityKind.read,
+            event.activity_kind,
+        ),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "presentation grouping spans silent tool steps and splits on visible prose" {

@@ -1401,6 +1401,51 @@ async function launchRouteRecoveryTui(
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   test(
+    "full-window output limit is omitted from the agent request",
+    async () => {
+      const model = "meta/muse-spark-1.2-contributor";
+      const finalText = "Full-window output limit omitted.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-full-window-output-limit-",
+        [fakeGatewayFinalText(finalText)],
+        {
+          model,
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use", "implicit-caching", "file-input", "vision"],
+            context_window: 1_048_576,
+            max_tokens: 1_048_576,
+          }],
+          settings: { model },
+        },
+      );
+      await waitForCondition(
+        () => queuedGateway.modelRequests.length === 1,
+        "full-window model catalog",
+      );
+
+      await session!.sendText("hi");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      expect(queuedGateway.modelRequests).toHaveLength(1);
+      expect(queuedGateway.requests).toHaveLength(1);
+      expect(JSON.parse(queuedGateway.requests[0]!.body)).not.toHaveProperty(
+        "maxOutputTokens",
+      );
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "live token counter includes submitted input, reasoning, and streamed text",
     async () => {
       const hold: TokenProgressHoldState = { started: false, cancelled: false };

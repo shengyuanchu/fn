@@ -53,6 +53,156 @@ const BackgroundSessionPolicy = enum {
     stop_forget,
 };
 
+const LiveSessionTransitionEvent = union(enum) {
+    request: BackgroundSessionPolicy,
+    settle,
+};
+
+const LiveSessionTransitionAction = union(enum) {
+    apply_now: BackgroundSessionPolicy,
+    cancel_and_defer,
+    apply_pending: BackgroundSessionPolicy,
+    none,
+};
+
+const LiveSessionTransitionDecision = struct {
+    pending_policy: ?BackgroundSessionPolicy,
+    action: LiveSessionTransitionAction,
+};
+
+fn decideLiveSessionTransition(
+    cooperative: bool,
+    processing: bool,
+    pending_policy: ?BackgroundSessionPolicy,
+    event: LiveSessionTransitionEvent,
+) LiveSessionTransitionDecision {
+    return switch (event) {
+        .request => |policy| if (!cooperative or !processing)
+            .{
+                .pending_policy = null,
+                .action = .{ .apply_now = policy },
+            }
+        else if (pending_policy == null)
+            .{
+                .pending_policy = policy,
+                .action = .cancel_and_defer,
+            }
+        else
+            .{
+                .pending_policy = policy,
+                .action = .none,
+            },
+        .settle => if (processing)
+            .{
+                .pending_policy = pending_policy,
+                .action = .none,
+            }
+        else if (pending_policy) |policy|
+            .{
+                .pending_policy = null,
+                .action = .{ .apply_pending = policy },
+            }
+        else
+            .{
+                .pending_policy = null,
+                .action = .none,
+            },
+    };
+}
+
+test "live session transition decision defers only active cooperative requests" {
+    const cases = [_]struct {
+        cooperative: bool,
+        processing: bool,
+        pending: ?BackgroundSessionPolicy,
+        event: LiveSessionTransitionEvent,
+        expected: LiveSessionTransitionDecision,
+    }{
+        .{
+            .cooperative = false,
+            .processing = true,
+            .pending = null,
+            .event = .{ .request = .carry_forward },
+            .expected = .{
+                .pending_policy = null,
+                .action = .{ .apply_now = .carry_forward },
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = false,
+            .pending = null,
+            .event = .{ .request = .stop_forget },
+            .expected = .{
+                .pending_policy = null,
+                .action = .{ .apply_now = .stop_forget },
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = true,
+            .pending = null,
+            .event = .{ .request = .carry_forward },
+            .expected = .{
+                .pending_policy = .carry_forward,
+                .action = .cancel_and_defer,
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = true,
+            .pending = .carry_forward,
+            .event = .{ .request = .stop_forget },
+            .expected = .{
+                .pending_policy = .stop_forget,
+                .action = .none,
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = true,
+            .pending = .stop_forget,
+            .event = .settle,
+            .expected = .{
+                .pending_policy = .stop_forget,
+                .action = .none,
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = false,
+            .pending = .stop_forget,
+            .event = .settle,
+            .expected = .{
+                .pending_policy = null,
+                .action = .{ .apply_pending = .stop_forget },
+            },
+        },
+        .{
+            .cooperative = true,
+            .processing = false,
+            .pending = null,
+            .event = .settle,
+            .expected = .{
+                .pending_policy = null,
+                .action = .none,
+            },
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualDeep(
+            case.expected,
+            decideLiveSessionTransition(
+                case.cooperative,
+                case.processing,
+                case.pending,
+                case.event,
+            ),
+        );
+    }
+}
+
 fn nextImageIdForResumedHistory(
     alloc: Allocator,
     history: []const types.HistoryTurn,
@@ -941,8 +1091,16 @@ pub const Persistence = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_view_admission: ?session_store.ResumeViewAdmission = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
+    pending_live_session_policy: ?BackgroundSessionPolicy = null,
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
+        if (self.pending_live_session_policy) |policy| {
+            debug_trace.logf(
+                "session",
+                "event=live_session_transition_discard reason=deinit policy={s}",
+                .{@tagName(policy)},
+            );
+        }
         if (self.pending_cancelled_command) |*pending| pending.discard(alloc);
         if (self.resume_view_admission) |*admission| admission.deinit(alloc);
         if (self.image_snapshot_temp_dir) |path| {
@@ -1285,8 +1443,60 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
-            clearCachedSessionTitle(app);
+            const previous_policy = app.session_persistence.pending_live_session_policy;
+            const decision = decideLiveSessionTransition(
+                runtime_profile.allows(App, .cooperative_agent),
+                app.worker.isProcessing(),
+                previous_policy,
+                .{ .request = background_policy },
+            );
+            if (previous_policy) |previous| {
+                if (decision.pending_policy) |next| {
+                    if (previous != next) {
+                        debug_trace.logf(
+                            "session",
+                            "event=live_session_transition_coalesced previous={s} next={s}",
+                            .{ @tagName(previous), @tagName(next) },
+                        );
+                    }
+                }
+            }
+            app.session_persistence.pending_live_session_policy = decision.pending_policy;
+            switch (decision.action) {
+                .apply_now => |policy| try applyLiveSessionTransition(app, policy),
+                .cancel_and_defer => beginLiveSessionCancellation(app),
+                .none => {},
+                .apply_pending => unreachable,
+            }
+        }
+
+        pub fn settlePendingLiveSessionTransition(app: *App) !void {
+            const decision = decideLiveSessionTransition(
+                runtime_profile.allows(App, .cooperative_agent),
+                app.worker.isProcessing(),
+                app.session_persistence.pending_live_session_policy,
+                .settle,
+            );
+            app.session_persistence.pending_live_session_policy = decision.pending_policy;
+            switch (decision.action) {
+                .apply_pending => |policy| {
+                    applyIdleLiveSessionTransition(app, policy, .{});
+                    try installFreshLiveSession(app);
+                },
+                .none => {},
+                .apply_now, .cancel_and_defer => unreachable,
+            }
+        }
+
+        fn applyLiveSessionTransition(
+            app: *App,
+            background_policy: BackgroundSessionPolicy,
+        ) !void {
             try prepareLiveSessionTransition(app, background_policy, .{});
+            try installFreshLiveSession(app);
+        }
+
+        fn installFreshLiveSession(app: *App) !void {
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
@@ -1310,6 +1520,12 @@ pub fn Runtime(comptime App: type) type {
             background_policy: BackgroundSessionPolicy,
             log_options: session_log.Options,
         ) !void {
+            beginLiveSessionCancellation(app);
+            app.worker.waitUntilIdle();
+            applyIdleLiveSessionTransition(app, background_policy, log_options);
+        }
+
+        fn beginLiveSessionCancellation(app: *App) void {
             app.worker.requestCancel();
             app.pacer.clear(app.alloc);
             if (comptime @hasField(App, "queued_prompt_review")) {
@@ -1317,7 +1533,14 @@ pub fn Runtime(comptime App: type) type {
             }
             app.shell.render_requests.finishSubmittedPromptTransition();
             app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
-            app.worker.waitUntilIdle();
+        }
+
+        fn applyIdleLiveSessionTransition(
+            app: *App,
+            background_policy: BackgroundSessionPolicy,
+            log_options: session_log.Options,
+        ) void {
+            clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
 
             if (comptime @hasField(App, "subagents") and
@@ -3125,8 +3348,8 @@ pub fn Runtime(comptime App: type) type {
 
                 const Self = @This();
 
-                fn activityKind(self: *Self, tool_name: []const u8) types.ToolActivityKind {
-                    return self.app.historicalToolActivityKind(tool_name);
+                fn activityKind(self: *Self, call: types.ToolCall) types.ToolActivityKind {
+                    return self.app.historicalToolActivityKind(call);
                 }
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
@@ -3170,7 +3393,7 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolDetail(
                         entry_id,
                         call,
-                        self.activityKind(call.name),
+                        self.activityKind(call),
                         result,
                     );
                 }
@@ -3185,7 +3408,7 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolDetailWithLifecycle(
                         entry_id,
                         call,
-                        self.activityKind(call.name),
+                        self.activityKind(call),
                         result,
                         lifecycle_id,
                     );
@@ -3200,7 +3423,7 @@ pub fn Runtime(comptime App: type) type {
                     try self.projection.attachHistoricalToolDetailAfterCommandOutput(
                         entry_id,
                         call,
-                        self.activityKind(call.name),
+                        self.activityKind(call),
                         result,
                     );
                 }

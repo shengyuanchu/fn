@@ -191,6 +191,18 @@ pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
     return std.mem.eql(u8, erased.as(Input).action, "list");
 }
 
+pub fn presentation(args: std.json.ObjectMap) ?tool_dispatch.CallPresentation {
+    const action = tool_args.optionalStringArg(args, "action") orelse return null;
+    if (!std.mem.eql(u8, action, "list")) return null;
+    return .{
+        .activity_kind = .read,
+        .action_label = "Listing",
+        .completed_action_label = "Listed",
+        .label_arg_kind = .none,
+        .label_arg_default = "memories",
+    };
+}
+
 pub fn isIrreversible(erased: tool_dispatch.ToolInput) bool {
     return std.mem.eql(u8, erased.as(Input).action, "clear");
 }

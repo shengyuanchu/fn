@@ -6676,6 +6676,33 @@ test "app_input_runtime model picker commits a model without options directly" {
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
+test "app_input_runtime model picker skips effort stage for reasoning model without tiers" {
+    const alloc = std.testing.allocator;
+    const model = "deepseek/deepseek-v4-pro-0813";
+    const completions = [_][]const u8{model};
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &completions;
+    app.gateway_metadata_model = model;
+    app.gateway_metadata = .{ .supports_reasoning = true };
+    try app.input_runtime.textReplacementState().replace(alloc, "/model ");
+
+    const capabilities = app.resolvedModelCapabilities(model);
+    try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqual(ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
+    try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
+    try std.testing.expect(app.last_preference_effort == null);
+    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+}
+
 test "app_input_runtime model picker exposes opaque Gateway reasoning effort" {
     const alloc = std.testing.allocator;
     const completions = [_][]const u8{"provider/new-reasoning-model"};
