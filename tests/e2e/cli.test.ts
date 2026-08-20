@@ -768,9 +768,9 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx upgrade help documents release channels",
+    "fn update help documents release channels",
     async () => {
-      const result = await runFx(["upgrade", "--help"]);
+      const result = await runFx(["update", "--help"]);
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("--channel <stable|dev>");
       expect(result.stdout).toContain("Select and remember the release channel");

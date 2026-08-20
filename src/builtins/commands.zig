@@ -227,10 +227,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     },
     .{
         .kind = .upgrade,
-        .token = "upgrade",
-        .aliases = &.{"update"},
-        .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade fn on the selected release channel",
+        .token = "update",
+        .aliases = &.{"upgrade"},
+        .usage = "update [--channel <stable|dev>] [--json]",
+        .summary = "Update fn on the selected release channel",
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -300,7 +300,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .models, .usage = "models" },
         .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
-        .{ .kind = .upgrade, .usage = "upgrade" },
+        .{ .kind = .upgrade, .usage = "update" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .help, .usage = "help" },
     } },

@@ -1316,7 +1316,7 @@ fn runNonInteractiveWithDeps(
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
             const opts = parseUpgradeArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "update", err, rest);
                 return .handled_failure;
             };
 

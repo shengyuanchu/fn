@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.4-fn.2";
+pub const version = "0.0.4-fn.3";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
@@ -3089,6 +3089,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "logout") or
         std.mem.eql(u8, command, "teams") or
         std.mem.eql(u8, command, "setup") or
+        std.mem.eql(u8, command, "update") or
         std.mem.eql(u8, command, "upgrade") or
         // Resolve a stored credential, which reads the platform key store out of process.
         std.mem.eql(u8, command, "status") or
@@ -3097,10 +3098,12 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "credits");
 }
 
-test "auth and upgrade commands use early threaded io without full entry config" {
-    const args = &.{@as([:0]const u8, "upgrade")};
-    try std.testing.expect(!needsFullEntryConfig(args));
-    try std.testing.expect(needsEarlyThreadedIo(args));
+test "auth and update commands use early threaded io without full entry config" {
+    for ([_][:0]const u8{ "update", "upgrade" }) |command| {
+        const args = &.{command};
+        try std.testing.expect(!needsFullEntryConfig(args));
+        try std.testing.expect(needsEarlyThreadedIo(args));
+    }
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
