@@ -2043,7 +2043,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI feedback opens fx.sh without creating a trace or touching the clipboard",
+    "TUI feedback opens fn issues without creating a trace or touching the clipboard",
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway([]);
@@ -2084,7 +2084,7 @@ describe("effect-aware command permissions", () => {
       ).toHaveLength(0);
       const escapes = await activeSession.capturePaneEscapes();
       expect(escapes).not.toContain("Feedback:");
-      expect(escapes).not.toContain("github.com");
+      expect(escapes).toContain("github.com/shengyuanchu/fn/issues");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");
