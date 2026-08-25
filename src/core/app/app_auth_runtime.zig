@@ -928,7 +928,7 @@ pub fn Runtime(comptime App: type) type {
             const preferred_model = if (intent == .post_oauth)
                 saved_model
             else
-                io_mod.getenv("FX_MODEL") orelse saved_model;
+                io_mod.getenv("MODEL") orelse saved_model;
             const selected_model = selectCatalogModel(catalog.items, current_model, preferred_model) orelse unreachable;
             var owned_model = try app.alloc.dupe(u8, selected_model);
             errdefer app.alloc.free(owned_model);

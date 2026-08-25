@@ -1484,7 +1484,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
+            MODEL: FAKE_GATEWAY_MODEL,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
             FX_SKIP_ONBOARDING: "1",

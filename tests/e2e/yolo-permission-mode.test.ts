@@ -203,7 +203,7 @@ describe("yolo permission mode", () => {
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: fake.baseUrl,
             FX_GATEWAY_CHAT_URL: fake.chatUrl,
-            FX_MODEL: FAKE_GATEWAY_MODEL,
+            MODEL: FAKE_GATEWAY_MODEL,
           },
           timeoutMs: TIMEOUT,
         },

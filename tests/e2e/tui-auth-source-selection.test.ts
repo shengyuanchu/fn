@@ -1063,7 +1063,7 @@ tmuxTest(
       undefined,
       {
         ...chatgptOauth.env,
-        FX_MODEL: undefined,
+        MODEL: undefined,
       },
     );
     await session.waitForComposer(TIMEOUT);
@@ -1162,7 +1162,7 @@ tmuxTest(
       undefined,
       {
         ...chatgptOauth.env,
-        FX_MODEL: undefined,
+        MODEL: undefined,
       },
     );
     await session.waitForComposer(TIMEOUT);
@@ -1227,7 +1227,7 @@ tmuxTest(
       gateway,
       undefined,
       undefined,
-      { ...chatgptOauth.env, FX_MODEL: undefined },
+      { ...chatgptOauth.env, MODEL: undefined },
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
@@ -1270,7 +1270,7 @@ tmuxTest(
       undefined,
       {
         ...chatgptOauth.env,
-        FX_MODEL: undefined,
+        MODEL: undefined,
       },
     );
     await session.waitForComposer(TIMEOUT);
@@ -2294,7 +2294,7 @@ tmuxTest(
     const grok = startFakeGrokOAuth();
     try {
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
-        FX_MODEL: undefined,
+        MODEL: undefined,
         ...grok.env,
       });
       await session.waitForText("auto ·", TIMEOUT);
@@ -2361,7 +2361,7 @@ tmuxTest(
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
-        FX_MODEL: undefined,
+        MODEL: undefined,
         ...grok.env,
       });
       await session.waitForComposer(TIMEOUT);
@@ -2408,7 +2408,7 @@ tmuxTest(
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
-        FX_MODEL: undefined,
+        MODEL: undefined,
         FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
         FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
         FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,

@@ -212,7 +212,7 @@ keychainTest(
       ...keychainEnv(home, account, issuer.issuer),
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_MODEL: FAKE_GATEWAY_MODEL,
+      MODEL: FAKE_GATEWAY_MODEL,
     };
 
     try {

@@ -6574,7 +6574,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_GATEWAY_BASE_URL: commandGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: commandGateway.chatUrl,
           FX_E2E_GATEWAY_CHAT_URL: commandGateway.chatUrl,
-          FX_MODEL: MODEL,
+          MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
         },
