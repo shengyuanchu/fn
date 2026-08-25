@@ -538,14 +538,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "",
                     .tone = .neutral,
-                    .body = "Opened https://fx.sh/feedback.",
+                    .body = "Opened https://github.com/shengyuanchu/fn/issues.",
                 }, true);
                 return;
             }
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "Could not open https://fx.sh/feedback. Open it manually.",
+                .body = "Could not open https://github.com/shengyuanchu/fn/issues. Open it manually.",
             }, true);
         }
 
@@ -3449,7 +3449,7 @@ const McpCommandFakeApp = struct {
             .display = .{
                 .line = try alloc.dupe(
                     u8,
-                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+                    "Waiting for MCP authentication for 'fixture'. You can continue using fn while the browser flow completes.",
                 ),
             },
         };
@@ -4087,7 +4087,7 @@ test "app_commands preserves command display after implicit MCP reload" {
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
+        "Waiting for MCP authentication for 'fixture'. You can continue using fn while the browser flow completes.",
         app.notice_body.items,
     );
     try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);

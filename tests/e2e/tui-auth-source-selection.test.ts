@@ -2533,7 +2533,7 @@ tmuxTest(
     const grok = startFakeGrokOAuth();
     try {
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
-        FX_MODEL: undefined,
+        MODEL: undefined,
         ...grok.env,
       });
       await session.waitForComposer(TIMEOUT);
@@ -2723,7 +2723,7 @@ tmuxTest(
         { mode: 0o600 },
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
-        FX_MODEL: undefined,
+        MODEL: undefined,
         FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
         FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
       });

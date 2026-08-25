@@ -1017,7 +1017,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedback") &&
-          !pane.includes("open the fx feedback form"),
+          !pane.includes("open the fn issue tracker"),
         5_000,
       );
       const afterDismiss = await capture("after-dismiss");
@@ -1028,7 +1028,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForPane(
         (pane) =>
           composerContains(pane, "/feedbackx") &&
-          !pane.includes("open the fx feedback form"),
+          !pane.includes("open the fn issue tracker"),
         5_000,
       );
       const afterDismissEdit = await capture("after-dismiss-edit");

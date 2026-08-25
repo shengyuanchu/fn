@@ -2075,9 +2075,9 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       await activeSession.sendText("/feedback");
-      await activeSession.waitForText("Opened https://fx.sh/feedback.", TIMEOUT);
+      await activeSession.waitForText("Opened https://github.com/shengyuanchu/fn/issues.", TIMEOUT);
 
-      expect(readFileSync(openerPath, "utf8")).toBe("https://fx.sh/feedback");
+      expect(readFileSync(openerPath, "utf8")).toBe("https://github.com/shengyuanchu/fn/issues");
       expect(existsSync(clipboardMarker)).toBe(false);
       expect(
         readdirSync(root.root).filter((entry) => entry.startsWith("fx-trace-")),

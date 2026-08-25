@@ -1063,7 +1063,7 @@ const schema_properties = [_]model_tool_schema.Property{
 
 pub const function_schema: model_tool_schema.FunctionSchema = .{
     .name = tool_name,
-    .description = "Return bounded safety advice for one exact fx action.",
+    .description = "Return bounded safety advice for one exact fn action.",
     .input_schema = .{
         .properties = schema_properties[0..],
         .required = schema_required[0..],

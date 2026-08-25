@@ -285,14 +285,14 @@ fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]c
             .status = "200 OK",
             .body = comptime callbackPage(
                 "Authorization complete",
-                "Returning you to fx. You can close this tab.",
+                "Returning you to fn. You can close this tab.",
             ),
         },
         .failed => .{
             .status = "400 Bad Request",
             .body = comptime callbackPage(
                 "Authorization failed",
-                "Return to fx for details.",
+                "Return to fn for details.",
             ),
         },
         .unrelated => .{

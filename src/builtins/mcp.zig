@@ -123,7 +123,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
         return switch (authentication) {
             .started => lineParts(
                 alloc,
-                &.{ "Waiting for MCP authentication for '", name, "'. You can continue using fx while the browser flow completes." },
+                &.{ "Waiting for MCP authentication for '", name, "'. You can continue using fn while the browser flow completes." },
                 false,
             ),
             .busy => lineParts(
@@ -2016,7 +2016,7 @@ test "MCP auth requires explicit browser confirmation and logout stays non-secre
     defer started.deinit(alloc);
     try expectLine(
         started,
-        "Waiting for MCP authentication for 'remote'. You can continue using fx while the browser flow completes.",
+        "Waiting for MCP authentication for 'remote'. You can continue using fn while the browser flow completes.",
         false,
     );
     try std.testing.expectEqual(@as(usize, 2), fixture.validation_calls);

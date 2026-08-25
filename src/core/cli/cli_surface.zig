@@ -1147,9 +1147,9 @@ fn runNonInteractiveWithDeps(
             const catalog_access = startup.modelCatalogAccess();
             const catalog_provider = cfg.provider_set.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
+                    .gateway => "fn models: Gateway model catalog is unavailable\n",
+                    .codex => "fn models: Codex model catalog is unavailable\n",
+                    .grok => "fn models: Grok model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -1175,7 +1175,7 @@ fn runNonInteractiveWithDeps(
                             message,
                         );
                     } else {
-                        try writeStderr(deps, "fx models: ");
+                        try writeStderr(deps, "fn models: ");
                         try writeStderr(deps, message);
                         try writeStderr(deps, "\n");
                     }
@@ -4794,7 +4794,7 @@ test "runIfRequested model fetch failure is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: Unavailable\n",
+        "fn models: could not list models: Unavailable\n",
         capture.stderr.written(),
     );
 }
@@ -4836,7 +4836,7 @@ test "runIfRequested model provider cancellation is handled" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
     try std.testing.expectEqual(RunResult.handled_failure, result);
     try std.testing.expectEqualStrings(
-        "fx models: could not list models: the request was cancelled\n",
+        "fn models: could not list models: the request was cancelled\n",
         capture.stderr.written(),
     );
 }
