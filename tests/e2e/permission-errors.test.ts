@@ -120,6 +120,7 @@ async function runTtyPromptPermissionsCase(
   const gateway = startFakeGateway([
     fakeGatewayToolCall(`${decision}_${outputMode}_call`, "terminal", {
       action: "exec",
+      timeout_ms: 600_000,
       command: `touch ${JSON.stringify(marker)}`,
     }),
     fakeGatewayFinalText(`${decision} ${outputMode} complete`),
@@ -171,6 +172,7 @@ describe("generic permission typed errors", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall(toolCallId, "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `touch ${JSON.stringify(marker)}`,
         }),
         fakeGatewayFinalText("permission error observed"),
@@ -238,7 +240,7 @@ describe("generic permission typed errors", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "JSON prompt-permissions does not prompt after automatic recovery exhaustion",
+    "JSON prompt-permissions does not prompt after repeated advisory cautions",
     async () => {
       const root = createIsolatedRoot("fx-json-auto-prompt-permissions-");
       const markers = Array.from(
@@ -254,18 +256,20 @@ describe("generic permission typed errors", () => {
       const gateway = startFakeGateway(
         [
           ...markers.map((marker, index) => (body?: string) => {
-            if (index > 0) expect(body).toContain("auto_denied");
+            if (index > 0) expect(body).toContain("review_caution");
             return fakeGatewayToolCall(`auto_call_${index + 1}`, "terminal", {
               action: "exec",
+              timeout_ms: 600_000,
               command: `touch ${JSON.stringify(marker)}`,
             });
           }),
+          fakeGatewayFinalText("Advisory cautions handled normally."),
         ],
         {
           classifierResponses: Array.from(
             { length: 4 },
             (_, index) => fakeGatewayPermissionDecision(
-              "ask",
+              "caution",
               `auto_review_${index + 1}`,
             ),
           ),
@@ -274,7 +278,7 @@ describe("generic permission typed errors", () => {
       let session: TmuxSession | null = null;
       try {
         session = await TmuxSession.create({
-          cmd: `${JSON.stringify(FX_BIN)} ask --auto --json --prompt-permissions --no-save "Run the automatic threshold fixture." > ${JSON.stringify(stdoutPath)}`,
+          cmd: `${JSON.stringify(FX_BIN)} ask --auto --json --prompt-permissions --no-save "Run the advisory caution fixture." > ${JSON.stringify(stdoutPath)}`,
           cwd: root.workspace,
           env: permissionEnv(root.home, gateway),
           remainOnExit: true,
@@ -288,12 +292,10 @@ describe("generic permission typed errors", () => {
         const stdout = readFileSync(stdoutPath, "utf8");
         expect(stdout).not.toContain("Approve? [y/N]");
         const json = JSON.parse(stdout) as FxJson;
-        expect(json.output).toContain(
-          "I couldn't continue because the required actions were blocked by automatic safety checks.",
-        );
+        expect(json.output).toContain("Advisory cautions handled normally.");
         expect(json.tool_calls.filter((call) => call.status === "error")).toHaveLength(4);
         expect(json.tool_calls.filter((call) => call.status === "success")).toHaveLength(0);
-        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.requests).toHaveLength(5);
         expect(gateway.classifierRequests).toHaveLength(4);
       } finally {
         if (session) await session.kill();
@@ -336,6 +338,7 @@ describe("generic permission typed errors", () => {
         const gateway = startFakeGateway([
           fakeGatewayToolCall("non_tty_call", "terminal", {
             action: "exec",
+            timeout_ms: 600_000,
             command: `touch ${JSON.stringify(marker)}`,
           }),
         ]);

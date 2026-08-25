@@ -173,6 +173,8 @@ pub const AgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
+    /// Samples host-owned root permission mode at an action boundary.
+    snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,
     tool_activity_recorder: ?ToolActivityRecorder = null,
     finalize_turn: *const fn (ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, disposition: ?types.ProviderCompletionDisposition) anyerror!void = acknowledgePromptFinalization,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,

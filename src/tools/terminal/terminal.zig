@@ -17,6 +17,9 @@ const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const exec_timeout_min_ms: u64 = 1;
+pub const exec_timeout_max_ms: u64 = 600_000;
+
 const ShellKind = enum { user_login, executable };
 pub const Action = enum {
     exec,
@@ -139,6 +142,7 @@ pub const Input = struct {
     cwd: ?[]const u8 = null,
     command: ?[]const u8 = null,
     profile: ?command_environment.Profile = null,
+    timeout_ms: ?u64 = null,
     shell: ?ShellInput = null,
     backend: ?contracts.Backend = null,
     return_when: ?ReturnInput = null,
@@ -180,8 +184,8 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .exec => .{
-            .allowed = &.{ "action", "command", "cwd", "profile" },
-            .required = &.{ "action", "command" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "timeout_ms" },
+            .required = &.{ "action", "command", "timeout_ms" },
         },
         .start => .{
             .allowed = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" },
@@ -392,6 +396,16 @@ pub fn decode(
             "terminal arguments must match the advertised action schema",
         ) };
     };
+    if (action == .exec) {
+        if (raw.object.get("timeout_ms")) |timeout_value| {
+            if (timeout_value != .integer) {
+                return .{ .failure = try ctx.allocator.dupe(
+                    u8,
+                    "terminal exec field \"timeout_ms\" must be an integer between 1 and 600000",
+                ) };
+            }
+        }
+    }
     elideKnownNullFields(&raw.object);
     var correction_scratch: ActionFieldCorrectionScratch = .{};
     defer correction_scratch.deinit(ctx.allocator);
@@ -491,6 +505,12 @@ pub fn validate(
         }
         if (input.command.?.len > contracts.max_command_bytes) {
             return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: InvalidCommand");
+        }
+        const timeout_ms = input.timeout_ms orelse {
+            return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: MissingTimeout");
+        };
+        if (timeout_ms < exec_timeout_min_ms or timeout_ms > exec_timeout_max_ms) {
+            return try ctx.allocator.dupe(u8, "terminal exec arguments are invalid: InvalidTimeout");
         }
         _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
             return try std.fmt.allocPrint(
@@ -652,6 +672,9 @@ fn callExec(
     const command = input.command orelse return .{
         .failure = try ctx.allocator.dupe(u8, "terminal exec requires string field \"command\""),
     };
+    const timeout_ms = input.timeout_ms orelse return .{
+        .failure = try ctx.allocator.dupe(u8, "terminal exec requires integer field \"timeout_ms\""),
+    };
     const cwd = resolveCwd(ctx.allocator, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = try std.fmt.allocPrint(
@@ -678,6 +701,7 @@ fn callExec(
         .command = command,
         .resolved_cwd = cwd,
         .environment = environment_value,
+        .timeout_ms = timeout_ms,
     });
 }
 
@@ -1389,7 +1413,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "terminal decoder accepts every public action and owns its input" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { Action, []const u8 }{
-        .{ .exec, "{\"action\":\"exec\",\"command\":\"true\"}" },
+        .{ .exec, "{\"action\":\"exec\",\"command\":\"true\",\"timeout_ms\":600000}" },
         .{ .start, "{\"action\":\"start\"}" },
         .{ .read, "{\"action\":\"read\",\"session_id\":\"terminal-a\",\"cursor_segment\":1}" },
         .{ .screen, "{\"action\":\"screen\",\"session_id\":\"terminal-a\"}" },
@@ -1475,7 +1499,7 @@ test "terminal action field ownership is exact for every public action" {
         required: []const []const u8,
         conflicts: []const tool_result_errors.TerminalActionFieldConflict = &.{},
     }{
-        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile" }, .required = &.{ "action", "command" } },
+        .{ .action = .exec, .fields = &.{ "action", "command", "cwd", "profile", "timeout_ms" }, .required = &.{ "action", "command", "timeout_ms" } },
         .{ .action = .start, .fields = &.{ "action", "cwd", "command", "profile", "shell", "backend", "return_when", "wait_ceiling_ms", "dimensions", "initial_monitors" }, .required = &.{"action"}, .conflicts = &.{.{ "profile", "shell" }} },
         .{ .action = .read, .fields = &.{ "action", "session_id", "cursor_segment", "cursor_offset" }, .required = &.{ "action", "session_id", "cursor_segment" } },
         .{ .action = .screen, .fields = &.{ "action", "session_id" }, .required = &.{ "action", "session_id" } },
@@ -1515,6 +1539,59 @@ test "terminal action field ownership is exact for every public action" {
                 want_allowed,
                 actionAllowsField(want.action, field.name),
             );
+        }
+    }
+}
+
+test "terminal exec requires a strict bounded integer timeout" {
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{
+        .allocator = alloc,
+        .workspace_root = "/tmp",
+    };
+
+    for ([_][]const u8{
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":1}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":1000}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":600000}",
+    }) |arguments_json| {
+        const accepted = try decode(ctx, arguments_json);
+        switch (accepted) {
+            .failure => |message| {
+                defer alloc.free(message);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| {
+                defer input.deinit(alloc);
+                const validation = try validate(ctx, input);
+                defer if (validation) |message| alloc.free(message);
+                try std.testing.expect(validation == null);
+            },
+        }
+    }
+
+    for ([_][]const u8{
+        "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":null}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":\"1000\"}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":1.5}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":true}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":{}}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":[]}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":-1}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":0}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":600001}",
+        "{\"action\":\"exec\",\"command\":\"pwd\",\"timeout_ms\":18446744073709551616}",
+    }) |arguments_json| {
+        const rejected = try decode(ctx, arguments_json);
+        switch (rejected) {
+            .failure => |message| alloc.free(message),
+            .input => |input| {
+                defer input.deinit(alloc);
+                const validation = try validate(ctx, input);
+                defer if (validation) |message| alloc.free(message);
+                try std.testing.expect(validation != null);
+            },
         }
     }
 }
@@ -1564,7 +1641,7 @@ test "terminal decoder elides textual null placeholders like real nulls" {
     const alloc = std.testing.allocator;
     const exec_call = try decode(
         .{ .allocator = alloc },
-        "{\"action\":\"exec\",\"command\":\"echo ONE\",\"cwd\":\".\",\"profile\":\"NULL\"," ++
+        "{\"action\":\"exec\",\"command\":\"echo ONE\",\"cwd\":\".\",\"profile\":\"NULL\",\"timeout_ms\":600000," ++
             "\"session_id\":\"null\",\"task_id\":\"null\",\"workspace_root\":\" null \"," ++
             "\"shell\":null,\"backend\":\"null\",\"return_when\":\"null\",\"lease\":\"null\"}",
     );
@@ -1611,7 +1688,7 @@ test "terminal decoder keeps command text that merely contains a null placeholde
     const alloc = std.testing.allocator;
     const accepted = try decode(
         .{ .allocator = alloc },
-        "{\"action\":\"exec\",\"command\":\"echo null\"}",
+        "{\"action\":\"exec\",\"command\":\"echo null\",\"timeout_ms\":600000}",
     );
     switch (accepted) {
         .failure => |message| {
@@ -1632,7 +1709,7 @@ test "terminal decoder reports a textual null placeholder on a required field as
     const alloc = std.testing.allocator;
     const rejected = try decode(
         .{ .allocator = alloc },
-        "{\"action\":\"exec\",\"command\":\"null\"}",
+        "{\"action\":\"exec\",\"command\":\"null\",\"timeout_ms\":600000}",
     );
     switch (rejected) {
         .failure => |message| {
@@ -2004,7 +2081,7 @@ test "registered terminal validation enforces action-specific input before execu
     const terminal_tool = tool_dispatch.Tool{
         .name = "terminal",
         .description = "Terminal test adapter.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "terminal",
             .description = "Terminal test adapter.",
         },
@@ -2117,7 +2194,7 @@ test "registered terminal validation enforces action-specific input before execu
     @memset(oversized_command, 'x');
     const oversized_json = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"action\":\"exec\",\"command\":\"{s}\"}}",
+        "{{\"action\":\"exec\",\"command\":\"{s}\",\"timeout_ms\":600000}}",
         .{oversized_command},
     );
     defer std.testing.allocator.free(oversized_json);

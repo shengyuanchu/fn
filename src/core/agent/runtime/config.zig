@@ -2,9 +2,12 @@ const std = @import("std");
 const types = @import("../../shared/types.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
+const command_replay_store = @import("../../session/command_replay_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
+const provider_set = @import("../../gateway/provider_set.zig");
+const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
@@ -29,7 +32,13 @@ pub const Config = struct {
     /// from cancellation. Headless hosts leave this null.
     recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     gateway_chat_url: []const u8,
-    gateway_tools_json: []const u8,
+    advertised_tool_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
+    provider_capabilities: provider_set.Bundle.Capabilities = .{
+        .fx_search = true,
+        .vision_fallback = true,
+        .deferred_usage = true,
+    },
     custom_tool_guidance: []const u8 = "",
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
@@ -54,6 +63,7 @@ pub const Config = struct {
     current_prompt_is_root_authority: bool = false,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     subagent_id: u64 = 0,
     context_limits: context_limits.Values = .{},
 };

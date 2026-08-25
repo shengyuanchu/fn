@@ -7,6 +7,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_catalog = @import("provider_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -37,6 +38,7 @@ const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs: usize = 32;
+const max_manual_code_mask_glyphs: usize = 32;
 const max_team_query_bytes: usize = 256;
 
 fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
@@ -148,6 +150,7 @@ pub fn refreshCredentialTokenForAccount(
 }
 
 pub const AcquisitionAction = enum {
+    connections,
     login,
     chatgpt_login,
     grok_login,
@@ -162,6 +165,7 @@ pub const AcquisitionAction = enum {
 
 pub const PickerStage = enum {
     root,
+    connections,
     provider,
     sign_in,
     api_key,
@@ -336,6 +340,13 @@ const ApiKeyExitReason = enum {
     runtime_deinit,
 };
 
+const ManualCodeClearReason = enum {
+    cancel,
+    submitted,
+    screen_replacement,
+    runtime_deinit,
+};
+
 pub const Choice = union(enum) {
     provider: model_provider.ProviderId,
     source: credentials.Source,
@@ -378,6 +389,7 @@ pub const PickerView = struct {
     team_query: []const u8 = &.{},
     sign_in: login_flow.SignInSnapshot = .{},
     sign_in_source: credentials.Source = .fx_login,
+    sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
@@ -387,11 +399,12 @@ pub const PickerView = struct {
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
             .root => if (self.include_skip)
-                if (comptime host_target.is_wasm) 2 else 4
+                connectionChoiceCount()
             else if (comptime host_target.is_wasm)
-                4
+                3
             else
-                7,
+                4,
+            .connections => connectionChoiceCount(),
             .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
             .change_team => blk: {
@@ -407,38 +420,21 @@ pub const PickerView = struct {
 
     pub fn choiceAt(self: PickerView, index: usize) ?Choice {
         return switch (self.stage) {
-            .root => if (self.include_skip)
-                if (comptime host_target.is_wasm)
-                    switch (index) {
-                        0 => .{ .action = .login },
-                        1 => .{ .action = .setup },
-                        else => null,
-                    }
-                else switch (index) {
-                    0 => .{ .action = .login },
-                    1 => .{ .action = .chatgpt_login },
-                    2 => .{ .action = .grok_login },
-                    3 => .{ .action = .setup },
-                    else => null,
-                }
-            else if (comptime host_target.is_wasm)
+            .root => if (self.include_skip) connectionChoiceAt(index) else if (comptime host_target.is_wasm)
                 switch (index) {
-                    0 => .{ .action = .login },
-                    1 => .{ .action = .setup },
-                    2 => .{ .action = .change_team },
-                    3 => .{ .action = .switch_credential },
+                    0 => .{ .action = .connections },
+                    1 => .{ .action = .change_team },
+                    2 => .{ .action = .switch_credential },
                     else => null,
                 }
             else switch (index) {
-                0 => .{ .action = .login },
-                1 => .{ .action = .chatgpt_login },
-                2 => .{ .action = .grok_login },
-                3 => .{ .action = .setup },
-                4 => .{ .action = .switch_provider },
-                5 => .{ .action = .change_team },
-                6 => .{ .action = .switch_credential },
+                0 => .{ .action = .connections },
+                1 => .{ .action = .switch_provider },
+                2 => .{ .action = .change_team },
+                3 => .{ .action = .switch_credential },
                 else => null,
             },
+            .connections => connectionChoiceAt(index),
             .provider => switch (index) {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
@@ -480,9 +476,10 @@ pub const PickerView = struct {
 
     pub fn choiceLabel(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| model_provider.label(provider),
+            .provider => |provider| provider_catalog.label(provider),
             .source => |source| credentials.sourceLabel(source),
             .action => |action| switch (action) {
+                .connections => "Connections",
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
                 .grok_login => "Sign in with Grok",
@@ -501,11 +498,12 @@ pub const PickerView = struct {
             .provider => |provider| if (provider == self.active_provider) "current" else "available",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
+                .connections => "",
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
-                .automatic => "use normal precedence",
+                .automatic => "use the first available source",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
@@ -528,6 +526,27 @@ pub const PickerView = struct {
         return std.mem.eql(u8, current, team.id) or std.mem.eql(u8, current, team.slug);
     }
 };
+
+fn connectionChoiceCount() usize {
+    return if (comptime host_target.is_wasm) 2 else 4;
+}
+
+fn connectionChoiceAt(index: usize) ?Choice {
+    if (comptime host_target.is_wasm) {
+        return switch (index) {
+            0 => .{ .action = .login },
+            1 => .{ .action = .setup },
+            else => null,
+        };
+    }
+    return switch (index) {
+        0 => .{ .action = .login },
+        1 => .{ .action = .chatgpt_login },
+        2 => .{ .action = .grok_login },
+        3 => .{ .action = .setup },
+        else => null,
+    };
+}
 
 fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
     return text_utils.containsIgnoreCase(team.name, query) or
@@ -764,6 +783,7 @@ pub const Runtime = struct {
     sign_in_flow: login_flow.SignInRuntime = .{},
     sign_in_source: credentials.Source = .fx_login,
     sign_in_returns_to_root: bool = false,
+    sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
@@ -783,6 +803,7 @@ pub const Runtime = struct {
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
+        self.clearSignInCodeInput(alloc, .runtime_deinit);
         self.exitApiKeyStage(alloc, .runtime_deinit);
         self.clearTeamSelection(alloc);
         self.team_query.deinit(alloc);
@@ -944,6 +965,15 @@ pub const Runtime = struct {
     }
 
     pub fn openPicker(self: *Self, alloc: Allocator) void {
+        self.openPickerForProvider(alloc, .gateway);
+    }
+
+    pub fn openPickerForProvider(
+        self: *Self,
+        alloc: Allocator,
+        active_provider: model_provider.ProviderId,
+    ) void {
+        self.provider_picker_active = active_provider;
         self.openPickerWithSkip(alloc, false);
     }
 
@@ -972,10 +1002,16 @@ pub const Runtime = struct {
             .stage = self.picker_stage,
             .fx_login_session_available = self.fx_login_session_available,
             .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
-            .current_team = if (self.team_selection) |*selection| selection.currentTeam() else null,
+            .current_team = if (self.team_selection) |*selection|
+                selection.currentTeam()
+            else if (self.selected_credential) |credential|
+                credential.gatewayTeam()
+            else
+                null,
             .team_query = self.team_query.items,
             .sign_in = self.sign_in_flow.snapshot(),
             .sign_in_source = self.sign_in_source,
+            .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
             .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
         };
     }
@@ -985,15 +1021,20 @@ pub const Runtime = struct {
         const picker = self.pickerView();
         const choice_count = picker.choiceCount();
         if (choice_count < 2) return false;
-        const selected_index = picker.selectedIndex();
-        const next_index = if (delta < 0)
-            if (selected_index == 0) choice_count - 1 else selected_index - 1
-        else if (selected_index + 1 == choice_count)
-            0
-        else
-            selected_index + 1;
-        self.picker_selection = picker.choiceAt(next_index);
-        return true;
+        var next_index = picker.selectedIndex();
+        for (0..choice_count) |_| {
+            next_index = if (delta < 0)
+                if (next_index == 0) choice_count - 1 else next_index - 1
+            else if (next_index + 1 == choice_count)
+                0
+            else
+                next_index + 1;
+            const choice = picker.choiceAt(next_index) orelse continue;
+            if (!picker.choiceEnabled(choice)) continue;
+            self.picker_selection = choice;
+            return true;
+        }
+        return false;
     }
 
     pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
@@ -1001,8 +1042,18 @@ pub const Runtime = struct {
         self.exitApiKeyStage(alloc, .screen_replacement);
         self.clearTeamSelection(alloc);
         self.team_selection = selection.take();
+        self.picker_include_skip = false;
         self.picker_stage = .change_team;
         self.picker_selection = self.currentTeamChoice() orelse self.pickerView().choiceAt(0);
+    }
+
+    fn openConnectionPicker(self: *Self, alloc: Allocator) void {
+        self.exitSignInStage(alloc);
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.clearTeamSelection(alloc);
+        self.picker_active = true;
+        self.picker_stage = .connections;
+        self.picker_selection = self.pickerView().choiceAt(0);
     }
 
     pub fn openProviderPicker(
@@ -1135,6 +1186,10 @@ pub const Runtime = struct {
         return self.picker_active and self.picker_stage == .sign_in;
     }
 
+    pub fn signInCodeEntryActive(self: *const Self) bool {
+        return self.signInEntryActive() and self.sign_in_flow.snapshot().accepts_manual_code;
+    }
+
     pub fn signInReturnsToRoot(self: *const Self) bool {
         return self.sign_in_returns_to_root;
     }
@@ -1150,6 +1205,47 @@ pub const Runtime = struct {
 
     pub fn pulseSignIn(self: *Self, alloc: Allocator) void {
         self.sign_in_flow.pulse(alloc);
+    }
+
+    pub fn appendSignInCodeByte(self: *Self, alloc: Allocator, byte: u8) !bool {
+        if (!self.signInCodeEntryActive()) return false;
+        if (byte <= 0x20 or byte > 0x7e) return true;
+        if (self.sign_in_code_input.items.len >= login_flow.max_manual_code_bytes) return true;
+        try self.sign_in_code_input.ensureTotalCapacityPrecise(alloc, login_flow.max_manual_code_bytes);
+        self.sign_in_code_input.appendAssumeCapacity(byte);
+        return true;
+    }
+
+    pub fn deleteSignInCodeByte(self: *Self) bool {
+        if (!self.signInCodeEntryActive()) return false;
+        if (self.sign_in_code_input.items.len > 0) {
+            self.sign_in_code_input.items.len -= 1;
+            self.sign_in_code_input.allocatedSlice()[self.sign_in_code_input.items.len] = 0;
+        }
+        return true;
+    }
+
+    pub fn replaceSignInCodeInput(self: *Self, alloc: Allocator, input: []const u8) !bool {
+        if (!self.signInCodeEntryActive()) return false;
+        const code = std.mem.trim(u8, input, " \t\r\n");
+        if (code.len == 0 or code.len > login_flow.max_manual_code_bytes) return false;
+        for (code) |byte| {
+            if (byte < 0x21 or byte > 0x7e) return false;
+        }
+        if (self.sign_in_code_input.capacity > 0) {
+            self.sign_in_code_input.clearRetainingCapacity();
+            @memset(self.sign_in_code_input.allocatedSlice(), 0);
+        }
+        try self.sign_in_code_input.ensureTotalCapacityPrecise(alloc, login_flow.max_manual_code_bytes);
+        self.sign_in_code_input.appendSliceAssumeCapacity(code);
+        return true;
+    }
+
+    pub fn submitSignInCode(self: *Self, alloc: Allocator) !bool {
+        if (!self.signInCodeEntryActive() or self.sign_in_code_input.items.len == 0) return false;
+        if (!try self.sign_in_flow.submitManualCode(alloc, self.sign_in_code_input.items)) return false;
+        self.clearSignInCodeInput(alloc, .submitted);
+        return true;
     }
 
     pub fn apiKeyEntryActive(self: *const Self) bool {
@@ -1195,8 +1291,13 @@ pub const Runtime = struct {
         const returns_to_root = self.api_key_returns_to_root;
         self.exitApiKeyStage(alloc, .saved);
         self.picker_active = returns_to_root;
-        self.picker_stage = .root;
-        self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+        if (!returns_to_root or self.picker_include_skip) {
+            self.picker_stage = .root;
+            self.picker_selection = if (returns_to_root) .{ .action = .setup } else null;
+        } else {
+            self.picker_stage = .connections;
+            self.picker_selection = .{ .action = .setup };
+        }
 
         return if (self.api_key_save.start(alloc, key, deps)) .started else .busy;
     }
@@ -1235,15 +1336,31 @@ pub const Runtime = struct {
             self.picker_selection = .{ .action = .switch_provider };
             return true;
         }
+        if (stage == .connections) {
+            self.picker_stage = .root;
+            self.picker_selection = .{ .action = .connections };
+            return true;
+        }
 
         if (stage == .sign_in) {
             const returns_to_root = self.sign_in_returns_to_root;
             _ = self.sign_in_flow.cancel(alloc);
+            self.clearSignInCodeInput(alloc, .cancel);
             self.sign_in_returns_to_root = false;
             if (!returns_to_root) {
                 self.picker_active = false;
                 self.picker_stage = .root;
                 self.picker_selection = null;
+                return true;
+            }
+            if (!self.picker_include_skip) {
+                self.clearTeamSelection(alloc);
+                self.picker_stage = .connections;
+                self.picker_selection = .{ .action = switch (self.sign_in_source) {
+                    .chatgpt_subscription => .chatgpt_login,
+                    .grok_subscription => .grok_login,
+                    else => .login,
+                } };
                 return true;
             }
         }
@@ -1257,12 +1374,19 @@ pub const Runtime = struct {
                 self.picker_selection = null;
                 return true;
             }
+            if (!self.picker_include_skip) {
+                self.clearTeamSelection(alloc);
+                self.picker_stage = .connections;
+                self.picker_selection = .{ .action = .setup };
+                return true;
+            }
         }
 
         self.clearTeamSelection(alloc);
         self.picker_stage = .root;
         self.picker_selection = .{ .action = switch (stage) {
             .root => unreachable,
+            .connections => unreachable,
             .provider => unreachable,
             .sign_in => if (self.sign_in_source == .chatgpt_subscription)
                 .chatgpt_login
@@ -1294,6 +1418,19 @@ pub const Runtime = struct {
 
         switch (self.picker_stage) {
             .sign_in, .api_key => unreachable,
+            .connections => switch (selected) {
+                .action => |action| switch (action) {
+                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
+                    .setup => {},
+                    .connections,
+                    .change_team,
+                    .switch_credential,
+                    .switch_provider,
+                    .automatic,
+                    => unreachable,
+                },
+                .provider, .source, .team => unreachable,
+            },
             .provider => switch (selected) {
                 .provider => self.closePicker(alloc),
                 .source, .action, .team => unreachable,
@@ -1302,6 +1439,10 @@ pub const Runtime = struct {
                 .provider => unreachable,
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
+                    .connections => {
+                        self.openConnectionPicker(alloc);
+                        return null;
+                    },
                     .change_team => {},
                     .switch_provider => {},
                     .switch_credential => {
@@ -1333,7 +1474,23 @@ pub const Runtime = struct {
     fn exitSignInStage(self: *Self, alloc: Allocator) void {
         if (self.picker_stage != .sign_in) return;
         _ = self.sign_in_flow.cancel(alloc);
+        self.clearSignInCodeInput(alloc, .screen_replacement);
         self.sign_in_returns_to_root = false;
+    }
+
+    fn clearSignInCodeInput(self: *Self, alloc: Allocator, reason: ManualCodeClearReason) void {
+        const byte_count = self.sign_in_code_input.items.len;
+        if (self.sign_in_code_input.capacity > 0) {
+            secret.zeroAndFree(alloc, self.sign_in_code_input.allocatedSlice());
+            self.sign_in_code_input = .empty;
+        }
+        if (byte_count > 0) {
+            debug_trace.logf(
+                "auth",
+                "authorization code entry cleared reason={s} bytes={d}",
+                .{ @tagName(reason), byte_count },
+            );
+        }
     }
 
     pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
@@ -1362,6 +1519,7 @@ pub const Runtime = struct {
         credential.team_id = null;
         credential.team_slug = null;
         self.source_inventory.insert(source);
+        if (source == .fx_login) self.fx_login_session_available = true;
         if (source == .stored_key) self.stored_key_status = .not_attempted;
         return changed;
     }
@@ -2279,7 +2437,7 @@ test "logout reconciliation adopts a newer concurrent fx login" {
     try std.testing.expect(runtime.source_inventory.contains(.fx_login));
 }
 
-test "auth picker root starts on sign in and keeps sources in the switch stage" {
+test "auth picker root exposes four setup sections" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -2293,10 +2451,8 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
-    try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
-    try std.testing.expectEqualStrings("Switch provider", picker.choiceLabel(picker.choiceAt(4).?));
-    try std.testing.expect(picker.choiceAt(7) == null);
+    try std.testing.expect((Choice{ .action = .connections }).eql(picker.selected_choice.?));
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
 }
 
 test "credential switcher excludes provider-routed subscription sessions" {
@@ -2311,20 +2467,19 @@ test "credential switcher excludes provider-routed subscription sessions" {
     try std.testing.expectEqual(@as(usize, 2), picker.choiceCount());
     try std.testing.expect((Choice{ .source = .ai_gateway_api_key }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .automatic }).eql(picker.choiceAt(1).?));
+    try std.testing.expectEqualStrings(
+        "use the first available source",
+        picker.choiceDescription(picker.choiceAt(1).?),
+    );
 }
 
-test "auth picker navigation wraps across the seven hub actions" {
+test "auth picker navigation wraps across the four setup sections" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
+    runtime.fx_login_session_available = true;
     runtime.openPicker(alloc);
 
-    try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .grok_login }).eql(runtime.pickerView().selected_choice.?));
-    try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -2332,18 +2487,70 @@ test "auth picker navigation wraps across the seven hub actions" {
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .switch_credential }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
-    try std.testing.expect((Choice{ .action = .login }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect((Choice{ .action = .connections }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(-1));
     try std.testing.expect((Choice{ .action = .switch_credential }).eql(runtime.pickerView().selected_choice.?));
 }
 
-test "auth picker selection closes before returning its typed choice" {
+test "auth picker navigation skips disabled hub actions" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.openPicker(alloc);
+
+    for (0..4) |_| try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .switch_provider }).eql(
+        runtime.pickerView().selected_choice.?,
+    ));
+
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .switch_credential }).eql(
+        runtime.pickerView().selected_choice.?,
+    ));
+
+    try std.testing.expect(runtime.movePicker(-1));
+    try std.testing.expect((Choice{ .action = .switch_provider }).eql(
+        runtime.pickerView().selected_choice.?,
+    ));
+}
+
+test "setup picker projects the active Vercel team" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    runtime.openPicker(alloc);
+
+    const current_team = runtime.pickerView().current_team;
+    try std.testing.expect(current_team != null);
+    try std.testing.expectEqualStrings("team_1", current_team.?);
+}
+
+test "adopting fx login publishes Vercel session availability to setup" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, null, null);
+    defer credential.deinit(alloc);
+
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    const picker = runtime.pickerView();
+    try std.testing.expect(picker.fx_login_session_available);
+    try std.testing.expect(picker.choiceEnabled(.{ .action = .change_team }));
+}
+
+test "connections picker closes before returning its typed choice" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
 
     try std.testing.expect(runtime.takePickerChoice(alloc) == null);
     runtime.openPicker(alloc);
+    try std.testing.expect(runtime.takePickerChoice(alloc) == null);
+    try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
 
     try std.testing.expect((Choice{ .action = .login }).eql(runtime.takePickerChoice(alloc).?));
     try std.testing.expect(!runtime.pickerView().active);
@@ -2356,9 +2563,9 @@ test "auth picker without credentials exposes acquisition actions" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active_source == null);
-    try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
+    try std.testing.expect((Choice{ .action = .connections }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2468,6 +2675,26 @@ test "change team stage owns fetched rows and releases them when popped" {
     try std.testing.expectEqual(@as(usize, 0), runtime.pickerView().teams.len);
 }
 
+test "team selection reached from onboarding returns to the setup hub" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.fx_login_session_available = true;
+    runtime.openOnboardingPicker(alloc);
+
+    var selection: login_flow.TeamSelection = .{};
+    defer selection.deinit(alloc);
+    try appendTestTeam(&selection, alloc, "team_123", "vercel-labs", "Vercel Labs");
+    runtime.openTeamPicker(alloc, &selection);
+
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    const root = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.root, root.stage);
+    try std.testing.expect(!root.include_skip);
+    try std.testing.expect((Choice{ .action = .change_team }).eql(root.selected_choice.?));
+    try std.testing.expect(root.choiceEnabled(root.selected_choice.?));
+}
+
 test "change team search filters by name and slug without losing original indexes" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2572,6 +2799,33 @@ test "an api key save runs off the event loop and is reaped" {
     try std.testing.expectEqual(@as(usize, 1), fixture.store_calls);
     try std.testing.expect(!runtime.apiKeySaveInFlight());
     try std.testing.expect(runtime.api_key_save.thread == null);
+}
+
+test "api key save from setup returns to the selected Connections row" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var fixture: ApiKeySaveFixture = .{};
+
+    runtime.openPicker(alloc);
+    try std.testing.expect(runtime.takePickerChoice(alloc) == null);
+    try std.testing.expectEqual(PickerStage.connections, runtime.pickerView().stage);
+    for (0..3) |_| try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .setup }).eql(runtime.takePickerChoice(alloc).?));
+
+    runtime.openApiKeyPickerFromRoot(alloc);
+    for ("vck_setup_parent") |byte| _ = try runtime.appendApiKeyByte(alloc, byte);
+    try std.testing.expectEqual(ApiKeySaveStart.started, runtime.beginApiKeySaveWithDeps(alloc, .{
+        .ctx = @ptrCast(&fixture),
+        .validator = fixture.validator(),
+        .store = ApiKeySaveFixture.store,
+        .loader = ApiKeySaveFixture.load,
+    }));
+
+    const picker = runtime.pickerView();
+    try std.testing.expectEqual(PickerStage.connections, picker.stage);
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.selected_choice.?));
+    try std.testing.expect(picker.choiceIsSelected(picker.choiceAt(3).?));
 }
 
 test "auth runtime saves and reloads through its injected secret store" {

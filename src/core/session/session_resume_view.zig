@@ -9,7 +9,7 @@ pub const max_text_bytes: usize = 128 * 1024;
 const sidecar_file = "resume-view.bin";
 
 const magic = "FXRV";
-const schema_version: u8 = 2;
+const schema_version: u8 = 3;
 const fixed_header_bytes = magic.len + 1 + 2 + 2 + 2 + 1 + 16 + 8 + 8 + 4;
 const max_sidecar_bytes = fixed_header_bytes + 255 + max_text_bytes;
 
@@ -474,7 +474,13 @@ test "resume view sidecar treats missing and corrupt cache data as fallback" {
 
     const encoded = try encode(alloc, "session-1", boundary, test_capture, "cached session tail\n");
     defer alloc.free(encoded);
-    encoded[magic.len] = schema_version - 1;
+    encoded[magic.len] = 2;
+    try io_mod.durableReplaceVerified(alloc, &verified, sidecar_file, encoded);
+    var stale_presentation = try loadMatching(alloc, &verified, "session-1", boundary);
+    defer stale_presentation.deinit(alloc);
+    try std.testing.expect(stale_presentation == .invalid);
+
+    encoded[magic.len] = 1;
     try io_mod.durableReplaceVerified(alloc, &verified, sidecar_file, encoded);
     var old_schema = try loadMatching(alloc, &verified, "session-1", boundary);
     defer old_schema.deinit(alloc);

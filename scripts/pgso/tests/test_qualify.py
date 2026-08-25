@@ -279,9 +279,9 @@ class PgsoQualificationTests(unittest.TestCase):
             )
 
         self.assertEqual(("startup-doctor",), tuple(item.name for item in results))
-        self.assertEqual(10, sum(command[0] == str(hyperfine) for command in calls))
+        self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
 
-    def test_startup_measurement_balances_warmed_hyperfine_rounds(self) -> None:
+    def test_startup_measurement_uses_one_thousand_samples_in_balanced_blocks(self) -> None:
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"
         hyperfine = self.root / "tools" / "hyperfine"
@@ -308,9 +308,9 @@ class PgsoQualificationTests(unittest.TestCase):
         hyperfine_calls = [
             command for command in calls if command[0] == str(hyperfine)
         ]
-        self.assertEqual(60, len(hyperfine_calls))
-        for command_start in range(0, len(hyperfine_calls), 10):
-            command_rounds = hyperfine_calls[command_start : command_start + 10]
+        self.assertEqual(600, len(hyperfine_calls))
+        for command_start in range(0, len(hyperfine_calls), 100):
+            command_rounds = hyperfine_calls[command_start : command_start + 100]
             for round_index, command in enumerate(command_rounds):
                 self.assertIn("--shell=none", command)
                 self.assertEqual("10", command[command.index("--warmup") + 1])
@@ -328,9 +328,9 @@ class PgsoQualificationTests(unittest.TestCase):
                         if value == "--command-name"
                     ],
                 )
-        self.assertTrue(all(result.requested_samples == 100 for result in results))
-        self.assertTrue(all(len(result.control_samples) == 100 for result in results))
-        self.assertTrue(all(len(result.candidate_samples) == 100 for result in results))
+        self.assertTrue(all(result.requested_samples == 1_000 for result in results))
+        self.assertTrue(all(len(result.control_samples) == 1_000 for result in results))
+        self.assertTrue(all(len(result.candidate_samples) == 1_000 for result in results))
 
     def test_startup_measurement_caps_large_campaign_blocks_at_ten_runs(self) -> None:
         control = self.root / "control" / "fx"

@@ -352,7 +352,6 @@ function prepareFixture(config: StressConfig): {
       sandbox: "none",
       permission_mode: "auto",
       permission: {},
-      maxxing_mode: "legacy",
       max_agent_steps: config.batches + 12,
       max_tool_result_bytes: 2 * 1024 * 1024,
     }),
@@ -391,6 +390,7 @@ done
   responses.push(fakeGatewayFinalText(`${HISTORY_DONE}\n${TAIL_SENTINEL}`));
   responses.push(fakeGatewayToolCall("ctrl-o-brutal-live", "terminal", {
     action: "exec",
+    timeout_ms: 600_000,
     command: "./ctrl-o-live.sh",
   }));
   responses.push(fakeGatewayFinalText(LIVE_DONE));
@@ -884,7 +884,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     expect(readFileSync(paths.stderrPath, "utf8")).toBe("");
 
     await session.sendText("Run the prepared live command while I inspect the transcript.");
-    await session.waitForText(LIVE_START, TIMEOUT);
+    await session.waitForText("Running ./ctrl-o-live.sh", TIMEOUT);
     await session.sendLiteralText(DRAFT);
     await waitForMode(session, "main", DRAFT);
     const pid = fxProcessId(session);

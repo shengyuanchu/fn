@@ -106,7 +106,7 @@ pub const AutoUpgrade = struct {
                 const ver = self.getLatestVersion(&ver_buf);
                 return std.fmt.bufPrint(buf, "upgrading to {s}...", .{ver}) catch "";
             },
-            .ready => return "Update installed: ctrl+g to reload",
+            .ready => return "update ready: ctrl+g to reload",
             .failed => return "upgrade failed",
             else => return "",
         }
@@ -293,7 +293,7 @@ test "statusLabel ready explains ctrl+g reload" {
     au.setState(.ready);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("Update installed: ctrl+g to reload", label);
+    try std.testing.expectEqualStrings("update ready: ctrl+g to reload", label);
 }
 
 test "setLatestVersion stores normalized version" {

@@ -149,13 +149,12 @@ export function fakeGatewayToolCall(
 }
 
 export function fakeGatewayPermissionDecision(
-  decision: "allow" | "ask" = "allow",
+  decision: "clear" | "caution" = "clear",
   toolCallId = "permission_decision_1",
   rationale = "test fixture",
 ) {
   return fakeGatewayToolCall(toolCallId, "permission_decision", {
-    risk: decision === "allow" ? "low" : "high",
-    authorization: decision === "allow" ? "medium" : "unknown",
+    risk: decision === "clear" ? "low" : "high",
     decision,
     rationale,
   });
@@ -313,7 +312,7 @@ export type FakeGatewayOptions = {
       | FakeGatewayModel[]
       | Response
       | Promise<FakeGatewayModel[] | Response>);
-  classifierDecision?: "allow" | "ask";
+  classifierDecision?: "clear" | "caution";
   classifierResponses?: FakeGatewayResponse[];
   generationResponse?: (
     generationId: string,
@@ -363,7 +362,7 @@ function serveFakeGateway(
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
         if (next) return typeof next === "function" ? await next(body) : next;
-        return fakeGatewayPermissionDecision(options.classifierDecision ?? "allow");
+        return fakeGatewayPermissionDecision(options.classifierDecision ?? "clear");
       }
       requests.push({ body, headers });
       return nextCompletion(body);

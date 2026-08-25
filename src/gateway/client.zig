@@ -199,7 +199,7 @@ var test_cancel_watcher_spawn_error: ?anyerror = null;
 
 pub const StreamResult = struct {
     status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
+    completion: types.ModelCompletion = .{},
     err_body: ?[]u8 = null,
     retry_after_seconds: ?u64 = null,
 
@@ -1000,6 +1000,7 @@ pub const StreamRequest = struct {
     trace_ctx: debug_trace.TraceContext = .{},
     content_capture_limit: ?usize = null,
     delivery: ?*DeliveryCertainty = null,
+    admission: ?agent_stream_provider.Admission = null,
     on_reasoning_chunk: ?StreamCallback = null,
     on_tool_input_chunk: ?StreamCallback = null,
     provider_attempt_owner: ProviderAttemptOwner = .transport,
@@ -1185,6 +1186,7 @@ fn streamGatewayCompletionCoreWithOptions(
         request.session_id,
     );
 
+    if (request.admission) |admission| try admission.admit();
     var attempt: usize = 0;
     var delivery_ambiguous = false;
     var request_body_possibly_sent = false;
@@ -2253,7 +2255,7 @@ fn stringifyJsonValueOwned(alloc: std.mem.Allocator, value: std.json.Value) ![]u
     return out.toOwnedSlice();
 }
 
-fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.GatewayCompletion) void {
+fn deinitGatewayCompletion(alloc: std.mem.Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(content);
     if (completion.generation_id) |id| alloc.free(id);
     if (completion.billing) |billing| alloc.free(@constCast(billing.model));
@@ -2522,7 +2524,7 @@ fn parseSseBilling(
     root: std.json.Value,
     created_at_ms: ?i64,
     tools: []const SseToolCallAccumulator,
-) SseBillingParseError!types.GatewayBilling {
+) SseBillingParseError!types.ProviderBilling {
     const timestamp = created_at_ms orelse return error.InvalidSseBilling;
     const usage = if (root == .object)
         root.object.get("usage") orelse return error.InvalidSseBilling
@@ -2746,7 +2748,7 @@ fn consumeSseStream(
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     return consumeSseStreamTraced(alloc, reader, callback_ctx, on_content_chunk, on_tool_start, null, null, cancel_flag, null, null, null);
 }
 
@@ -2764,7 +2766,7 @@ pub fn consumeGatewaySseStream(
     on_reasoning_chunk: ?StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     return consumeSseStreamTraced(
         alloc,
         reader,
@@ -2792,7 +2794,7 @@ fn consumeSseStreamTraced(
     resolved_model_trace: ?ResolvedModelTrace,
     expected_provider_tool_name: ?[]const u8,
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content_buf: std.ArrayList(u8) = .empty;
     defer content_buf.deinit(alloc);
 
@@ -2810,7 +2812,7 @@ fn consumeSseStreamTraced(
 
     var finish_reason_holder: ?types.ProviderFinishReason = null;
     var finish_usage: types.Usage = .{};
-    var finish_billing: ?types.GatewayBilling = null;
+    var finish_billing: ?types.ProviderBilling = null;
     defer if (finish_billing) |billing| alloc.free(@constCast(billing.model));
     var generation_id: ?[]u8 = null;
     defer if (generation_id) |id| alloc.free(id);
@@ -3263,7 +3265,7 @@ fn consumeSseStreamTraced(
         }
     }
 
-    var completion: types.GatewayCompletion = .{};
+    var completion: types.ModelCompletion = .{};
     errdefer deinitGatewayCompletion(alloc, &completion);
 
     if (content_buf.items.len > 0) {

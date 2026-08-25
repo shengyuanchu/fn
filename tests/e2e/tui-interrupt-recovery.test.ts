@@ -214,7 +214,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("cancelled", TIMEOUT);
       await session.sendText(`/model ${FOLLOW_UP_MODEL}`);
       await waitForCondition(
-        () => JSON.parse(readFileSync(settingsPath, "utf8")).model === FOLLOW_UP_MODEL,
+        () => JSON.parse(readFileSync(settingsPath, "utf8")).models?.gateway === FOLLOW_UP_MODEL,
         "follow-up model persistence",
       );
       await session.sendText("Confirm that the next prompt still works.");
@@ -342,6 +342,7 @@ while :; do sleep 1; done
       gateway = startFakeGateway([
         fakeGatewayToolCall("workspace-cancel-hold", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: "./hold-workspace-cancel.sh",
         }),
       ]);

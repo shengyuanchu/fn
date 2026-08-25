@@ -2,7 +2,6 @@ const std = @import("std");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
 const session_runtime = @import("../../session/session.zig");
-const gateway_json = @import("../../gateway/gateway_json.zig");
 
 const runtime_config = @import("config.zig");
 
@@ -74,7 +73,7 @@ test "history context budget reserves known output capacity from one capability 
     }
 }
 
-test "budgeted history projection uses corrected Anthropic window while remaining bounded" {
+test "budgeted history projection uses a million-token capability while remaining bounded" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -91,7 +90,7 @@ test "budgeted history projection uses corrected Anthropic window while remainin
     }
 
     const exact_budget = historyContextBudgetTokensForCapabilities(
-        model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.8"),
+        .{ .context_window = 1_000_000 },
     );
     try std.testing.expectEqual(@as(usize, 250_000), exact_budget);
 
@@ -116,21 +115,12 @@ test "budgeted history projection uses corrected Anthropic window while remainin
     try std.testing.expectEqual(@as(usize, 9), above_new_budget.items.len);
     try std.testing.expectEqualStrings(large_assistant, above_new_budget.items[above_new_budget.items.len - 1].content.?);
 
-    const body = try gateway_json.buildGatewayRequestBodyWithOptions(
-        arena,
-        "[]",
-        above_new_budget.items,
-        .{},
-        .auto,
-    );
-    try std.testing.expect(body.len < 1_100_000);
-
     var older_model_projection: std.ArrayList(ChatMessage) = .empty;
     try session_runtime.appendHistoryChatMessagesBudgeted(
         arena,
         &older_model_projection,
         history[0..4],
-        .{ .max_tokens = historyContextBudgetTokensForCapabilities(model_capabilities.capabilitiesForModel("anthropic/claude-opus-4.5")) },
+        .{ .max_tokens = historyContextBudgetTokensForCapabilities(.{ .context_window = 200_000 }) },
     );
     try std.testing.expectEqual(types.ChatRole.system, older_model_projection.items[0].role);
     try std.testing.expectEqual(@as(usize, 3), older_model_projection.items.len);
@@ -293,5 +283,4 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);
-    try gateway_json.validateToolMessageHistory(arena, messages.items);
 }

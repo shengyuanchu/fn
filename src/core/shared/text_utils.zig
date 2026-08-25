@@ -448,6 +448,60 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     return try out.toOwnedSlice();
 }
 
+/// Returns true when a secret candidate begins before the retained suffix and
+/// cannot be classified until later bytes arrive on the same logical line.
+pub fn secretMayCrossBoundary(text: []const u8, retained_suffix_bytes: usize) bool {
+    const retained_start = text.len -| retained_suffix_bytes;
+
+    var assignment_end = text.len;
+    if (assignment_end > 0 and
+        (text[assignment_end - 1] == '"' or text[assignment_end - 1] == '\''))
+    {
+        assignment_end -= 1;
+    }
+    if (assignment_end > 0 and text[assignment_end - 1] == '=') {
+        const key_end = assignment_end - 1;
+        var unfinished_key_start = key_end;
+        while (unfinished_key_start > 0 and
+            isAssignmentKeyChar(text[unfinished_key_start - 1]))
+        {
+            unfinished_key_start -= 1;
+        }
+        if (unfinished_key_start < retained_start and
+            sensitiveAssignmentKey(text[unfinished_key_start..key_end]))
+        {
+            return true;
+        }
+    }
+
+    var key_start = text.len;
+    while (key_start > 0 and isAssignmentKeyChar(text[key_start - 1])) {
+        key_start -= 1;
+    }
+    if (key_start < retained_start and
+        sensitiveAssignmentKey(text[key_start..]))
+    {
+        return true;
+    }
+
+    const prefix = "https://";
+    var search_start: usize = 0;
+    while (std.mem.findPos(u8, text, search_start, prefix)) |url_start| {
+        const credential_start = url_start + prefix.len;
+        var end = credential_start;
+        while (end < text.len and
+            text[end] != '\n' and
+            text[end] != '\r' and
+            !std.ascii.isWhitespace(text[end])) : (end += 1)
+        {
+            if (text[end] == '/' or text[end] == '?' or text[end] == '#' or text[end] == '@') break;
+        }
+        if (end == text.len and url_start < retained_start) return true;
+        search_start = if (end < text.len) end + 1 else text.len;
+    }
+    return false;
+}
+
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -944,6 +998,37 @@ test "maskSecrets masks expanded model-facing secret patterns" {
         masked,
     );
     try std.testing.expect(std.mem.find(u8, masked, "AKIA0123456789ABCDEF") == null);
+}
+
+test "secret boundary analysis preserves resolved URLs and catches unfinished candidates" {
+    try std.testing.expect(!secretMayCrossBoundary(
+        "prefix https://example.com suffix ",
+        64,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY=",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY=\"",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "MY_VERY_LONG_TOKEN_KEY='",
+        4,
+    ));
+    try std.testing.expect(secretMayCrossBoundary(
+        "prefix https://user:password",
+        4,
+    ));
+    try std.testing.expect(!secretMayCrossBoundary(
+        "prefix ORDINARY_KEY",
+        4,
+    ));
 }
 
 test "redactUrlForDisplay masks credential-like query values" {

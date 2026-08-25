@@ -992,67 +992,6 @@ test "common Stop step limit retains candidate and current-turn execution" {
     );
 }
 
-test "common Stop automatic recovery fallback retains candidate and current-turn execution" {
-    const alloc = std.testing.allocator;
-    const first = [_]ToolCall{toolCall("blocked-1", "run_command", "{\"command\":\"touch blocked\"}")};
-    const second = [_]ToolCall{toolCall("blocked-2", "run_command", "{\"command\":\"touch blocked\"}")};
-    const third = [_]ToolCall{toolCall("blocked-3", "run_command", "{\"command\":\"touch blocked\"}")};
-    const fourth = [_]ToolCall{toolCall("blocked-4", "run_command", "{\"command\":\"touch blocked\"}")};
-    var gateway = FakeGateway.init(alloc, &.{
-        .{ .content = "candidate" },
-        .{ .tool_calls = &first },
-        .{ .tool_calls = &second },
-        .{ .tool_calls = &third },
-        .{ .tool_calls = &fourth },
-        .{ .content = "must not be requested" },
-    });
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    defer deps.deinit();
-    deps.permission_decisions = &.{.deny};
-    deps.permission_denial_reasons = &.{.auto_denied};
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.agent_step_limit = 0;
-    var job = fixture.job();
-    job.permission_mode = .auto;
-    var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
-    defer lifecycle_runtime.deinit();
-    var handler = StopTestHandler{
-        .alloc = alloc,
-        .action = .{ .continue_once = "verify" },
-    };
-    defer handler.deinit();
-    const view = try registerStopTestHandler(&lifecycle_runtime, &handler);
-
-    try runFakePromptWithLifecycle(
-        &gateway,
-        &deps,
-        config,
-        job,
-        testLifecycleContext(view, alloc, fixture.workspace_root),
-    );
-
-    try std.testing.expectEqual(@as(usize, 5), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 1), handler.calls);
-    try std.testing.expectEqual(@as(usize, 1), deps.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, deps.finalized_outcome.?);
-    const turn = deps.history_turns.items[0].assistant;
-    try std.testing.expectEqualStrings(
-        "candidate\nI couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        turn.assistant,
-    );
-    try std.testing.expectEqual(@as(usize, 4), turn.execution.tool_steps.len);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countText(
-            &deps,
-            "I couldn't continue because the required actions were blocked by automatic safety checks. I need a different approach or explicit direction from you.",
-        ),
-    );
-}
-
 test "common Stop length-limited tool failure retains candidate" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{

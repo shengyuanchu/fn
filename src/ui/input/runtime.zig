@@ -27,7 +27,6 @@ const terminal_action_decoder = @import("terminal_action_decoder.zig");
 
 const ImageBlocks = kill_ring.ImageBlocks;
 const InputRuntime = core_input_runtime.Runtime;
-const InputAppearance = core_input_runtime.InputAppearance;
 
 const Allocator = std.mem.Allocator;
 const InsertResult = composer_insertion.InsertResult;

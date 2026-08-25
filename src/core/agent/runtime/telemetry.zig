@@ -317,35 +317,6 @@ pub fn traceGatewayProviderOptions(ctx: TraceContext, model: []const u8, fast_mo
     );
 }
 
-pub fn traceGatewayRequestBuilt(ctx: TraceContext, model: []const u8, payload_bytes: usize, gateway_message_count: usize, tools_json: []const u8) void {
-    if (!debug_trace.isScopeEnabled("gateway")) return;
-
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    if (countToolSchemas(arena, tools_json)) |tool_schema_count| {
-        debug_trace.eventf("gateway", "request_built", ctx, "payload_bytes={d} model={s} gateway_messages={d} tool_schema_count={d}", .{ payload_bytes, model, gateway_message_count, tool_schema_count });
-    } else {
-        debug_trace.eventf("gateway", "request_built", ctx, "payload_bytes={d} model={s} gateway_messages={d} tool_schema_count=unknown", .{ payload_bytes, model, gateway_message_count });
-    }
-}
-
-fn countToolSchemas(alloc: Allocator, tools_json: []const u8) ?usize {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, tools_json, .{}) catch return null;
-    defer parsed.deinit();
-
-    switch (parsed.value) {
-        .array => |array| return array.items.len,
-        .object => |object| {
-            const tools_value = object.get("tools") orelse return null;
-            if (tools_value == .array) return tools_value.array.items.len;
-            return null;
-        },
-        else => return null,
-    }
-}
-
 pub fn toolExecutionResultKind(result: ToolExecutionResult) []const u8 {
     if (result.status == .failure) return "error";
     if (result.diff_entry != null) return "diff";

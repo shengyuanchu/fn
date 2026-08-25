@@ -65,7 +65,7 @@ function createRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "minimal" }),
+    JSON.stringify({}),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),
@@ -82,6 +82,18 @@ function createRoot(
       },
     }),
   );
+  return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
+}
+
+function createEmptyRoot(label: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-mcp-http-${label}-`)));
+  cleanupRoot = root;
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+  writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
   return { root, home, workspace, traceLogPath: join(root, "fx-trace.log") };
 }
 
@@ -185,6 +197,52 @@ function assertModernWire(
 }
 
 describe("modern MCP Streamable HTTP", () => {
+  test.skipIf(!tmuxAvailable())(
+    "/mcp add --transport http persists and reloads a remote server",
+    async () => {
+      fixture = startModernMcpHttpFixture("json");
+      const root = createEmptyRoot("add-command");
+      gateway = startFakeGateway([], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 150,
+        height: 36,
+        stderrPath,
+        env: fixtureEnv(root, gateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText(
+        `/mcp add --transport http prisma ${fixture.url}`,
+      );
+      const saved = await tui.waitForText("Saved MCP server 'prisma'.", 10_000);
+      expect(saved).toContain("MCP reconnection started");
+      await tui.waitForText("MCP configuration reloaded successfully.", 15_000);
+      await tui.sendText("/mcp list");
+      const health = await tui.waitForText("MCP health (1 server):", 10_000);
+      expect(health).toMatch(/prisma[\s\S]{0,240}transport=http state=ready/);
+
+      const profile = JSON.parse(
+        readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
+      );
+      expect(profile.mcp.prisma).toMatchObject({
+        type: "http",
+        url: fixture.url,
+        enabled: true,
+      });
+      expect(fixture.requests.map((entry) => entry.message.method)).toEqual([
+        "server/discover",
+        "tools/list",
+      ]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    30_000,
+  );
+
   test("resource list-change storms coalesce to one complete refresh", async () => {
     fixture = startModernMcpHttpFixture("features");
     const root = createRoot("feature-update-storm", fixture);
@@ -508,9 +566,22 @@ describe("modern MCP Streamable HTTP", () => {
     expect(bodies).toContain('\\"trust\\":\\"untrusted_external\\"');
     expect(bodies).toContain("HTTP_RESOURCE_TEXT");
     expect(bodies).toContain("HTTP_PROMPT_TEXT");
-    expect(fixture.requests.filter((entry) =>
+    const resourceReads = fixture.requests.filter((entry) =>
       entry.message.method === "resources/read"
-    )).toHaveLength(2);
+    );
+    expect(resourceReads).toHaveLength(2);
+    for (const entry of resourceReads) {
+      expect(entry.headers["mcp-name"]).toBe("custom://alpha");
+    }
+    const promptGet = fixture.requests.find((entry) =>
+      entry.message.method === "prompts/get"
+    );
+    expect(promptGet?.headers["mcp-name"]).toBe("review");
+    for (const entry of fixture.requests.filter((request) =>
+      ["resources/list", "prompts/list"].includes(request.message.method)
+    )) {
+      expect(entry.headers["mcp-name"]).toBeUndefined();
+    }
     expect(fixture.requests.filter((entry) =>
       entry.message.method === "completion/complete"
     )).toHaveLength(1);
@@ -1368,7 +1439,7 @@ describe("modern MCP Streamable HTTP", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       tui = await TmuxSession.create({

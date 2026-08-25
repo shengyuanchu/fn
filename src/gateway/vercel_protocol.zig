@@ -1,18 +1,18 @@
 const std = @import("std");
-const image_attachments = @import("../images/image_attachments.zig");
-const io_mod = @import("../shared/io.zig");
-const model_capabilities = @import("../config/model_capabilities.zig");
-const types = @import("../shared/types.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
+const io_mod = @import("../core/shared/io.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
+const types = @import("../core/shared/types.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
-pub const GatewayCompletion = types.GatewayCompletion;
+pub const GatewayCompletion = types.ModelCompletion;
 pub const ToolCall = types.ToolCall;
 
 pub const StructuredResponseFormat = struct {
     name: []const u8,
     description: []const u8,
-    schema_json: []const u8,
+    schema: std.json.Value,
 };
 
 const pending_tool_review_result_text = "Tool call has not executed; it is pending permission review.";
@@ -404,19 +404,15 @@ fn writeStructuredResponseFormat(
     writer: *std.Io.Writer,
     format: StructuredResponseFormat,
 ) !void {
-    var schema = std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidStructuredResponseSchema,
-    };
-    defer schema.deinit();
-    if (schema.value != .object) return error.InvalidStructuredResponseSchema;
+    _ = alloc;
+    if (format.schema != .object) return error.InvalidStructuredResponseSchema;
 
     try writer.writeAll(",\"responseFormat\":{\"type\":\"json\",\"name\":");
     try std.json.Stringify.value(format.name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(format.description, .{}, writer);
     try writer.writeAll(",\"schema\":");
-    try std.json.Stringify.value(schema.value, .{}, writer);
+    try std.json.Stringify.value(format.schema, .{}, writer);
     try writer.writeByte('}');
 }
 
@@ -895,6 +891,13 @@ test "roleName returns exact gateway role strings" {
 test "gateway request serializes an optional structured response format" {
     const alloc = std.testing.allocator;
     const messages = [_]ChatMessage{.{ .role = .user, .content = "inspect" }};
+    var schema = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"object\",\"additionalProperties\":false}",
+        .{},
+    );
+    defer schema.deinit();
     const body = try buildGatewayRequestBodyValidated(
         alloc,
         "[]",
@@ -906,7 +909,7 @@ test "gateway request serializes an optional structured response format" {
         .{
             .name = "fx_vision_evidence",
             .description = "Evidence \"only\"",
-            .schema_json = "{\"type\":\"object\",\"additionalProperties\":false}",
+            .schema = schema.value,
         },
         null,
     );
@@ -939,7 +942,7 @@ test "gateway request serializes an optional structured response format" {
             .{
                 .name = "invalid",
                 .description = "invalid",
-                .schema_json = "not json",
+                .schema = .{ .string = "not json" },
             },
             null,
         ),

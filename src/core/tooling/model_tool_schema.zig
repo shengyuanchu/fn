@@ -54,6 +54,24 @@ pub const FunctionSchema = struct {
     input_schema: ObjectSchema = .{},
 };
 
+pub fn isSingleRequiredObjectUnionField(
+    schema: ObjectSchema,
+    field_name: []const u8,
+) bool {
+    if (schema.properties.len != 1 or schema.required.len != 1 or
+        schema.additional_properties != false or
+        !std.mem.eql(u8, schema.properties[0].name, field_name) or
+        !std.mem.eql(u8, schema.required[0], field_name))
+    {
+        return false;
+    }
+    const shape = schema.properties[0].shape orelse return false;
+    return switch (shape.*) {
+        .object => |object| object.one_of.len > 0,
+        else => false,
+    };
+}
+
 test "static property representation stays within the measured size budget" {
     try std.testing.expect(@sizeOf(Property) <= 96);
 }
@@ -68,7 +86,7 @@ fn cappedDescriptionAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return out;
 }
 
-fn writeCappedDescriptionJsonString(
+pub fn writeCappedDescriptionJsonString(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     text: []const u8,
@@ -127,7 +145,7 @@ pub fn dynamicFunctionSchemaJsonAlloc(
     return try out.toOwnedSlice();
 }
 
-fn writeObjectSchema(
+pub fn writeObjectSchema(
     alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     schema: ObjectSchema,

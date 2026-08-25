@@ -11,6 +11,7 @@ const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_runtime = @import("provider_runtime.zig");
@@ -21,31 +22,10 @@ fn oauthAuthEnabled(comptime App: type) bool {
         runtime_profile.allows(App, .js_host_auth);
 }
 
-const ProviderSwitchDecision = enum {
-    no_change,
-    busy,
-    prepare,
-};
-
-const ProviderSwitchIntent = enum {
-    manual,
-    post_oauth,
-};
-
-const ProviderSwitchFacts = struct {
-    current: model_provider.ProviderId,
-    target: model_provider.ProviderId,
-    target_credential_ready: bool,
-    intent: ProviderSwitchIntent,
-    stream_active: bool,
-    queued_prompts: usize,
-};
-
-fn decideProviderSwitch(facts: ProviderSwitchFacts) ProviderSwitchDecision {
-    if (facts.intent == .manual and facts.current == facts.target and facts.target_credential_ready) return .no_change;
-    if (facts.stream_active or facts.queued_prompts > 0) return .busy;
-    return .prepare;
-}
+const ProviderSwitchDecision = auth_transition.ProviderSwitchDecision;
+const ProviderSwitchIntent = auth_transition.ProviderSwitchIntent;
+const ProviderSwitchFacts = auth_transition.ProviderSwitchFacts;
+const decideProviderSwitch = auth_transition.decideProviderSwitch;
 
 fn providerFailureMessage(
     intent: ProviderSwitchIntent,
@@ -133,7 +113,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
 
@@ -158,31 +138,21 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 };
             try app.flushBeforeBlockingExternalWork();
-            const selected_model_uses_chatgpt = if (comptime provider_runtime.supported(App))
-                provider_runtime.provider(app) == .codex
+            const selected_provider: model_provider.ProviderId = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app)
             else
-                false;
-            const selected_model_uses_grok = if (comptime provider_runtime.supported(App))
-                provider_runtime.provider(app) == .grok
-            else
-                false;
+                .gateway;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
                 try app.auth.refreshSourceInventory(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
-            const chatgpt_is_only_logout_session = provider_inventory.contains(.chatgpt_subscription) and
-                !provider_inventory.contains(.fx_login) and
-                !provider_inventory.contains(.grok_subscription);
-            const grok_is_only_logout_session = provider_inventory.contains(.grok_subscription) and
-                !provider_inventory.contains(.fx_login) and
-                !provider_inventory.contains(.chatgpt_subscription);
-            const logout_grok = if (requested_provider) |provider|
-                provider == .grok
-            else
-                selected_model_uses_grok or
-                    app.auth.credentialSource() == .grok_subscription or
-                    grok_is_only_logout_session;
-            if (logout_grok) {
+            const logout_provider = auth_transition.decideLogoutProvider(.{
+                .requested = requested_provider,
+                .selected = selected_provider,
+                .active_source = app.auth.credentialSource(),
+                .available_sources = provider_inventory,
+            });
+            if (logout_provider == .grok) {
                 const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -210,13 +180,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return;
             }
-            const logout_chatgpt = if (requested_provider) |provider|
-                provider == .codex
-            else
-                selected_model_uses_chatgpt or
-                    app.auth.credentialSource() == .chatgpt_subscription or
-                    chatgpt_is_only_logout_session;
-            if (logout_chatgpt) {
+            if (logout_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -260,7 +224,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             app.shell.render_requests.request(.footer);
         }
 
@@ -312,6 +276,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider => |provider| try switchProvider(app, provider, true, .manual),
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
+                    .connections => unreachable,
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
@@ -338,10 +303,19 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn routeAuthPickerByte(app: *App, byte: u8) !bool {
             if (app.auth.signInEntryActive()) {
-                switch (byte) {
-                    3, 4 => _ = app.auth.popPickerStage(app.alloc),
-                    '\r', '\n' => try openSignInBrowser(app),
-                    else => {},
+                if (app.auth.signInCodeEntryActive()) {
+                    switch (byte) {
+                        3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                        '\r', '\n' => if (!try app.auth.submitSignInCode(app.alloc)) try openSignInBrowser(app),
+                        8, 127 => _ = app.auth.deleteSignInCodeByte(),
+                        else => _ = try app.auth.appendSignInCodeByte(app.alloc, byte),
+                    }
+                } else {
+                    switch (byte) {
+                        3, 4 => _ = app.auth.popPickerStage(app.alloc),
+                        '\r', '\n' => try openSignInBrowser(app),
+                        else => {},
+                    }
                 }
                 app.shell.render_requests.request(.footer);
                 return true;
@@ -371,6 +345,7 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.signInEntryActive() and !app.auth.apiKeyEntryActive()) return false;
             return switch (action) {
                 .escape, .remapped_byte => false,
+                .paste_start, .paste_end => !app.auth.signInCodeEntryActive(),
                 else => true,
             };
         }
@@ -418,62 +393,54 @@ pub fn Runtime(comptime App: type) type {
                             });
                         },
                         .chatgpt => {
-                            try app.auth.refreshSourceInventory(app.alloc);
-                            if (comptime provider_runtime.supported(App)) {
-                                app.auth.closePicker(app.alloc);
-                                try switchProvider(app, .codex, false, .post_oauth);
-                                return;
-                            }
-                            if (!try selectCredentialSource(app, .chatgpt_subscription)) {
-                                _ = app.auth.popPickerStage(app.alloc);
-                                try writeAuthNotice(app, .{
-                                    .topic = "auth",
-                                    .tone = .@"error",
-                                    .body = "Signed in, but the Codex subscription credential could not be loaded.",
-                                });
-                                return;
-                            }
-                            app.auth.closePicker(app.alloc);
-                            try writeAuthNotice(app, .{
-                                .topic = "auth",
-                                .tone = .neutral,
-                                .body = "Signed in with Codex.",
-                            });
+                            try finishSubscriptionSignIn(app, .codex);
+                            return;
                         },
                         .grok => {
-                            try app.auth.refreshSourceInventory(app.alloc);
-                            if (comptime provider_runtime.supported(App)) {
-                                app.auth.closePicker(app.alloc);
-                                try switchProvider(app, .grok, false, .post_oauth);
-                                return;
-                            }
-                            const selected_model_uses_grok = if (comptime provider_runtime.supported(App))
-                                provider_runtime.provider(app) == .grok
-                            else
-                                false;
-                            if (selected_model_uses_grok and
-                                !try selectCredentialSource(app, .grok_subscription))
-                            {
-                                _ = app.auth.popPickerStage(app.alloc);
-                                try writeAuthNotice(app, .{
-                                    .topic = "auth",
-                                    .tone = .@"error",
-                                    .body = "Signed in, but the Grok subscription credential could not be loaded.",
-                                });
-                                return;
-                            }
-                            if (!selected_model_uses_grok) {
-                                app.model_cache.reset();
-                                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
-                            }
-                            app.auth.closePicker(app.alloc);
-                            try writeAuthNotice(app, .{
-                                .topic = "auth",
-                                .tone = .neutral,
-                                .body = "Signed in with Grok.",
-                            });
+                            try finishSubscriptionSignIn(app, .grok);
+                            return;
                         },
                     }
+                },
+            }
+        }
+
+        fn finishSubscriptionSignIn(
+            app: *App,
+            provider: model_provider.ProviderId,
+        ) !void {
+            try app.auth.refreshSourceInventory(app.alloc);
+            switch (auth_transition.signInCompletion(
+                provider,
+                comptime provider_runtime.supported(App),
+            )) {
+                .vercel => unreachable,
+                .switch_provider => |target| {
+                    app.auth.closePicker(app.alloc);
+                    try switchProvider(app, target, false, .post_oauth);
+                },
+                .activate_source => |source| {
+                    if (!try selectCredentialSource(app, source)) {
+                        _ = app.auth.popPickerStage(app.alloc);
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = if (provider == .codex)
+                                "Signed in, but the Codex subscription credential could not be loaded."
+                            else
+                                "Signed in, but the Grok subscription credential could not be loaded.",
+                        });
+                        return;
+                    }
+                    app.auth.closePicker(app.alloc);
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .neutral,
+                        .body = if (provider == .codex)
+                            "Signed in with Codex."
+                        else
+                            "Signed in with Grok.",
+                    });
                 },
             }
         }
@@ -775,7 +742,7 @@ pub fn Runtime(comptime App: type) type {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
                         "Already using {s}.",
-                        .{model_provider.label(target)},
+                        .{provider_catalog.label(target)},
                     );
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
@@ -916,11 +883,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer settings.deinit(app.alloc);
-            const saved_model = switch (target) {
-                .gateway => settings.model,
-                .codex => settings.codex_model,
-                .grok => settings.grok_model,
-            };
+            const saved_model = settings.models.get(target);
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
             else
@@ -954,7 +917,7 @@ pub fn Runtime(comptime App: type) type {
             const body = try std.fmt.allocPrint(
                 app.alloc,
                 "Switched to {s} with {s}.",
-                .{ model_provider.label(target), provider_runtime.model(app) },
+                .{ provider_catalog.label(target), provider_runtime.model(app) },
             );
             defer app.alloc.free(body);
             if (comptime @hasDecl(App, "persistRuntimePreferences")) {
@@ -981,10 +944,12 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
                 }
             } else {
-                var persistence = config_runtime.attemptUserPreferences(app.alloc, switch (target) {
-                    .gateway => .{ .provider = .gateway, .model = provider_runtime.model(app) },
-                    .codex => .{ .provider = .codex, .codex_model = provider_runtime.model(app) },
-                    .grok => .{ .provider = .grok, .grok_model = provider_runtime.model(app) },
+                var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                    .provider = target,
+                    .model_preference = .{
+                        .provider = target,
+                        .model = provider_runtime.model(app),
+                    },
                 });
                 defer persistence.deinit(app.alloc);
                 switch (persistence) {
@@ -1152,7 +1117,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("auth", "prompt credential refresh failed source={t} err={s}", .{ source, @errorName(err) });
             if (app.auth.credentialSource() == source) app.auth.recordCredentialRefreshFailure(source);
             try app.auth.refreshSourceInventory(app.alloc);
-            app.auth.openPicker(app.alloc);
+            app.auth.openPickerForProvider(app.alloc, provider_runtime.provider(app));
             const failure = auth_runtime.FailureSnapshot{
                 .source = source,
                 .reason = .credential_refresh_failed,
@@ -1196,10 +1161,23 @@ pub fn Runtime(comptime App: type) type {
                     if (subscription) {
                         app.session.usage.clearReconciliationCredential();
                     } else {
-                        app.session.usage.replaceReconciliationCredential(
-                            app.alloc,
-                            credential.api_key,
-                        );
+                        if (comptime @hasDecl(
+                            @TypeOf(app.session.usage),
+                            "replaceProviderReconciliationCredential",
+                        )) {
+                            app.session.usage.replaceProviderReconciliationCredential(
+                                app.alloc,
+                                .gateway,
+                                credential.source,
+                                null,
+                                credential.api_key,
+                            );
+                        } else {
+                            app.session.usage.replaceReconciliationCredential(
+                                app.alloc,
+                                credential.api_key,
+                            );
+                        }
                     }
                 } else {
                     app.session.usage.clearReconciliationCredential();
@@ -1465,6 +1443,7 @@ const TestAuth = struct {
     source_inventory_refresh_count: usize = 0,
     refresh_failure_source: ?credentials.Source = null,
     picker_opened: bool = false,
+    picker_provider: model_provider.ProviderId = .gateway,
     picker_closed: bool = false,
     gateway_ready: bool = true,
     catalog_ready: bool = true,
@@ -1530,8 +1509,13 @@ const TestAuth = struct {
         self.refresh_failure_source = source;
     }
 
-    fn openPicker(self: *TestAuth, _: std.mem.Allocator) void {
+    fn openPickerForProvider(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        provider: model_provider.ProviderId,
+    ) void {
         self.picker_opened = true;
+        self.picker_provider = provider;
     }
 
     fn teamSelection(self: *TestAuth) ?*TestTeamSelection {
@@ -1620,6 +1604,7 @@ const TestUrlOpener = struct {
 
 const TestApp = struct {
     alloc: std.mem.Allocator = std.testing.allocator,
+    selected_provider: model_provider.ProviderId = .gateway,
     auth: TestAuth = .{},
     model_cache: TestModelCache = .{},
     session: struct {
@@ -1665,6 +1650,16 @@ const TestApp = struct {
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 };
+
+test "setup hub projects the selected provider into the auth picker" {
+    var app: TestApp = .{ .selected_provider = .codex };
+    defer app.deinit();
+
+    try Runtime(TestApp).openSetupHub(&app);
+
+    try std.testing.expect(app.auth.picker_opened);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.auth.picker_provider);
+}
 
 test "OAuth app gating accepts native auth or JS-host auth and rejects neither" {
     const NativeApp = struct {

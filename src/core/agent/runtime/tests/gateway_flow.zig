@@ -6,7 +6,6 @@ const token_estimate = @import("../../../shared/token_estimate.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const gateway_json = @import("../../../gateway/gateway_json.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const image_attachments = @import("../../../images/image_attachments.zig");
@@ -18,6 +17,7 @@ const vision_executor = @import("../vision_executor.zig");
 const diagnostics = @import("../../../workspace/diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 
 const test_support = @import("support.zig");
 
@@ -58,8 +58,8 @@ const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
     builtin_tools.read_file,
     builtin_tools.terminal,
 };
-const terminal_nested_tools_json =
-    "[{\"type\":\"function\",\"name\":\"terminal\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"request\":{\"oneOf\":[{\"type\":\"object\"}]}},\"required\":[\"request\"],\"additionalProperties\":false}}]";
+const terminal_advertised_names = [_][]const u8{"terminal"};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -200,7 +200,7 @@ fn expectPromptEntryRole(entry: std.json.Value, expected_role: types.ChatRole) !
     try std.testing.expect(entry == .object);
     const role = entry.object.get("role") orelse return error.TestExpectedPromptRoleMissing;
     try std.testing.expect(role == .string);
-    try std.testing.expectEqualStrings(gateway_json.roleName(expected_role), role.string);
+    try std.testing.expectEqualStrings(@tagName(expected_role), role.string);
 }
 
 fn expectGatewayPromptRoles(gateway: *const FakeGateway, index: usize, expected_roles: []const types.ChatRole) !void {
@@ -435,18 +435,24 @@ const VisionProviderScript = struct {
     fn stream(
         context: ?*anyopaque,
         _: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) anyerror!agent_stream_provider.Result {
         const self: *VisionProviderScript = @ptrCast(@alignCast(context.?));
         if (self.calls >= self.responses.len) return error.TestVisionScriptExhausted;
         const response = self.responses[self.calls];
         self.calls += 1;
+        try request.admission.admit();
         return switch (response) {
-            .content => |text| .{ .status = .ok, .completion = .{ .content = text } },
-            .http_status => |status| .{ .status = status },
+            .content => |text| .{ .completed = .{ .completion = .{ .content = text } } },
+            .http_status => |status| .{ .failed = .{ .kind = switch (status) {
+                .unauthorized => .unauthorized,
+                .too_many_requests => .rate_limited,
+                .service_unavailable => .unavailable,
+                else => .provider_error,
+            } } },
             .cancel => blk: {
                 request.cancel_flag.store(true, .seq_cst);
-                break :blk .{ .status = .ok };
+                break :blk .{ .completed = .{} };
             },
         };
     }
@@ -467,7 +473,6 @@ fn runScriptedVision(
         .api_key = "key",
         .gateway_team = null,
         .retry_count = 1,
-        .chat_url = "https://example.invalid",
         .cancel_flag = null,
         .usage = null,
         .usage_allocator = alloc,
@@ -978,7 +983,8 @@ test "required Vision rejects non-Vision before effects and stays required until
     job.permission_mode = .ask;
 
     var config = fixture.config();
-    config.gateway_tools_json = terminal_nested_tools_json;
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
     var lifecycle = test_support.testLifecycleContext(
         lifecycle_view,
         alloc,
@@ -2332,9 +2338,11 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     job.images = &images;
     job.authorized_image_catalog = &images;
 
+    var config = fixture.config();
+    config.provider_capabilities = .{};
     try std.testing.expectError(
         error.SubscriptionNativeImageUnavailable,
-        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+        runFakePrompt(&gateway, &hooks, config, job),
     );
     try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
 }
@@ -3762,8 +3770,11 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    var initial_job = fixture.job();
+    initial_job.credential_source = .fx_login;
+    initial_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, initial_job);
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -3806,6 +3817,8 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     var restored_hooks = FakeAgentRuntimeDeps.init(alloc);
     defer restored_hooks.deinit();
     var restored_job = fixture.job();
+    restored_job.credential_source = .fx_login;
+    restored_job.account_id = @constCast("acct_1");
     restored_job.recovery_checkpoint = restored_checkpoint;
 
     try runFakePrompt(&restored_gateway, &restored_hooks, config, restored_job);
@@ -4455,7 +4468,15 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         .assistant_source = @constCast("partial"),
         .cause = .provider_unavailable,
         .action = .paused,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .credential_source = .fx_login,
+            .credential_identity = @import("../../../auth/credential_authority.zig").derive(
+                .fx_login,
+                "acct_1",
+            ),
+        },
         .requested_fast_mode = true,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4474,6 +4495,8 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         config.max_provider_attempts = 4;
         var job = fixture.job();
         job.model = @constCast("zai/glm-5.2");
+        job.credential_source = .fx_login;
+        job.account_id = @constCast("acct_1");
         job.recovery_checkpoint = checkpoint;
 
         try runFakePrompt(&gateway, &hooks, config, job);
@@ -4498,6 +4521,8 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
         config.max_provider_attempts = 4;
         var job = fixture.job();
         job.model = @constCast("zai/glm-5.2");
+        job.credential_source = .fx_login;
+        job.account_id = @constCast("acct_1");
         job.recovery_checkpoint = checkpoint;
 
         try runFakePrompt(&gateway, &hooks, config, job);
@@ -4510,7 +4535,7 @@ test "processQueuedPrompt preserves fallback route and budget until selection ch
     }
 }
 
-test "processQueuedPrompt restores legacy connectivity checkpoints through evidence" {
+test "processQueuedPrompt fails closed without stable credential authority" {
     const alloc = std.testing.allocator;
     var fixture = PromptFixture{};
     const checkpoint = session_codec.RecoveryCheckpoint{
@@ -4519,7 +4544,11 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
         .assistant_source = @constCast("partial response"),
         .cause = .system_resumed,
         .action = .waiting_for_connectivity,
-        .route_model = @constCast("zai/glm-5.2"),
+        .authority = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .credential_source = .ai_gateway_api_key,
+        },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,
@@ -4535,20 +4564,11 @@ test "processQueuedPrompt restores legacy connectivity checkpoints through evide
     job.model = @constCast("zai/glm-5.2");
     job.recovery_checkpoint = checkpoint;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        gateway.request_bodies.items[0],
-        "<partial_assistant>\\npartial response\\n</partial_assistant>",
-    ) != null);
-    const reserved = hooks.recovery_checkpoints.items[0];
-    try std.testing.expectEqual(@as(usize, 3), reserved.consumed_provider_attempts);
-    try std.testing.expect(reserved.outstanding_reservation);
-    for (hooks.route_recovery_statuses.items) |status| {
-        try std.testing.expect(status.action != .waiting_for_connectivity);
-    }
+    try std.testing.expectError(
+        error.RecoveryCredentialAuthorityChanged,
+        runFakePrompt(&gateway, &hooks, fixture.config(), job),
+    );
+    try std.testing.expectEqual(@as(usize, 0), gateway.request_models.items.len);
 }
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
@@ -4569,8 +4589,11 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     var fixture = PromptFixture{};
     var config = fixture.config();
     config.max_provider_attempts = 2;
+    var initial_job = fixture.job();
+    initial_job.credential_source = .fx_login;
+    initial_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    try runFakePrompt(&gateway, &hooks, config, initial_job);
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
@@ -4591,6 +4614,8 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     continued_hooks.enable_recovery_checkpoint = true;
     defer continued_hooks.deinit();
     var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
     continued_job.recovery_checkpoint = continued_checkpoint;
 
     try runFakePrompt(&continued_gateway, &continued_hooks, config, continued_job);
@@ -4616,8 +4641,11 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     var fixture = PromptFixture{};
     var first_config = fixture.config();
     first_config.max_provider_attempts = 1;
+    var first_job = fixture.job();
+    first_job.credential_source = .fx_login;
+    first_job.account_id = @constCast("acct_1");
 
-    try runFakePrompt(&first_gateway, &first_hooks, first_config, fixture.job());
+    try runFakePrompt(&first_gateway, &first_hooks, first_config, first_job);
     const saved = first_hooks.recovery_checkpoints.items[first_hooks.recovery_checkpoints.items.len - 1];
     var checkpoint = try saved.dupe(alloc);
     defer checkpoint.deinit(alloc);
@@ -4633,6 +4661,8 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh exhaus
     second_hooks.enable_recovery_checkpoint = true;
     defer second_hooks.deinit();
     var continued_job = fixture.job();
+    continued_job.credential_source = .fx_login;
+    continued_job.account_id = @constCast("acct_1");
     continued_job.recovery_checkpoint = checkpoint;
     var continued_config = fixture.config();
     continued_config.max_provider_attempts = 2;
@@ -5054,7 +5084,7 @@ test "processQueuedPrompt regenerates and executes a local tool once after ReadF
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
     try std.testing.expectEqualStrings("Finished", hooks.history_turns.items[0].assistant.assistant);
 }
@@ -5087,7 +5117,7 @@ test "processQueuedPrompt settles an interrupted local tool after a different st
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
 }
 
@@ -5119,7 +5149,7 @@ test "processQueuedPrompt settles an interrupted local tool after an HTTP failur
     try expectFailedLifecycleContains(
         hooks.lifecycle_events.items,
         "call_read_interrupted",
-        "before read_file ran",
+        "before tool call ran",
     );
 }
 
@@ -5594,7 +5624,12 @@ test "processQueuedPrompt non-ok gateway response records schema diagnostics" {
     const detail =
         \\{"error":{"message":"Invalid input: expected string, received array","param":["prompt",0,"content"]}}
     ;
-    const completions = [_]FakeCompletion{.{ .status = .bad_request, .err_body = detail }};
+    const completions = [_]FakeCompletion{.{
+        .status = .bad_request,
+        .err_body = detail,
+        .failure_schema = "path=prompt.0.content expected=string received=array",
+        .failure_request_shape = "prompt.0 role=system content=string prompt.1 role=user content=array",
+    }};
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
@@ -5962,8 +5997,8 @@ test "processQueuedPrompt trace records history shape returned tool calls and wa
     try std.testing.expect(std.mem.find(u8, trace, "event=projection_end") != null);
     try std.testing.expect(std.mem.find(u8, trace, "history_turn_kinds=interrupted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "projected_message_roles=user,assistant,tool,user") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=before_payload_build") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=after_payload_build") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=before_provider_preflight") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=provider_admitted") != null);
     try std.testing.expect(std.mem.find(u8, trace, "event=returned_tool_call") != null);
     try std.testing.expect(std.mem.find(u8, trace, "call_id=call_1 tool_name=write_file") != null);
     try std.testing.expect(std.mem.find(u8, trace, "args_preview=<object_fields=3 values=[") != null);

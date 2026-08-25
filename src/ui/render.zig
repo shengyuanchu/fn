@@ -26,7 +26,6 @@ const user_message_card = @import("assistant/user_message_card.zig");
 pub const welcome_message_reserved_rows: u16 = 11;
 
 pub var is_light: bool = false;
-pub var input_bar_style: []const u8 = "";
 pub var divider_style: []const u8 = "\x1b[38;5;240m";
 pub var hint_style: []const u8 = "\x1b[38;5;255m";
 pub var statusline_style: []const u8 = "\x1b[38;5;245m";
@@ -68,7 +67,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
     active_terminal_background = terminal_bg;
     assistant_presentation.setInlineCodeTheme(light);
     if (light) {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;250m";
         hint_style = "\x1b[38;5;235m";
         statusline_style = "\x1b[38;5;241m";
@@ -87,7 +85,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         selected_completion_style = "\x1b[1;38;5;235m";
         permission_auto_style = "\x1b[38;5;238m";
     } else {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;240m";
         hint_style = "\x1b[38;5;255m";
         statusline_style = "\x1b[38;5;245m";
@@ -117,11 +114,7 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         diff_removed_marker_style = diff_removed_marker_fallback;
     }
 
-    // Delegate bar shade computation to the card module — it owns the logic
-    // that derives a subtle but visible shade from the terminal's actual bg.
-    user_message_card.setTruecolor(truecolor_enabled);
     user_message_card.setStyle(light, terminal_bg);
-    input_bar_style = user_message_card.user_message_style;
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
@@ -818,12 +811,10 @@ test "initTheme sets light mode styles" {
     initTheme(true, null);
     try std.testing.expect(is_light);
     try std.testing.expect(!std.mem.eql(u8, subtitle_style, "\x1b[1;38;5;255m"));
-    try std.testing.expectEqualStrings("\x1b[48;5;255m\x1b[38;5;16m", input_bar_style);
 
     initTheme(false, null);
     try std.testing.expect(!is_light);
     try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
-    try std.testing.expectEqualStrings("\x1b[48;5;238m\x1b[38;5;250m", input_bar_style);
 }
 
 test "resume handoff uses one row only when the full instruction fits" {

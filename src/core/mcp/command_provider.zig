@@ -1,22 +1,28 @@
 const std = @import("std");
-const mcp_auth = @import("mcp_auth.zig");
 
 const Allocator = std.mem.Allocator;
+
+pub const AuthenticationStart = enum {
+    started,
+    busy,
+};
 
 pub const ListServersFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror![]u8;
 pub const SummarizeServersFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror![]u8;
 pub const AuthenticateServerFn = *const fn (
     ctx: *anyopaque,
     name: []const u8,
-) anyerror!mcp_auth.AuthenticationResult;
+) anyerror!AuthenticationStart;
 pub const ValidateAuthenticationServerFn = *const fn (
     ctx: *anyopaque,
     name: []const u8,
 ) anyerror!void;
 
 pub const LogoutResult = struct {
+    busy: bool = false,
     removed: bool = false,
     revocation_failed: bool = false,
+    repaired_entries: usize = 0,
 };
 
 pub const LogoutServerFn = *const fn (

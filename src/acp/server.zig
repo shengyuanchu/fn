@@ -365,24 +365,14 @@ pub fn streamProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) @import("../core/agent/stream_provider.zig").Provider {
-    return switch (provider) {
-        .gateway => state.cfg.gateway_provider.agent_stream,
-        .codex => state.cfg.codex_agent_stream orelse
-            @import("../core/agent/stream_provider.zig").unavailable_provider,
-        .grok => state.cfg.grok_agent_stream orelse
-            @import("../core/agent/stream_provider.zig").unavailable_provider,
-    };
+    return state.cfg.provider_set.select(provider).agent_stream_or_unavailable();
 }
 
 pub fn catalogProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
-    return switch (provider) {
-        .gateway => state.cfg.gateway_provider.model_catalog,
-        .codex => state.cfg.codex_model_catalog,
-        .grok => state.cfg.grok_model_catalog,
-    };
+    return state.cfg.provider_set.select(provider).model_catalog;
 }
 
 pub fn refreshModelCredential(
@@ -440,13 +430,18 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+            if (state.cfg.provider_set.select(active.provider).deferred_usage == null) {
                 active.session_rt.usage.clearReconciliationCredential();
-            } else {
-                active.session_rt.usage.startReconciliation(
+            } else if (active.credential_source) |source| {
+                active.session_rt.usage.replaceProviderReconciliationCredential(
                     state.alloc,
+                    active.provider,
+                    source,
+                    active.account_id,
                     state.api_key,
                 );
+            } else {
+                active.session_rt.usage.clearReconciliationCredential();
             }
             return err;
         };
@@ -661,7 +656,7 @@ pub fn runWithTransport(
         .cfg = cfg,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.gateway_provider.web_search,
+            .provider = cfg.provider_set.gateway.fx_search.?,
         }),
         .background = background_runtime.BackgroundRuntime.init(
             cfg.background_process_provider,
@@ -1409,7 +1404,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode;
+    state.fast_mode = startup.fast_mode and
+        (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -1440,6 +1436,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             .cancel_flag = &catalog_cancel_flag,
         },
         state.selected_model,
+        state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
     );
 
     state.client_fs_read = request.client_fs_read;
@@ -1709,11 +1706,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             else
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
-            const saved_model = switch (target) {
-                .gateway => settings.model,
-                .codex => settings.codex_model,
-                .grok => settings.grok_model,
-            };
+            const saved_model = settings.models.get(target);
             var selected_model = catalog.items[0].id;
             if (saved_model) |saved| {
                 for (catalog.items) |entry| {

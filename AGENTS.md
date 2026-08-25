@@ -134,7 +134,7 @@ Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `backg
 
 Security is permission-first. All sensitive tool behavior must integrate with `src/core/permissions/permissions.zig`.
 
-* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses Fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
+* `permission_mode` controls baseline (`ask`, `auto`, or `yolo`). Yolo bypasses fx permission policy and uses an effective sandbox of `none` without rewriting saved sandbox configuration
 
 * Configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
 
@@ -142,7 +142,11 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
 
-* An `auto_denied` result may carry an opaque approval request ID. Only `ask_user_question` with that exact current-turn ID may enter the real permission screen; generic model or user text never authorizes the action, and execution still requires exact live revalidation
+* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one review using the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
+
+* A `clear` review authorizes only the exact unchanged action. A `caution` or unavailable review holds only that action, returns advice to the agent, and never opens a human permission screen, disables tools, or ends the turn
+
+* Exact cautions are reused only for the current turn. Changed actions receive a new review. Legacy `permission_request_id` input is rejected without prompting
 
 Do not bypass the permission system for new tools.
 

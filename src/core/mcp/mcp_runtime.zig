@@ -9,7 +9,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_auth_store = @import("mcp_auth_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const gateway_schema = @import("../tooling/gateway_schema.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const permissions = @import("../permissions/permissions.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
@@ -5236,6 +5236,26 @@ pub const McpRuntime = struct {
         open_ctx: ?*anyopaque,
         open_url: mcp_auth.OpenUrlFn,
     ) !mcp_auth.AuthenticationResult {
+        return self.authenticateServerControlled(
+            name,
+            open_ctx,
+            open_url,
+            null,
+        );
+    }
+
+    pub fn authenticateServerControlled(
+        self: *McpRuntime,
+        name: []const u8,
+        open_ctx: ?*anyopaque,
+        open_url: mcp_auth.OpenUrlFn,
+        cancel_flag: ?*const std.atomic.Value(bool),
+    ) !mcp_auth.AuthenticationResult {
+        const cancellation = operation_control.CancellationSources{
+            .caller = cancel_flag,
+            .runtime = &self.retiring,
+        };
+        if (cancellation.cancelled()) return error.Cancelled;
         const server = try self.authenticationServer(name);
         server.connection_lock.lockSharedUncancelable(io_mod.getIo());
         var connection_locked = true;
@@ -5282,18 +5302,29 @@ pub const McpRuntime = struct {
             .previous_scope = source.previous_scope,
             .open_ctx = open_ctx,
             .open_url = open_url,
+            .cancel_flag = cancel_flag,
             .lifecycle_cancel_flag = &self.retiring,
         })) {
             .credentials => |credentials| credentials,
             .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
         };
         var transferred = false;
+        var repaired_entries: usize = 0;
         defer if (!transferred) credentials.deinit(self.alloc);
         {
             server.auth_lock.lockUncancelable(io_mod.getIo());
             defer server.auth_lock.unlock(io_mod.getIo());
-            try validateInteractiveAuthPublication(self, server, source.generation);
-            try mcp_auth_store.save(self.alloc, server.config.name, credentials);
+            try validateInteractiveAuthPublication(
+                server,
+                source.generation,
+                cancellation,
+            );
+            const save_result = try mcp_auth_store.save(
+                self.alloc,
+                server.config.name,
+                credentials,
+            );
+            repaired_entries = save_result.repaired_entries;
             installAuthCredentials(self.alloc, server, &credentials);
             transferred = true;
             if (server.pending_auth_challenge) |*pending| pending.deinit(self.alloc);
@@ -5315,7 +5346,9 @@ pub const McpRuntime = struct {
         server.connection_lock.unlockShared(io_mod.getIo());
         connection_locked = false;
         try resumeToolSubscriptionAfterAuthentication(self, server, deadline);
-        return .authenticated;
+        return .{ .authenticated = .{
+            .repaired_entries = repaired_entries,
+        } };
     }
 
     pub fn validateAuthenticationServer(self: *McpRuntime, name: []const u8) !void {
@@ -5330,11 +5363,11 @@ pub const McpRuntime = struct {
     }
 
     fn validateInteractiveAuthPublication(
-        self: *const McpRuntime,
         server: *const McpServer,
         generation: u64,
+        cancellation: operation_control.CancellationSources,
     ) !void {
-        if (self.retiring.load(.acquire)) return error.Cancelled;
+        if (cancellation.cancelled()) return error.Cancelled;
         if (server.auth_logout_in_progress.load(.acquire) or
             server.auth_generation.load(.acquire) != generation)
         {
@@ -5345,6 +5378,7 @@ pub const McpRuntime = struct {
     pub const LogoutResult = struct {
         removed: bool = false,
         revocation_failed: bool = false,
+        repaired_entries: usize = 0,
     };
 
     const DetachedLogoutAuth = struct {
@@ -5436,7 +5470,10 @@ pub const McpRuntime = struct {
             self.restoreAuthAfterLogout(server, &auth);
             return err;
         };
-        if (deleted.removed == 0 and auth.credentials == null) {
+        if (deleted.removed == 0 and
+            deleted.repaired_entries == 0 and
+            auth.credentials == null)
+        {
             self.restoreAuthAfterLogout(server, &auth);
             return .{};
         }
@@ -5476,6 +5513,7 @@ pub const McpRuntime = struct {
         return .{
             .removed = true,
             .revocation_failed = revocation_failed,
+            .repaired_entries = deleted.repaired_entries,
         };
     }
 
@@ -5906,7 +5944,9 @@ pub const McpRuntime = struct {
                 for (server.tool_catalog.tools.items) |tool| {
                     if (!operation_access.allows(.{ .tool = tool.prefixed_name })) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-                    if (!toolMatchesQuery(tool, searchable_instructions, query)) continue;
+                    const exact_identity = queryContainsCompleteIdentity(query, tool.original_name) or
+                        queryContainsCompleteIdentity(query, tool.prefixed_name);
+                    if (!exact_identity and !toolMatchesQuery(tool, searchable_instructions, query)) continue;
                     server_matched = true;
                     if (matches.items.len >= capped_limit) {
                         more_available = true;
@@ -5929,6 +5969,7 @@ pub const McpRuntime = struct {
                     alloc,
                     self.servers.items,
                     &operation_access,
+                    query,
                 )) |output| {
                     break :result tool_mcp_runtime.SearchResult{ .model_output = output, .notice = null };
                 }
@@ -8509,9 +8550,11 @@ fn renderAuthenticationRequired(
     alloc: Allocator,
     servers: []McpServer,
     access: *const OperationAccessGuard,
+    query: []const u8,
 ) !?[]u8 {
     for (servers) |*server| {
         if (!access.allows(.{ .tool_server = server.config.name })) continue;
+        if (!queryContainsCompleteIdentity(query, server.config.name)) continue;
         server.status_lock.lockUncancelable(io_mod.getIo());
         const failed = server.state == .failed;
         server.status_lock.unlock(io_mod.getIo());
@@ -8735,21 +8778,32 @@ test "private catalog visibility is bound to the producing auth generation" {
 
 test "interactive authentication publishes only to its live auth generation" {
     var runtime = McpRuntime.init(std.testing.allocator);
+    var caller_cancelled = std.atomic.Value(bool).init(false);
     var server = McpServer{
         .config = .{ .name = "fixture" },
         .auth_generation = .init(7),
     };
+    const cancellation = operation_control.CancellationSources{
+        .caller = &caller_cancelled,
+        .runtime = &runtime.retiring,
+    };
 
-    try runtime.validateInteractiveAuthPublication(&server, 7);
+    try McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation);
+    caller_cancelled.store(true, .release);
+    try std.testing.expectError(
+        error.Cancelled,
+        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
+    );
+    caller_cancelled.store(false, .release);
     server.auth_generation.store(8, .release);
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        runtime.validateInteractiveAuthPublication(&server, 7),
+        McpRuntime.validateInteractiveAuthPublication(&server, 7, cancellation),
     );
     runtime.retiring.store(true, .release);
     try std.testing.expectError(
         error.Cancelled,
-        runtime.validateInteractiveAuthPublication(&server, 8),
+        McpRuntime.validateInteractiveAuthPublication(&server, 8, cancellation),
     );
 }
 
@@ -8780,7 +8834,11 @@ test "a newer pending challenge invalidates interactive authentication publicati
     try std.testing.expectEqual(@as(u64, 8), server.auth_generation.load(.acquire));
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        runtime.validateInteractiveAuthPublication(&server, interactive_generation),
+        McpRuntime.validateInteractiveAuthPublication(
+            &server,
+            interactive_generation,
+            .{ .runtime = &runtime.retiring },
+        ),
     );
     try std.testing.expect(server.pending_auth_challenge != null);
     try std.testing.expectEqualStrings(
@@ -9748,8 +9806,12 @@ fn connectServer(
         existing.deinit();
         server.env_map = null;
     }
+    defer {
+        if (server.env_map) |*environment| environment.deinit();
+        server.env_map = null;
+    }
     if (server.config.env.len > 0) {
-        server.env_map = EnvMap.init(alloc);
+        server.env_map = try io_mod.cloneEnvironMap(alloc);
         for (server.config.env) |entry| {
             try server.env_map.?.put(entry.key, entry.value);
         }
@@ -11219,7 +11281,7 @@ fn buildToolSchemaJsonWithLimitMarker(
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);
-    return gateway_schema.dynamicFunctionSchemaJsonAlloc(
+    return model_tool_schema.dynamicFunctionSchemaJsonAlloc(
         alloc,
         tool.prefixed_name,
         merged_description,
@@ -11403,6 +11465,20 @@ fn toolMatchesQuery(tool: McpTool, server_instructions: []const u8, query: []con
             !text_utils.containsIgnoreCase(server_instructions, token)) return false;
     }
     return found_token or query.len == 0;
+}
+
+fn queryContainsCompleteIdentity(query: []const u8, identity: []const u8) bool {
+    if (identity.len == 0 or identity.len > query.len) return false;
+
+    var start: usize = 0;
+    while (start <= query.len - identity.len) : (start += 1) {
+        const end = start + identity.len;
+        if (!std.ascii.eqlIgnoreCase(query[start..end], identity)) continue;
+        if (start > 0 and isSearchByte(query[start - 1])) continue;
+        if (end < query.len and isSearchByte(query[end])) continue;
+        return true;
+    }
+    return false;
 }
 
 fn buildToolTags(alloc: Allocator, server_name: []const u8, tool_name: []const u8) ![]const []u8 {
@@ -11871,7 +11947,16 @@ fn refreshSharedCredentials(
     {
         return false;
     }
-    try mcp_auth_store.save(alloc, server.config.name, refreshed);
+    const save_result = try mcp_auth_store.save(
+        alloc,
+        server.config.name,
+        refreshed,
+    );
+    traceCredentialStoreRepair(
+        "refresh",
+        server.config.name,
+        save_result.repaired_entries,
+    );
     installAuthCredentials(alloc, server, &refreshed);
     transferred = true;
     return true;
@@ -11964,8 +12049,12 @@ fn authorizeForChallenge(
         .credentials => |credentials| credentials,
         .issuer_mismatch => |owned_mismatch| {
             var mismatch = owned_mismatch;
+            const err = switch (mismatch.source) {
+                .authorization_metadata => error.AuthorizationMetadataIssuerMismatch,
+                .authorization_response => error.AuthorizationResponseIssuerMismatch,
+            };
             mismatch.deinit();
-            return error.AuthorizationMetadataIssuerMismatch;
+            return err;
         },
     };
     var credentials_transferred = false;
@@ -11978,9 +12067,31 @@ fn authorizeForChallenge(
         credentials.deinit(alloc);
         return;
     }
-    try mcp_auth_store.save(alloc, server.config.name, credentials);
+    const save_result = try mcp_auth_store.save(
+        alloc,
+        server.config.name,
+        credentials,
+    );
+    traceCredentialStoreRepair(
+        "automated_auth",
+        server.config.name,
+        save_result.repaired_entries,
+    );
     installAuthCredentials(alloc, server, &credentials);
     credentials_transferred = true;
+}
+
+fn traceCredentialStoreRepair(
+    actor: []const u8,
+    server_name: []const u8,
+    repaired_entries: usize,
+) void {
+    if (repaired_entries == 0) return;
+    debug_trace.logf(
+        "mcp",
+        "removed unreadable MCP credential entries actor={s} server={s} count={d}",
+        .{ actor, server_name, repaired_entries },
+    );
 }
 
 fn installAuthCredentials(
@@ -17574,6 +17685,72 @@ test "parseAndStoreTools duplicates original_name for owned cleanup" {
     try std.testing.expectEqualStrings("read", server.tool_catalog.tools.items[0].original_name);
 }
 
+test "MCP search preserves exact identities and scopes authentication guidance" {
+    const alloc = std.testing.allocator;
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "linear"),
+        .command = try alloc.dupe(u8, "cmd"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "slack"),
+        .command = try alloc.dupe(u8, "cmd"),
+        .bearer_token_env = try alloc.dupe(u8, "SLACK_TOKEN"),
+    });
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "a/b"),
+        .command = try alloc.dupe(u8, "cmd"),
+        .bearer_token_env = try alloc.dupe(u8, "PUNCTUATED_TOKEN"),
+    });
+    runtime.servers.items[0].state = .ready;
+    runtime.servers.items[1].state = .failed;
+    runtime.servers.items[2].state = .failed;
+
+    var used = std.StringHashMap(void).init(alloc);
+    defer used.deinit();
+    const response =
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo Linear data","inputSchema":{"type":"object"}},{"name":"read/file","description":"Read a Linear file","inputSchema":{"type":"object"}}]}}
+    ;
+    try parseAndStoreTools(alloc, &runtime.servers.items[0], .{}, response, &used);
+
+    const cases = [_]struct {
+        query: []const u8,
+        expected_tool: []const u8,
+    }{
+        .{ .query = "Please use MCP_LINEAR_ECHO for this request", .expected_tool = "mcp_linear_echo" },
+        .{ .query = "Please use read/file for this request", .expected_tool = "mcp_linear_read_file" },
+    };
+    for (cases) |case| {
+        var result = try runtime.searchTools(alloc, case.query, 5, .{}, .{}, .unrestricted);
+        defer result.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, result.model_output, case.expected_tool) != null);
+        try std.testing.expect(std.mem.find(u8, result.model_output, "authentication_required") == null);
+    }
+
+    var partial = try runtime.searchTools(alloc, "mcp_linear_echoes", 5, .{}, .{}, .unrestricted);
+    defer partial.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", partial.model_output);
+
+    var unrelated = try runtime.searchTools(alloc, "linear issue", 5, .{}, .{}, .unrestricted);
+    defer unrelated.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", unrelated.model_output);
+
+    var targeted = try runtime.searchTools(alloc, "authenticate slack now", 5, .{}, .{}, .unrestricted);
+    defer targeted.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, targeted.model_output, "\"server\":\"slack\"") != null);
+    try std.testing.expect(std.mem.find(u8, targeted.model_output, "SLACK_TOKEN") != null);
+
+    var punctuated = try runtime.searchTools(alloc, "authenticate a/b now", 5, .{}, .{}, .unrestricted);
+    defer punctuated.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, punctuated.model_output, "\"server\":\"a/b\"") != null);
+
+    var adjacent = try runtime.searchTools(alloc, "authenticate xa/by now", 5, .{}, .{}, .unrestricted);
+    defer adjacent.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"tools\":[],\"count\":0}", adjacent.model_output);
+}
+
 test "MCP search returns metadata without advertising every executable schema" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
@@ -18084,6 +18261,7 @@ test "scoped MCP authentication rendering excludes denied servers" {
         alloc,
         runtime.servers.items,
         &scoped,
+        "denied",
     ) == null);
 
     var root = try OperationAccessGuard.init(alloc, .unrestricted, runtime.generation);
@@ -18092,6 +18270,7 @@ test "scoped MCP authentication rendering excludes denied servers" {
         alloc,
         runtime.servers.items,
         &root,
+        "denied",
     )).?;
     defer alloc.free(rendered);
     try std.testing.expect(std.mem.find(u8, rendered, "denied") != null);
@@ -18174,7 +18353,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
     try std.testing.expect(std.mem.find(u8, schema, "\"name\":\"mcp_fs_read\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "\"inputSchema\"") != null);
     try std.testing.expect(std.mem.find(u8, schema, "instruction tail") != null);
-    try std.testing.expect(std.mem.find(u8, schema, gateway_schema.truncation_marker) == null);
+    try std.testing.expect(std.mem.find(u8, schema, model_tool_schema.truncation_marker) == null);
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 

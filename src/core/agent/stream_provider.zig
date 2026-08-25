@@ -4,9 +4,14 @@ const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
+const model_provider = @import("../config/model_provider.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Transport parser callback shapes. Provider boundaries expose `EventSink`;
+/// concrete reducers may use these adapters internally.
 pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: []const u8) void;
 pub const ToolStartCallback = *const fn (
     ctx: *anyopaque,
@@ -14,6 +19,38 @@ pub const ToolStartCallback = *const fn (
     tool_name: []const u8,
     label_value: ?[]const u8,
 ) void;
+
+pub const Event = union(enum) {
+    content_delta: []const u8,
+    reasoning_delta: []const u8,
+    tool_started: struct {
+        id: []const u8,
+        name: []const u8,
+        label: ?[]const u8 = null,
+    },
+    tool_input_delta: []const u8,
+};
+
+pub const EventSink = struct {
+    context: *anyopaque,
+    emit_fn: *const fn (context: *anyopaque, event: Event) void,
+
+    pub fn emit(self: EventSink, event: Event) void {
+        self.emit_fn(self.context, event);
+    }
+};
+
+pub const Admission = struct {
+    context: ?*anyopaque = null,
+    admit_fn: ?*const fn (context: *anyopaque) anyerror!void = null,
+
+    /// Providers call this exactly once after request serialization and
+    /// validation succeed, immediately before delivery can become possible.
+    pub fn admit(self: Admission) !void {
+        const admit_fn = self.admit_fn orelse return error.ProviderAdmissionMissing;
+        try admit_fn(self.context orelse return error.ProviderAdmissionMissing);
+    }
+};
 
 /// Monotonic evidence for whether a request could have reached its provider.
 /// Core uses it to distinguish safe retries from potentially billed delivery.
@@ -87,16 +124,44 @@ pub const BuildBudget = struct {
 pub const StructuredResponseFormat = struct {
     name: []const u8,
     description: []const u8,
-    schema_json: []const u8,
+    schema: std.json.Value,
 };
 
-pub const BuildRequest = struct {
+pub const DynamicFunctionTool = struct {
+    name: []const u8,
+    description: []const u8,
+    input_schema: std.json.Value,
+};
+
+pub const ToolSelection = struct {
+    registry: tool_dispatch.Registry = .{},
+    advertised_names: []const []const u8 = &.{},
+    advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
+    additional_functions: []const model_tool_schema.FunctionSchema = &.{},
+    selected_dynamic: []const DynamicFunctionTool = &.{},
+
+    pub fn advertisedFunction(self: ToolSelection, name: []const u8) ?model_tool_schema.FunctionSchema {
+        for (self.advertised_functions) |function| {
+            if (std.mem.eql(u8, function.name, name)) return function;
+        }
+        return null;
+    }
+};
+
+pub const CredentialLease = struct {
+    secret: []const u8,
+    source: ?types.CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant: ?[]const u8 = null,
+};
+
+/// Pure provider input used by request serializers and permission reviewers.
+/// Every slice and JSON value is borrowed for the call.
+pub const RequestData = struct {
     model: []const u8,
-    tool_registry: tool_dispatch.Registry = .{},
-    serialized_tools: []const u8,
     messages: []const types.ChatMessage,
+    tools: ToolSelection = .{},
     tool_choice: types.ToolChoice,
-    selected_dynamic_tool_schemas: []const []const u8 = &.{},
     vision_mode: VisionMode = .unavailable,
     provider_options: model_capabilities.ResolvedProviderOptions,
     max_output_tokens: ?u32 = null,
@@ -105,18 +170,22 @@ pub const BuildRequest = struct {
     response_format: ?StructuredResponseFormat = null,
 };
 
-pub const Request = struct {
-    api_key: []const u8,
-    credential_source: ?types.CredentialSource = null,
-    /// Borrowed provider account identity captured with the admitted credential.
-    account_id: ?[]const u8 = null,
-    team: ?[]const u8,
-    /// Borrowed for the duration of `Provider.stream`.
+/// Borrowed typed request. Providers own validation, wire serialization,
+/// endpoint selection, headers, HTTP, and stream reduction.
+pub const ModelRequest = struct {
+    credential: CredentialLease,
     session_id: ?[]const u8 = null,
     model: []const u8,
     retry_count: usize,
-    chat_url: []const u8,
-    payload: []const u8,
+    messages: []const types.ChatMessage,
+    tools: ToolSelection = .{},
+    tool_choice: types.ToolChoice,
+    vision_mode: VisionMode = .unavailable,
+    provider_options: model_capabilities.ResolvedProviderOptions,
+    max_output_tokens: ?u32 = null,
+    budget: ?BuildBudget = null,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
+    response_format: ?StructuredResponseFormat = null,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
     /// Optional absolute provider deadline. Transports that support bounded
@@ -125,13 +194,25 @@ pub const Request = struct {
     cooperative_pulse: ?CooperativePulse = null,
     delivery: *DeliveryCertainty,
     attempt_evidence: *AttemptEvidence,
-    callback_ctx: *anyopaque,
-    on_content_chunk: StreamCallback,
-    on_tool_start: ?ToolStartCallback,
-    on_reasoning_chunk: ?StreamCallback,
-    on_tool_input_chunk: ?StreamCallback = null,
+    events: EventSink,
+    admission: Admission = .{},
     cancel_flag: *std.atomic.Value(bool),
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+
+    pub fn data(self: ModelRequest) RequestData {
+        return .{
+            .model = self.model,
+            .messages = self.messages,
+            .tools = self.tools,
+            .tool_choice = self.tool_choice,
+            .vision_mode = self.vision_mode,
+            .provider_options = self.provider_options,
+            .max_output_tokens = self.max_output_tokens,
+            .budget = self.budget,
+            .verified_images = self.verified_images,
+            .response_format = self.response_format,
+        };
+    }
 };
 
 pub const ResultOwnership = enum {
@@ -139,70 +220,102 @@ pub const ResultOwnership = enum {
     owned,
 };
 
-pub const Result = struct {
-    status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
-    err_body: ?[]u8 = null,
-    /// Borrowed base URL used to reconcile generation usage for this result.
-    generation_origin: []const u8 = "",
-    reconcile_generation_usage: bool = false,
-    failure_schema: ?[]u8 = null,
-    failure_request_shape: ?[]u8 = null,
+pub const FailureKind = enum {
+    invalid_request,
+    unauthorized,
+    forbidden,
+    request_too_large,
+    rate_limited,
+    server_error,
+    bad_gateway,
+    unavailable,
+    gateway_timeout,
+    provider_error,
+};
+
+pub const FailureDiagnostics = struct {
+    schema: ?[]u8 = null,
+    request_shape: ?[]u8 = null,
+};
+
+pub const DeferredUsageReference = struct {
+    provider: model_provider.ProviderId,
+    generation_id: []const u8,
+    scope: []const u8,
+    tenant: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    credential_source: types.CredentialSource,
+    credential_identity: ?credential_authority.Identity,
+};
+
+pub const UsageUnavailable = enum {
+    unbilled,
+    possibly_billed,
+};
+
+pub const UsageOutcome = union(enum) {
+    immediate: ?DeferredUsageReference,
+    deferred: DeferredUsageReference,
+    unavailable: UsageUnavailable,
+};
+
+pub const Completed = struct {
+    completion: types.ModelCompletion = .{},
+    usage: UsageOutcome = .{ .unavailable = .unbilled },
+    ownership: ResultOwnership = .borrowed,
+};
+
+pub const Failure = struct {
+    kind: FailureKind,
+    detail: ?[]u8 = null,
+    diagnostics: FailureDiagnostics = .{},
     retry_after_seconds: ?u64 = null,
     ownership: ResultOwnership = .borrowed,
+};
+
+pub const Result = union(enum) {
+    completed: Completed,
+    failed: Failure,
 
     /// Providers mark allocated response fields as `owned`; test and embedded
     /// providers may return stable borrowed fields instead.
     pub fn deinit(self: *Result, alloc: Allocator) void {
-        if (self.ownership == .owned) {
-            if (self.err_body) |body| alloc.free(body);
-            if (self.completion.content) |content| alloc.free(@constCast(content));
-            if (self.completion.generation_id) |id| alloc.free(@constCast(id));
-            if (self.completion.billing) |billing| alloc.free(@constCast(billing.model));
-            types.freeToolCallSlice(alloc, @constCast(self.completion.tool_calls));
-            if (self.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
-            if (self.completion.provider_state_json) |state| alloc.free(@constCast(state));
-            if (self.failure_schema) |schema| alloc.free(schema);
-            if (self.failure_request_shape) |shape| alloc.free(shape);
+        switch (self.*) {
+            .completed => |completed| if (completed.ownership == .owned) {
+                if (completed.completion.content) |content| alloc.free(@constCast(content));
+                if (completed.completion.generation_id) |id| alloc.free(@constCast(id));
+                if (completed.completion.billing) |billing| alloc.free(@constCast(billing.model));
+                types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
+                if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
+                if (completed.completion.provider_state_json) |state| alloc.free(@constCast(state));
+            },
+            .failed => |failure| if (failure.ownership == .owned) {
+                if (failure.detail) |detail| alloc.free(detail);
+                if (failure.diagnostics.schema) |schema| alloc.free(schema);
+                if (failure.diagnostics.request_shape) |shape| alloc.free(shape);
+            },
         }
-        const status = self.status;
-        self.* = .{ .status = status };
+        self.* = undefined;
     }
 };
 
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
-    request: Request,
+    request: ModelRequest,
 ) anyerror!Result;
-
-pub const BuildFn = *const fn (
-    context: ?*anyopaque,
-    alloc: Allocator,
-    request: BuildRequest,
-) anyerror![]u8;
 
 pub const Provider = struct {
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
-    build_fn: BuildFn = unavailableBuild,
     stream_fn: StreamFn,
 
-    /// The returned request bytes are owned by `alloc`.
-    pub fn build(self: Provider, alloc: Allocator, request: BuildRequest) ![]u8 {
-        return self.build_fn(self.context, alloc, request);
-    }
-
-    pub fn stream(self: Provider, alloc: Allocator, request: Request) !Result {
+    pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         return self.stream_fn(self.context, alloc, request);
     }
 };
 
-fn unavailableBuild(_: ?*anyopaque, _: Allocator, _: BuildRequest) anyerror![]u8 {
-    return error.AgentStreamProviderUnavailable;
-}
-
-fn unavailableStream(_: ?*anyopaque, _: Allocator, _: Request) anyerror!Result {
+fn unavailableStream(_: ?*anyopaque, _: Allocator, _: ModelRequest) anyerror!Result {
     return error.AgentStreamProviderUnavailable;
 }
 
@@ -210,39 +323,53 @@ pub const unavailable_provider = Provider{
     .stream_fn = unavailableStream,
 };
 
-test "stream provider dispatches request and preserves ordered callbacks" {
+test "stream provider accepts one typed request and emits ordered neutral events" {
     const Fake = struct {
         calls: usize = 0,
         attempt_owner: ?ProviderAttemptOwner = null,
 
-        fn stream(raw: ?*anyopaque, _: Allocator, request: Request) anyerror!Result {
+        fn stream(raw: ?*anyopaque, _: Allocator, request: ModelRequest) anyerror!Result {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             self.attempt_owner = request.provider_attempt_owner;
-            request.on_content_chunk(request.callback_ctx, "first");
-            request.on_reasoning_chunk.?(request.callback_ctx, "second");
-            return .{
-                .status = .ok,
+            try request.admission.admit();
+            request.events.emit(.{ .content_delta = "first" });
+            request.events.emit(.{ .reasoning_delta = "second" });
+            return .{ .completed = .{
                 .completion = .{ .content = "done" },
-                .retry_after_seconds = 17,
-            };
+                .usage = .{ .immediate = null },
+            } };
         }
     };
     const Capture = struct {
         chunks: std.ArrayList(u8) = .empty,
         failed: bool = false,
 
-        fn append(raw: *anyopaque, chunk: []const u8) void {
+        fn emit(raw: *anyopaque, event: Event) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            const chunk = switch (event) {
+                .content_delta => |value| value,
+                .reasoning_delta => |value| value,
+                else => return,
+            };
             self.chunks.appendSlice(std.testing.allocator, chunk) catch {
                 self.failed = true;
             };
+        }
+    };
+    const AdmissionCapture = struct {
+        calls: usize = 0,
+
+        fn admit(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
         }
     };
 
     var fake: Fake = .{};
     var capture: Capture = .{};
     defer capture.chunks.deinit(std.testing.allocator);
+    var admission_capture: AdmissionCapture = .{};
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: AttemptEvidence = .{};
     var cancelled = std.atomic.Value(bool).init(false);
@@ -250,29 +377,30 @@ test "stream provider dispatches request and preserves ordered callbacks" {
         .context = &fake,
         .stream_fn = Fake.stream,
     }).stream(std.testing.allocator, .{
-        .api_key = "key",
-        .team = null,
+        .credential = .{ .secret = "key" },
         .model = "model",
         .retry_count = 1,
-        .chat_url = "https://example.test/chat",
-        .payload = "{}",
+        .messages = &.{},
+        .tools = .{},
+        .tool_choice = .auto,
+        .vision_mode = .unavailable,
+        .provider_options = .{},
         .trace_ctx = .{},
         .content_capture_limit = null,
         .delivery = &delivery,
         .attempt_evidence = &attempt_evidence,
-        .callback_ctx = &capture,
-        .on_content_chunk = Capture.append,
-        .on_tool_start = null,
-        .on_reasoning_chunk = Capture.append,
+        .events = .{ .context = &capture, .emit_fn = Capture.emit },
+        .admission = .{ .context = &admission_capture, .admit_fn = AdmissionCapture.admit },
         .cancel_flag = &cancelled,
         .provider_attempt_owner = .agent,
     });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), admission_capture.calls);
     try std.testing.expectEqual(ProviderAttemptOwner.agent, fake.attempt_owner.?);
     try std.testing.expect(!capture.failed);
     try std.testing.expectEqualStrings("firstsecond", capture.chunks.items);
-    try std.testing.expectEqualStrings("done", result.completion.content.?);
-    try std.testing.expectEqual(@as(?u64, 17), result.retry_after_seconds);
+    try std.testing.expectEqualStrings("done", result.completed.completion.content.?);
+    try std.testing.expect(std.meta.activeTag(result.completed.usage) == .immediate);
 }

@@ -33,11 +33,13 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
-const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const tool_projection_mod = @import("../tooling/tool_projection.zig");
+const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -177,9 +179,7 @@ pub fn Runtime(comptime App: type) type {
                     .mode = snapshot.mode,
                 }
             else
-                app.worker.effectivePermissionSnapshot(
-                    app_permission_runtime.Runtime(App).livePermissionSnapshot(app),
-                );
+                app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const permission_grants = if (authority) |snapshot|
                 snapshot.grants
             else
@@ -193,6 +193,13 @@ pub fn Runtime(comptime App: type) type {
                     app_session_runtime.Runtime(App).childCapability(app)
                 else
                     null;
+            const selected_provider = provider_runtime.provider(app);
+            const provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
+                app.providerSet().select(selected_provider).capabilities
+            else if (selected_provider == .gateway)
+                provider_set.Bundle.Capabilities{ .fx_search = true, .vision_fallback = true, .deferred_usage = true }
+            else
+                provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
                 .access_scope = if (host_workspace != null)
@@ -214,7 +221,8 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
-                .provider = provider_runtime.provider(app),
+                .provider = selected_provider,
+                .provider_capabilities = provider_capabilities,
                 .oauth_transport = app.auth.oauthTransport(),
                 .secret_store = if (comptime @hasDecl(@TypeOf(app.auth), "secretStore"))
                     app.auth.secretStore()
@@ -286,9 +294,10 @@ pub fn Runtime(comptime App: type) type {
                 ctx.on_web_fetch_progress = app_callbacks.Bindings(App).onWebFetchProgress;
             }
             if (comptime @hasField(App, "web_search_runtime")) {
-                if (model_provider.usesGatewayAuxiliaries(provider_runtime.provider(app))) {
+                if (provider_capabilities.fx_search) {
                     app.web_search_runtime.configure(.{
                         .api_key = app.auth.apiKey() orelse "",
+                        .credential_source = app.auth.credentialSource(),
                         .gateway_team = app.auth.gatewayTeam(),
                         .worker_model = provider_runtime.model(app),
                         .gateway_retry_count = gateway_retry_count,
@@ -777,9 +786,7 @@ pub fn Runtime(comptime App: type) type {
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
             _ = gateway_chat_url;
-            const permission_snapshot = app.worker.effectivePermissionSnapshot(
-                app_permission_runtime.Runtime(App).livePermissionSnapshot(app),
-            );
+            const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace_root = if (host_workspace) |info|
                 info.root()
@@ -867,10 +874,6 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.active_context_snapshot = null;
             app.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer app.worker.clearActiveAgentTurnSettings();
-            app.worker.setActivePermissionSnapshot(.{
-                .mode = job.permission_mode,
-            });
-            defer app.worker.clearActivePermissionSnapshot();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
             defer preflight_context_notices.deinit();
             var postflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -933,7 +936,7 @@ pub fn Runtime(comptime App: type) type {
                     return error.McpRequiredServerUnavailable;
                 }
             }
-            var tool_projection = try app.snapshotGatewayToolProjection(
+            var tool_projection = try app.snapshotModelToolProjection(
                 std.heap.c_allocator,
                 job.permission_mode,
             );
@@ -992,7 +995,7 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
-            var child_projection = app.snapshotSubagentGatewayToolProjection(
+            var child_projection = app.snapshotSubagentModelToolProjection(
                 alloc,
                 admission.permission_mode,
                 admission.rules,
@@ -1014,33 +1017,37 @@ pub fn Runtime(comptime App: type) type {
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
             const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
-            const provider_routes = if (comptime @hasDecl(App, "subagentProviderRoutes"))
-                app.subagentProviderRoutes()
+            const providers = if (comptime @hasDecl(App, "providerSet"))
+                app.providerSet()
             else
-                subagent_agent_adapter.ProviderRoutes{
+                provider_set.Set{
                     .gateway = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .capabilities = tool_context.provider_capabilities,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .codex = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .capabilities = tool_context.provider_capabilities,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                     .grok = .{
-                        .agent_stream_provider = tool_context.agent_stream_provider,
-                        .permission_reviewer_provider = tool_context.permission_reviewer_provider,
+                        .capabilities = tool_context.provider_capabilities,
+                        .agent_stream = tool_context.agent_stream_provider,
+                        .permission_reviewer = tool_context.permission_reviewer_provider,
                     },
                 };
             return subagent_agent_adapter.run(.{
                 .host = app_session_runtime.Runtime(App).subagentHost(app) orelse
                     return error.ProviderFailed,
                 .tool_context = tool_context,
-                .provider_routes = provider_routes,
+                .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
                 .skills_prompt_section = bounded_skills.text,
                 .explicit_skills_prompt_section = explicit_skills.text,
-                .gateway_tools_json = child_projection.tools_json,
+                .advertised_tool_names = child_projection.advertised_names,
+                .advertised_functions = child_projection.advertised_functions,
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
@@ -1070,7 +1077,7 @@ pub fn Runtime(comptime App: type) type {
             explicit_skills_section: []const u8,
             gateway_retry_count: usize,
             gateway_chat_url: []const u8,
-            tool_projection: *const tool_advertisement.EffectiveToolProjection,
+            tool_projection: *const tool_projection_mod.EffectiveToolProjection,
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
             const prompt_policy = app.promptPolicy();
@@ -1085,7 +1092,14 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null,
                 .gateway_chat_url = gateway_chat_url,
-                .gateway_tools_json = tool_projection.tools_json,
+                .advertised_tool_names = tool_projection.advertised_names,
+                .advertised_functions = tool_projection.advertised_functions,
+                .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
+                    app.providerSet().select(job.provider).capabilities
+                else if (job.provider == .gateway)
+                    .{ .fx_search = true, .vision_fallback = true, .deferred_usage = true }
+                else
+                    .{},
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
@@ -1165,7 +1179,7 @@ fn formatToolAction(
         );
     }
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label, call.name);
+        return formatInvalidArgsToolAction(arena, state, denied_label);
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
@@ -1177,7 +1191,7 @@ fn formatToolAction(
 
 fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label, call.name);
+        return formatInvalidArgsToolAction(arena, state, denied_label);
     };
     const label = switch (state) {
         .active => "Searching",
@@ -1195,10 +1209,11 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
     };
 }
 
-fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, name: []const u8) ![]const u8 {
+fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
         .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
-        .completed, .denied => formatMissingSpecToolAction(arena, state, denied_label, name),
+        .completed => formatToolActionValue(arena, "Completed", "tool call"),
+        .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
 
@@ -1259,7 +1274,7 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_label_tool = tool_dispatch.Tool{
     .name = "custom_registered_tool",
     .description = "Custom registered test tool.",
-    .gateway_schema = .{
+    .model_schema = .{
         .name = "custom_registered_tool",
         .description = "Custom registered test tool.",
     },
@@ -1535,11 +1550,11 @@ const FakeApp = struct {
         );
     }
 
-    fn snapshotGatewayToolProjection(
+    fn snapshotModelToolProjection(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
-    ) !tool_advertisement.EffectiveToolProjection {
+    ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
         if (self.snapshot_barrier) |barrier| barrier.wait();
@@ -1548,20 +1563,23 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const advertised_names = try alloc.alloc([]const u8, 0);
+        errdefer alloc.free(advertised_names);
+        const advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0);
+        errdefer alloc.free(advertised_functions);
         return .{
-            .tools_json = tools_json,
+            .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
 
-    fn snapshotSubagentGatewayToolProjection(
+    fn snapshotSubagentModelToolProjection(
         self: *FakeApp,
         alloc: Allocator,
         permission_mode: PermissionMode,
         permission_rules: types.PermissionRuleSet,
-    ) !tool_advertisement.EffectiveToolProjection {
+    ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
         if (self.snapshot_barrier) |barrier| barrier.wait();
@@ -1570,10 +1588,13 @@ const FakeApp = struct {
         else
             null;
         if (self.snapshot_tools_error) |err| return err;
-        const tools_json = try alloc.dupe(u8, "[]");
-        errdefer alloc.free(tools_json);
+        const advertised_names = try alloc.alloc([]const u8, 0);
+        errdefer alloc.free(advertised_names);
+        const advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0);
+        errdefer alloc.free(advertised_functions);
         return .{
-            .tools_json = tools_json,
+            .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
             .custom_guidance = try alloc.dupe(u8, self.snapshot_custom_guidance),
         };
     }
@@ -1951,7 +1972,7 @@ test "app ChatGPT route removes Gateway-backed auxiliary capabilities" {
     try std.testing.expect(ctx.permission_reviewer_provider == null);
 }
 
-test "app agent runtime tool context prefers active queued turn settings" {
+test "app agent runtime tool context combines active settings with live permission mode" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc);
     defer app.deinit();
@@ -1971,11 +1992,7 @@ test "app agent runtime tool context prefers active queued turn settings" {
         .effort = types.ReasoningEffort.literal("high"),
     });
     defer app.worker.clearActiveAgentTurnSettings();
-    app.permission_engine.mode = .ask;
-    app.worker.setActivePermissionSnapshot(.{
-        .mode = .auto,
-    });
-    defer app.worker.clearActivePermissionSnapshot();
+    app.permission_engine.mode = .auto;
 
     const ctx = testToolContext(&app);
 
@@ -2020,6 +2037,30 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
     try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
     try std.testing.expect(std.mem.find(u8, denied, "zig build") != null);
+
+    const malformed_registered: ToolCall = .{
+        .id = "malformed_registered",
+        .name = "memory",
+        .arguments_json = "{",
+    };
+    const malformed_completed = try app.describeToolActionCompleted(arena, malformed_registered);
+    try std.testing.expectEqualStrings(
+        "● Completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_completed,
+    );
+    const malformed_denied = try app.describeToolActionDenied(arena, malformed_registered, "Denied");
+    try std.testing.expectEqualStrings(
+        "● Denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_denied,
+    );
+
+    const malformed_unknown: ToolCall = .{
+        .id = "malformed_unknown",
+        .name = "mcp_unknown",
+        .arguments_json = "{",
+    };
+    const malformed_unknown_completed = try app.describeToolActionCompleted(arena, malformed_unknown);
+    try std.testing.expect(std.mem.find(u8, malformed_unknown_completed, "mcp_unknown") != null);
 
     const mcp_call: ToolCall = .{ .id = "mcp", .name = "mcp_lookup", .arguments_json = "{}" };
     const mcp_action = try app.describeToolActionCompleted(arena, mcp_call);
@@ -2368,10 +2409,7 @@ test "app agent runtime appends static and transient context through configured 
     const arena = arena_state.allocator();
     var messages: std.ArrayList(ChatMessage) = .empty;
     defer messages.deinit(arena);
-    app.worker.setActivePermissionSnapshot(.{
-        .mode = .auto,
-    });
-    defer app.worker.clearActivePermissionSnapshot();
+    app.permission_engine.mode = .auto;
 
     try Runtime(FakeApp).appendStaticContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
     try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
@@ -2454,21 +2492,19 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
         fn stream(
             _: ?*anyopaque,
             _: Allocator,
-            request: agent_stream_provider.Request,
+            request: agent_stream_provider.ModelRequest,
         ) !agent_stream_provider.Result {
-            request.on_content_chunk(
-                request.callback_ctx,
-                "Before table.\n" ++
-                    "| Name | Count |\n" ++
-                    "|------|------:|\n" ++
-                    "| api | 7 |\n" ++
-                    "After table.\n\n" ++
-                    "```zig\n" ++
-                    "const ready = true;\n" ++
-                    "```\n\n" ++
-                    "---\n",
-            );
-            return .{ .status = .ok, .completion = .{ .content = "", .finish_reason = .stop } };
+            try request.admission.admit();
+            request.events.emit(.{ .content_delta = "Before table.\n" ++
+                "| Name | Count |\n" ++
+                "|------|------:|\n" ++
+                "| api | 7 |\n" ++
+                "After table.\n\n" ++
+                "```zig\n" ++
+                "const ready = true;\n" ++
+                "```\n\n" ++
+                "---\n" });
+            return .{ .completed = .{ .completion = .{ .content = "", .finish_reason = .stop } } };
         }
     };
 
@@ -2557,10 +2593,6 @@ test "app agent runtime clears active turn settings when queued prompt setup fai
     const effective = app.worker.effectiveAgentTurnSettings();
     try std.testing.expect(!effective.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), effective.effort);
-    const permission_snapshot = app.worker.effectivePermissionSnapshot(.{
-        .mode = .ask,
-    });
-    try std.testing.expectEqual(PermissionMode.ask, permission_snapshot.mode);
 }
 
 test "subagent tool projection uses immutable admission permission rules" {
@@ -2830,11 +2862,10 @@ test "app agent runtime queued prompt config uses captured job settings over sta
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("high"),
     };
-    const tools_json = try alloc.dupe(u8, "[]");
-    errdefer alloc.free(tools_json);
     const custom_guidance = try alloc.dupe(u8, "app custom tool guidance");
-    var tool_projection = tool_advertisement.EffectiveToolProjection{
-        .tools_json = tools_json,
+    var tool_projection = tool_projection_mod.EffectiveToolProjection{
+        .advertised_names = try alloc.alloc([]const u8, 0),
+        .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
         .custom_guidance = custom_guidance,
     };
     defer tool_projection.deinit(alloc);
@@ -2844,7 +2875,8 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
     try std.testing.expectEqual(@as(usize, 8192), config.max_tool_result_bytes);
     try std.testing.expectEqual(types.ToolChoice.none, config.first_call_tool_choice);
-    try std.testing.expectEqualStrings(tool_projection.tools_json, config.gateway_tools_json);
+    try std.testing.expectEqualSlices([]const u8, tool_projection.advertised_names, config.advertised_tool_names);
+    try std.testing.expectEqualSlices(model_tool_schema.FunctionSchema, tool_projection.advertised_functions, config.advertised_functions);
     try std.testing.expectEqualStrings(tool_projection.custom_guidance, config.custom_tool_guidance);
     try std.testing.expectEqualStrings(test_prompt_policy.system_prompt, config.system_prompt);
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);

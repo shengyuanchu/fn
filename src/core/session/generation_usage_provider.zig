@@ -1,4 +1,5 @@
 const std = @import("std");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -80,6 +81,24 @@ pub const unavailable_provider = Provider{
     .lookup_fn = lookupUnavailable,
 };
 
+pub const Set = struct {
+    gateway: ?Provider = null,
+    codex: ?Provider = null,
+    grok: ?Provider = null,
+
+    pub fn gatewayOnly(provider: Provider) Set {
+        return .{ .gateway = provider };
+    }
+
+    pub fn select(self: Set, provider: model_provider.ProviderId) ?Provider {
+        return switch (provider) {
+            .gateway => self.gateway,
+            .codex => self.codex,
+            .grok => self.grok,
+        };
+    }
+};
+
 test "generation usage lookup dispatches through the injected provider" {
     const Fake = struct {
         calls: usize = 0,
@@ -129,4 +148,11 @@ test "generation usage lookup dispatches through the injected provider" {
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expect(fake.saw_expected_input);
     try std.testing.expectEqualStrings("provider/model", outcome.found.model);
+}
+
+test "generation usage providers are selected by provider identity" {
+    const routes = Set.gatewayOnly(unavailable_provider);
+    try std.testing.expect(routes.select(.gateway) != null);
+    try std.testing.expect(routes.select(.codex) == null);
+    try std.testing.expect(routes.select(.grok) == null);
 }

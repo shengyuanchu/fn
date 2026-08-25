@@ -199,9 +199,9 @@ const FxLoginRefreshMode = enum { if_needed, force };
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
-pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
+pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
-pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login and choose Sign in with Grok.";
+pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login, open Connections, then choose Grok subscription.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {

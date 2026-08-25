@@ -291,9 +291,7 @@ pub fn Runtime(comptime App: type) type {
             app.worker.agent_turn_settings.effort = startup.effort;
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
-            app.input_runtime.input_appearance = startup.input_appearance;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
-            app.shell.maxxing_mode = startup.maxxing_mode;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
@@ -711,7 +709,6 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.permission_mode = .auto;
     state.context_enabled = false;
     state.fast_mode = true;
-    state.maxxing_mode = .minimal;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -936,7 +933,6 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
     try std.testing.expect(!app.context_enabled);
     try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqual(@import("../config/presentation_mode.zig").MaxxingMode.minimal, app.shell.maxxing_mode);
     try std.testing.expect(!app.auto_upgrade_enabled);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.workspace_identity.enabled);

@@ -4,6 +4,7 @@ const builtin_tools = @import("tools.zig");
 const mode_contract = @import("../core/modes/mode_contract.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
+const tool_projection = @import("../core/tooling/tool_projection.zig");
 
 pub const ModeSpec = mode_contract.ModeSpec;
 pub const ToolPolicy = mode_contract.ToolPolicy;
@@ -41,7 +42,7 @@ test "built-in modes register exact ACP order and permission policy" {
 
 test "ask and code mode projections carry included custom provider guidance" {
     inline for (&.{ "ask", "code" }) |mode_id| {
-        var projection = try registry.buildGatewayToolProjection(
+        var projection = try registry.buildModelToolProjection(
             std.testing.allocator,
             builtin_tools.advertisement_set,
             mode_id,
@@ -49,7 +50,7 @@ test "ask and code mode projections carry included custom provider guidance" {
         );
         defer projection.deinit(std.testing.allocator);
 
-        try std.testing.expect(std.mem.find(u8, projection.tools_json, "gateway.perplexity_search") != null);
+        try std.testing.expect(tool_projection.containsName(projection.advertised_names, "web_search"));
         try std.testing.expectEqualStrings(builtin_tools.web_search.description, projection.custom_guidance);
     }
 }
@@ -66,11 +67,9 @@ test "built-in mode projections use the supplied tool set" {
         .read_only_tool_names = read_only_names[0..],
     };
 
-    var projection = try registry.buildGatewayToolProjection(std.testing.allocator, tool_set, "ask", .{});
+    var projection = try registry.buildModelToolProjection(std.testing.allocator, tool_set, "ask", .{});
     defer projection.deinit(std.testing.allocator);
-    const json = projection.tools_json;
-
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"read_file\"") != null);
-    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"write_file\"") == null);
+    try std.testing.expect(tool_projection.containsName(projection.advertised_names, "read_file"));
+    try std.testing.expect(!tool_projection.containsName(projection.advertised_names, "write_file"));
     try std.testing.expectEqualStrings("", projection.custom_guidance);
 }

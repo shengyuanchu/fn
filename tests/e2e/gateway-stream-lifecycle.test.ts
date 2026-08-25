@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -41,7 +43,7 @@ import {
 } from "./tmux-helpers";
 
 const MODEL = "openai/gpt-5.5";
-const DEFAULT_MODEL = "zai/glm-5.2";
+const DEFAULT_MODEL = "moonshotai/kimi-k3";
 const DELAY_MS = 32_500;
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
@@ -141,7 +143,7 @@ function sse(body: string): Response {
 
 function startGateway(
   response: () => Response,
-  classifierDecision: "allow" | "ask" = "allow",
+  classifierDecision: "clear" | "caution" = "clear",
 ): GatewayFixture {
   return startDynamicFakeGateway(response, {
     classifierDecision,
@@ -182,7 +184,7 @@ function lengthLimitedCommandResponse(command: string): Response {
       `data: ${JSON.stringify({
         type: "tool-call",
         toolName: "terminal",
-        input: { action: "exec", command },
+        input: { action: "exec", command, timeout_ms: 600_000 },
       })}\n\n` +
       'data: {"type":"finish","finishReason":{"unified":"length","raw":"length"}}\n\n' +
       "data: [DONE]\n\n",
@@ -739,7 +741,7 @@ describe("gateway stream lifecycle", () => {
       expect(request.prompt[1]?.role).toBe("system");
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "terminal")?.description).toBe(
-        "Run one captured command and return its result.",
+        "Run one captured command with a required finite timeout_ms and return its result.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -855,7 +857,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("ask keeps the GLM default model identity without enabling fast mode", async () => {
+  test("ask keeps Kimi K3 as the default model with fast mode enabled", async () => {
     const root = createFixtureRoot("default-model");
     const tracePath = join(root.root, "trace.log");
     const gateway = startDynamicFakeGateway(
@@ -895,7 +897,9 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).not.toHaveProperty("fast");
-      expect(request).not.toHaveProperty("providerOptions.gateway.speed");
+      expect(request).toMatchObject({
+        providerOptions: { gateway: { speed: "fast" } },
+      });
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2688,7 +2692,7 @@ describe("gateway stream lifecycle", () => {
       );
       expect(historicalCalls).toHaveLength(1);
       expect(historicalCalls[0]).toEqual(
-        expect.objectContaining({ input: {} }),
+        expect.objectContaining({ input: { request: {} } }),
       );
       expect(historicalResults).toHaveLength(1);
       expect(gateway.requests[2].body).toContain("tool_execution_failed");
@@ -2724,7 +2728,11 @@ describe("gateway stream lifecycle", () => {
     const command = `cat <<'FX_LONG_COMMAND' > long-command-output.txt\n${payload}\nFX_LONG_COMMAND\n`;
     expect(Buffer.byteLength(command)).toBeGreaterThan(20 * 1024);
     const responses = [
-      fakeGatewayToolCall(callId, "terminal", { action: "exec", command }),
+      fakeGatewayToolCall(callId, "terminal", {
+        action: "exec",
+        command,
+        timeout_ms: 600_000,
+      }),
       fakeGatewayFinalText("Long command fixture written."),
     ];
     const gateway = startGateway(() =>
@@ -2758,6 +2766,407 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("no-save terminal timeout returns a readable process-scoped replay handle", async () => {
+    const root = createFixtureRoot("terminal-timeout-replay");
+    const tracePath = join(root.root, "trace.log");
+    const markerPath = join(root.workspace, "must-not-run.txt");
+    const childPidPath = join(root.workspace, "timeout-child.pid");
+    const invalidCallId = "terminal_missing_timeout_1";
+    const timeoutCallId = "terminal_timeout_1";
+    const readCallId = "terminal_replay_read_1";
+    let step = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(invalidCallId, "terminal", {
+            action: "exec",
+            command: "printf should-not-run > must-not-run.txt",
+            timeout_ms: undefined,
+          });
+        case 1: {
+          const correction = toolResultOutput(body, invalidCallId);
+          expect(correction).toContain("missing_fields");
+          expect(correction).toContain("timeout_ms");
+          expect(existsSync(markerPath)).toBe(false);
+          return fakeGatewayToolCall(timeoutCallId, "terminal", {
+            action: "exec",
+            command: `sleep 30 & child=$!; printf '%s' "$child" > ${JSON.stringify(childPidPath)}; printf 'PRE-TIMEOUT-OUT\\n'; wait "$child"`,
+            profile: "clean",
+            timeout_ms: 500,
+          });
+        }
+        case 2: {
+          const timedOut = toolResultOutput(body, timeoutCallId);
+          expect(timedOut).toContain("timeout=true");
+          const match = timedOut.match(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/,
+          );
+          replayHandle = match?.[1] ?? "";
+          expect(replayHandle).not.toBe("");
+          return fakeGatewayToolCall(readCallId, "read_tool_result", {
+            handle: replayHandle,
+            query: "PRE-TIMEOUT-OUT",
+          });
+        }
+        case 3:
+          expect(toolResultOutput(body, readCallId)).toContain("PRE-TIMEOUT-OUT");
+          return fakeGatewayFinalText("Timeout replay inspected.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const startedAt = Date.now();
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the timeout fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const elapsedMs = Date.now() - startedAt;
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Timeout replay inspected.");
+      expect(gateway.requestCount()).toBe(4);
+      expect(elapsedMs).toBeLessThan(5_000);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+      const childPid = Number.parseInt(readFileSync(childPidPath, "utf8"), 10);
+      expect(Number.isInteger(childPid)).toBe(true);
+      await waitForProcessExit(childPid);
+      expect(isProcessAlive(childPid)).toBe(false);
+
+      const expiredCallId = "expired_replay_read_1";
+      const expiredResponses = [
+        fakeGatewayToolCall(expiredCallId, "read_tool_result", {
+          handle: replayHandle,
+          start_byte: 1,
+          byte_count: 1024,
+        }),
+        fakeGatewayFinalText("Expired replay handled."),
+      ];
+      const expiredGateway = startGateway(() =>
+        expiredResponses.shift() ?? new Response("unexpected request", { status: 500 })
+      );
+      try {
+        const expired = await runFx(
+          ["ask", "--json", "--yolo", "--no-save", "Read the prior replay."],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, expiredGateway, tracePath),
+            timeoutMs: 15_000,
+          },
+        );
+        expect(expired.code).toBe(0);
+        expect(expiredGateway.requestCount()).toBe(2);
+        expect(
+          toolResultOutput(expiredGateway.requests[1]!.body, expiredCallId),
+        ).toContain("ResultHandleNotFound");
+      } finally {
+        expiredGateway.stop();
+      }
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("saved terminal replay handle remains readable after resume without re-execution", async () => {
+    const root = createFixtureRoot("saved-terminal-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const executionsPath = join(root.workspace, "executions.txt");
+    const commandCallId = "saved_terminal_command_1";
+    const readCallId = "saved_terminal_read_1";
+    let replayHandle = "";
+    const firstResponses = [
+      fakeGatewayToolCall(commandCallId, "terminal", {
+        action: "exec",
+        command: "printf 'run\\n' >> executions.txt; printf 'SAVED-REPLAY-NEEDLE\\n'",
+        profile: "clean",
+        timeout_ms: 600_000,
+      }),
+      (body: string) => {
+        const commandOutput = toolResultOutput(body, commandCallId);
+        const match = commandOutput.match(
+          /<command_output_handle>([^<]+)<\/command_output_handle>/,
+        );
+        replayHandle = match?.[1] ?? "";
+        expect(replayHandle).not.toBe("");
+        return fakeGatewayToolCall(readCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "SAVED-REPLAY-NEEDLE",
+        });
+      },
+      (body: string) => {
+        expect(toolResultOutput(body, readCallId)).toContain("SAVED-REPLAY-NEEDLE");
+        return fakeGatewayFinalText("Saved replay inspected.");
+      },
+    ];
+    const firstGateway = startGateway((body) => {
+      const response = firstResponses.shift();
+      if (!response) return new Response("unexpected request", { status: 500 });
+      return typeof response === "function" ? response(body) : response;
+    });
+
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--yolo", "Run the saved replay fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, firstGateway, firstTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout);
+      expect(first.code).toBe(0);
+      expect(firstJson.output).toContain("Saved replay inspected.");
+      expect(firstJson.session_id).not.toBe("");
+      expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+
+      const resumedReadCallId = "saved_terminal_resume_read_1";
+      const resumeResponses = [
+        fakeGatewayToolCall(resumedReadCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "SAVED-REPLAY-NEEDLE",
+        }),
+        (body: string) => {
+          expect(toolResultOutput(body, resumedReadCallId)).toContain(
+            "SAVED-REPLAY-NEEDLE",
+          );
+          return fakeGatewayFinalText("Resumed replay inspected.");
+        },
+      ];
+      const resumeGateway = startGateway((body) => {
+        const response = resumeResponses.shift();
+        if (!response) return new Response("unexpected request", { status: 500 });
+        return typeof response === "function" ? response(body) : response;
+      });
+      try {
+        const resumed = await runFx(
+          [
+            "ask",
+            "--json",
+            "--yolo",
+            "--resume-id",
+            firstJson.session_id,
+            "Read the saved replay again.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fixtureEnv(root, resumeGateway, resumeTracePath),
+            timeoutMs: 15_000,
+          },
+        );
+        expect(resumed.code).toBe(0);
+        expect(parseAskJson(resumed.stdout).output).toContain(
+          "Resumed replay inspected.",
+        );
+        expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+      } finally {
+        resumeGateway.stop();
+      }
+    } finally {
+      firstGateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("SIGKILL leaves no named no-save replay output", async () => {
+    const root = createFixtureRoot("no-save-replay-sigkill");
+    const tracePath = join(root.root, "trace.log");
+    const before = new Set(
+      readdirSync("/tmp").filter((name) =>
+        name.startsWith(".fx-command-replay-")
+      ),
+    );
+    const gateway = startGateway(() =>
+      fakeGatewayToolCall("no_save_sigkill_1", "terminal", {
+        action: "exec",
+        command:
+          "awk 'BEGIN { for (i = 0; i < 100000; i++) printf \"x\"; printf \"\\n\" }'; sleep 30",
+        profile: "clean",
+        timeout_ms: 600_000,
+      })
+    );
+    const proc = Bun.spawn(
+      [FX_BIN, "ask", "--yolo", "--no-save", "Run the crash cleanup fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_TRACE_SCOPES: "agent,core,gateway,stream,session",
+        },
+        stdout: "ignore",
+        stderr: "pipe",
+      },
+    );
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (
+        Date.now() < deadline &&
+        (!existsSync(tracePath) ||
+          !readFileSync(tracePath, "utf8").includes(
+            "command replay ephemeral backing opened",
+          ))
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(existsSync(tracePath)).toBe(true);
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command replay ephemeral backing opened",
+      );
+
+      proc.kill("SIGKILL");
+      await proc.exited;
+      await Bun.sleep(50);
+      const after = readdirSync("/tmp").filter((name) =>
+        name.startsWith(".fx-command-replay-") && !before.has(name)
+      );
+      expect(after).toEqual([]);
+      expect(existsSync(join(root.home, ".fx", "sessions"))).toBe(false);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test.skipIf(process.platform !== "linux")(
+    "a second headless terminal exec survives replacing the running fx binary",
+    async () => {
+      const root = createFixtureRoot("headless-reexec-after-rebuild");
+      const tracePath = join(root.root, "trace.log");
+      const liveBin = join(root.root, "fx");
+      const replacementBin = join(root.root, "fx.next");
+      const parentExePath = join(root.root, "parent-exe.txt");
+      const firstHelperPidPath = join(root.root, "first-helper.pid");
+      const secondHelperPidPath = join(root.root, "second-helper.pid");
+      const firstCallId = "headless_reexec_replace_1";
+      const secondCallId = "headless_reexec_after_replace_2";
+
+      copyFileSync(FX_BIN, liveBin);
+      chmodSync(liveBin, 0o755);
+      copyFileSync("/bin/sh", replacementBin);
+      chmodSync(replacementBin, 0o755);
+
+      let fxPid: number | null = null;
+      let responseIndex = 0;
+      const gateway = startGateway(() => {
+        switch (responseIndex++) {
+          case 0:
+            if (fxPid === null) {
+              return new Response("fx pid unavailable", { status: 500 });
+            }
+            return fakeGatewayToolCall(firstCallId, "terminal", {
+              action: "exec",
+              timeout_ms: 600_000,
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(firstHelperPidPath)}`,
+                `mv -f ${JSON.stringify(replacementBin)} ${JSON.stringify(liveBin)}`,
+                `readlink ${JSON.stringify(`/proc/${fxPid}/exe`)} > ${JSON.stringify(parentExePath)}`,
+                "printf 'first-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 1:
+            return fakeGatewayToolCall(secondCallId, "terminal", {
+              action: "exec",
+              timeout_ms: 600_000,
+              command: [
+                `printf '%s\\n' "$PPID" > ${JSON.stringify(secondHelperPidPath)}`,
+                "printf 'second-terminal-exec-ok\\n'",
+              ].join("; "),
+            });
+          case 2:
+            return fakeGatewayFinalText("Both terminal commands completed.");
+          default:
+            return new Response("unexpected request", { status: 500 });
+        }
+      });
+      const proc = Bun.spawn([
+        liveBin,
+        "ask",
+        "--json",
+        "--yolo",
+        "--no-save",
+        "Run both terminal commands.",
+      ], {
+        cwd: root.workspace,
+        env: {
+          ...process.env,
+          ...fixtureEnv(root, gateway, tracePath),
+          FX_AUTO_UPGRADE: "0",
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      fxPid = proc.pid;
+
+      try {
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        const json = parseAskJson(stdout);
+        const firstOutput = toolResultOutput(
+          gateway.requests[1]!.body,
+          firstCallId,
+        );
+        const secondOutput = toolResultOutput(
+          gateway.requests[2]!.body,
+          secondCallId,
+        );
+
+        expect(exitCode).toBe(0);
+        expect(json.error).toBeUndefined();
+        expect(json.tool_calls).toEqual([
+          expect.objectContaining({ name: "terminal", status: "success" }),
+          expect.objectContaining({ name: "terminal", status: "success" }),
+        ]);
+        expect(gateway.requestCount()).toBe(3);
+        expect(firstOutput).toContain("first-terminal-exec-ok");
+        expect(secondOutput).toContain("second-terminal-exec-ok");
+        expect(readFileSync(parentExePath, "utf8").trim()).toBe(
+          `${liveBin} (deleted)`,
+        );
+        expect(
+          [stdout, stderr, firstOutput, secondOutput, readFileSync(tracePath, "utf8")]
+            .join("\n"),
+        ).not.toContain("FileNotFound");
+
+        const firstHelperPid = Number.parseInt(
+          readFileSync(firstHelperPidPath, "utf8"),
+          10,
+        );
+        const secondHelperPid = Number.parseInt(
+          readFileSync(secondHelperPidPath, "utf8"),
+          10,
+        );
+        expect(Number.isSafeInteger(firstHelperPid) && firstHelperPid > 0).toBe(
+          true,
+        );
+        expect(Number.isSafeInteger(secondHelperPid) && secondHelperPid > 0).toBe(
+          true,
+        );
+        await waitForProcessExit(firstHelperPid, 3_000);
+        await waitForProcessExit(secondHelperPid, 3_000);
+      } finally {
+        proc.kill("SIGKILL");
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   test("SIGTERM drains an active headless terminal command without panic or survivors", async () => {
     const root = createFixtureRoot("headless-sigterm");
     const tracePath = join(root.root, "trace.log");
@@ -2771,6 +3180,7 @@ describe("gateway stream lifecycle", () => {
       fakeGatewayToolCall("headless_sigterm_1", "terminal", {
         action: "exec",
         command,
+        timeout_ms: 600_000,
       })
     );
     const proc = Bun.spawn([
@@ -2837,6 +3247,120 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("saved SIGINT retains cancelled terminal output for resume without re-execution", async () => {
+    const root = createFixtureRoot("saved-cancelled-terminal-replay");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const readyPath = join(root.workspace, "cancelled-command.ready");
+    const executionsPath = join(root.workspace, "cancelled-executions.txt");
+    const commandCallId = "saved_cancelled_terminal_1";
+    const readCallId = "saved_cancelled_replay_read_1";
+    const command = [
+      "printf 'run\\n' >> cancelled-executions.txt",
+      "printf 'CANCELLED-REPLAY-NEEDLE\\n'",
+      `printf ready > ${JSON.stringify(readyPath)}`,
+      "trap 'exit 0' TERM",
+      "while :; do sleep 1; done",
+    ].join("; ");
+    let phase: "initial" | "resume" = "initial";
+    let resumeStep = 0;
+    let replayHandle = "";
+    const gateway = startGateway((body) => {
+      if (phase === "initial") {
+        return fakeGatewayToolCall(commandCallId, "terminal", {
+          action: "exec",
+          command,
+          profile: "clean",
+          timeout_ms: 600_000,
+        });
+      }
+      if (resumeStep++ === 0) {
+        const replayMatches = [
+          ...body.matchAll(
+            /<command_output_handle>([^<]+)<\/command_output_handle>/g,
+          ),
+        ];
+        expect(replayMatches).toHaveLength(1);
+        replayHandle = replayMatches[0]?.[1] ?? "";
+        expect(replayHandle).not.toBe("");
+        return fakeGatewayToolCall(readCallId, "read_tool_result", {
+          handle: replayHandle,
+          query: "CANCELLED-REPLAY-NEEDLE",
+        });
+      }
+      expect(toolResultOutput(body, readCallId)).toContain(
+        "CANCELLED-REPLAY-NEEDLE",
+      );
+      return fakeGatewayFinalText("Cancelled replay inspected after resume.");
+    });
+    const proc = Bun.spawn(
+      [FX_BIN, "ask", "--json", "--yolo", "Run the cancellable command fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, firstTracePath),
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    try {
+      const startDeadline = Date.now() + 10_000;
+      while (!existsSync(readyPath)) {
+        if (Date.now() >= startDeadline) {
+          throw new Error("cancellable terminal command did not start");
+        }
+        await Bun.sleep(10);
+      }
+      proc.kill("SIGINT");
+      const exitCode = await proc.exited;
+      const stderr = await new Response(proc.stderr).text();
+      expect(exitCode).toBe(130);
+      expect(proc.signalCode).toBe("SIGINT");
+      expect(stderr).not.toContain("panic: reached unreachable code");
+
+      const latest = await runFx(["session", "last", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home },
+      });
+      expect(latest.code).toBe(0);
+      const sessionId = JSON.parse(latest.stdout).id as string;
+      const sessionRoot = join(root.home, ".fx", "sessions", sessionId);
+      expect(
+        readdirSync(join(sessionRoot, "logs", "commands")).filter((name) =>
+          name.endsWith(".bin")
+        ),
+      ).toHaveLength(1);
+
+      phase = "resume";
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--yolo",
+          "--resume-id",
+          sessionId,
+          "Inspect the cancelled command output.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain(
+        "Cancelled replay inspected after resume.",
+      );
+      expect(readFileSync(executionsPath, "utf8")).toBe("run\n");
+      expect(gateway.requestCount()).toBe(3);
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test(
     "nine saved turns stay canonical while the next request uses bounded context",
@@ -3564,6 +4088,7 @@ describe("gateway stream lifecycle", () => {
       if (responseIndex++ === 0) {
         return fakeGatewayToolCall("prompt_too_long_tool_1", "terminal", {
           action: "exec",
+          timeout_ms: 600_000,
           command: `printf 'once\\n' >> '${sideEffectPath}'`,
         });
       }
@@ -3633,7 +4158,7 @@ describe("gateway stream lifecycle", () => {
       requestIndex += 1;
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3791,7 +4316,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -3883,7 +4408,7 @@ describe("gateway stream lifecycle", () => {
         },
       });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     try {
@@ -4289,7 +4814,7 @@ describe("gateway stream lifecycle", () => {
       }
       return new Response("unexpected matrix request", { status: 500 });
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
 
@@ -4390,8 +4915,8 @@ describe("gateway stream lifecycle", () => {
     }
   }, 90_000);
 
-  test("selected dynamic MCP automatic review asks with zero sends and allows exactly once", async () => {
-    for (const decision of ["ask", "allow"] as const) {
+  test("selected dynamic MCP review cautions with zero sends and clears exactly once", async () => {
+    for (const decision of ["caution", "clear"] as const) {
       const root = createFixtureRoot(`mcp-review-${decision}`);
       const tracePath = join(root.root, "trace.log");
       const mcp = writeMcpFixture(root);
@@ -4431,29 +4956,29 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.classifierRequests[0]!.body).toContain(DYNAMIC_MCP_TOOL_NAME);
         expect(gateway.classifierRequests[0]!.body).toContain("exact-");
         expect(gateway.classifierRequests[0]!.body).toContain("inputSchema");
-        if (decision === "ask") {
-          // Headless automatic review returns a recoverable denial to the
+        if (decision === "caution") {
+          // Headless automatic review returns caution advice to the
           // primary model without executing the MCP tool or asking the user.
           expect(result.code).toBe(0);
           expect(gateway.requests).toHaveLength(3);
-          expect(gateway.requests[2]!.body).toContain("tool_permission_denied");
-          expect(gateway.requests[2]!.body).toContain("auto_denied");
+          expect(gateway.requests[2]!.body).toContain("tool_review_held");
+          expect(gateway.requests[2]!.body).toContain("review_caution");
           expect(gateway.requests[2]!.body).not.toContain("user_denied");
           const json = parseAskJson(result.stdout);
-          expect(json.output).toContain("MCP ask handled.");
+          expect(json.output).toContain("MCP caution handled.");
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
             status: "error",
           });
           expect(result.stdout).not.toContain("NonInteractivePermissionRequired");
           expect(trace).toContain("event=auto_review_result");
-          expect(trace).toContain("decision=ask");
+          expect(trace).toContain("decision=caution");
           expect(trace).not.toContain("err=NonInteractivePermissionRequired");
           expect(existsSync(mcp.callLogPath)).toBe(false);
         } else {
           expect(result.code).toBe(0);
           const json = parseAskJson(result.stdout);
-          expect(trace).toContain("decision=allow");
+          expect(trace).toContain("decision=clear");
           expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
           expect(json.tool_calls).toContainEqual({
             name: DYNAMIC_MCP_TOOL_NAME,
@@ -4585,7 +5110,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const responses = [
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"error","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),
@@ -5054,7 +5579,7 @@ describe("gateway stream lifecycle", () => {
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
     const gateway = startGateway(() =>
       sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt"}}\n\n' +
+        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"terminal","input":{"action":"exec","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}\n\n' +
           'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
           "data: [DONE]\n\n",
       ),

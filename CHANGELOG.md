@@ -1,8 +1,64 @@
 # fx
 
-## 0.0.5
+## 0.0.6
 
 <!-- release:start -->
+
+**New Gateway sessions use Kimi K3 with Fast mode, foreground commands require timeouts, auto mode reviews exact pending actions, and the macOS arm64 binary is 0.3% smaller (6.12 MiB vs 6.13 MiB).**
+
+### Breaking Changes
+
+- **Terminal presentation**: `/appearance`, `/input`, and `/maxxing` have been removed along with their saved settings. fx now uses the same input and transcript layout everywhere.
+- **Foreground command timeouts**: `terminal.exec` calls now require `timeout_ms` between 1 millisecond and 10 minutes. Use `terminal.start` for services, watchers, GUI apps, and other long-running work.
+
+### New Features
+
+- **Remote MCP servers**: `/mcp add --transport http <name> <url>` now saves or replaces a remote Streamable HTTP server and reloads MCP immediately. The existing local stdio form is unchanged.
+- **Retained command output**: Captured command output can now be read later with `read_tool_result`, including after a saved session resumes. With `--no-save`, output remains available until fx exits.
+
+### Improvements
+
+- **Auto mode review prompts**: Auto mode now uses fewer tokens when reviewing unresolved actions.
+- **Native binary size**: The macOS arm64 binary is 0.3% smaller (6.12 MiB vs 6.13 MiB).
+- **Gateway defaults**: New Gateway sessions now use Kimi K3 with Fast mode enabled by default.
+- **Setup hub**: `/setup` now groups sign-in methods under Connections and shows the current provider, Vercel team, and credential source. Child screens return to the setup hub, and active sign-in controls remain visible in compact terminals.
+- **Provider model preferences**: Gateway, Codex, and Grok now keep separate saved model selections, so switching providers no longer replaces another provider's preferred model.
+- **Subscription session longevity**: Codex and Grok sessions remain usable beyond 64 consecutive requests.
+- **Usage tracking**: Rejected completions no longer appear in usage tracking, and duplicate completion callbacks are recorded once.
+- **MCP discovery**: MCP searches still find the selected tool when a request includes surrounding context, and another server's authentication failure no longer replaces an empty search result.
+- **MCP authentication**: MCP authentication stays responsive while configuration reloads or logout is in progress, and pending authentication stops when MCP reloads or fx exits.
+- **Linked skill errors**: Linked skill errors now distinguish an unavailable linked directory from an unreadable `SKILL.md` and explain whether to repair, remove, or authorize the link.
+- **Live permission modes**: `Shift+Tab` permission-mode changes now apply to later tool calls in the current turn. Actions already in progress keep the mode under which they were admitted.
+- **Tool action summaries**: Denied and deferred tool rows now show the actual command or target, and those details and denial labels survive session resume.
+
+### Bug Fixes
+
+- **Terminal resize**: Terminal resizing no longer leaves empty scrollback behind.
+- **Subscription sign-in**: Codex and Grok sign-ins now survive unrelated, stalled, reset, or stale browser connections. Grok authorization codes can also be pasted when the browser cannot return to fx.
+- **OAuth callback pages**: OAuth callbacks now show a completion or failure page after returning from the browser.
+- **Nested rebuilds**: Interactive terminal helpers continue working after a nested rebuild replaces the fx binary on disk.
+- **Terminal recovery**: fx recovery no longer pauses commands already running in tmux.
+- **Terminal cancellation**: Terminal cancellation no longer reports failure when the command exits during cancellation.
+- **MCP resource compatibility**: MCP resources and prompts no longer fail on servers that require their configured name.
+- **MCP credential recovery**: MCP credentials with no advertised scopes remain usable after restart. Malformed stored entries no longer prevent valid servers from loading and are removed on the next successful credential write.
+- **MCP stdio environments**: Configured MCP stdio environment variables now override inherited values without discarding the rest of the child environment.
+- **Captured command failures**: Captured command output remains readable after timeout or cancellation. Output-capture failures now fail the tool call instead of returning an incomplete result.
+- **Resumed review labels**: The `Safety caution` and `Review unavailable` labels now survive session resume.
+
+### Security
+
+- **Exact-action reviews**: Auto mode reviews each unresolved action against the current request and relevant results from the current turn. A clear review applies only to that exact unchanged action and is checked again before execution.
+- **Blocked cautions**: Cautioned or unavailable actions remain blocked without opening a permission prompt or ending the turn.
+- **Untrusted tool output**: Actions copied from untrusted tool output remain blocked unless the user's request independently authorizes them.
+- **Current-branch pushes**: Explicit pushes to the current branch use the branch reported by the local Git checkout rather than repository text.
+- **Provider recovery authority**: After restart, fx continues unfinished Codex or Grok work only for the account that started it. If that account cannot be verified, fx preserves completed work and sends nothing.
+- **Sensitive command output**: Command output flagged as sensitive is not saved with the session, including secrets split across output chunks or oversized lines.
+- **OAuth callback validation**: OAuth authorization denials and successes apply only when the callback state matches the active sign-in attempt, and Grok browser callbacks accept only the expected xAI origin.
+- **MCP issuer validation**: MCP sign-in stops before exchanging a token or saving credentials when the authorization response comes from a different issuer than the server advertised.
+
+<!-- release:end -->
+
+## 0.0.5
 
 ### Breaking Changes
 
@@ -59,8 +115,6 @@
 - **MCP session retirement:** Keep retired HTTP session IDs alive until in-flight requests drain
 - **Provider response limits:** Reject oversized Codex and Grok catalogs, streams, tool data, and replay state while keeping later input usable
 - **ACP permission validation:** Validate permission input before writing JSON-RPC frames
-
-<!-- release:end -->
 
 ## 0.0.4
 

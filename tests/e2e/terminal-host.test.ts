@@ -7,6 +7,7 @@ import {
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
@@ -2778,6 +2780,7 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
   if (!existsSync("/bin/zsh")) return;
   for (const failurePoint of ["allocation", "storage", "checkpoint"]) {
     const home = makeHome();
+    const releasePath = join(home, "resize-release");
     const paths = hostPaths(home);
     const host = startHost(home, undefined, 30_000, {
       FX_TERMINAL_TEST_TMUX_RESIZE_CHECKPOINT_FAILURE: failurePoint,
@@ -2786,7 +2789,9 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
     const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
     const started = await startCommand(connected.client, connected.revision!, 135, {
       cwd: home,
-      command: "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"; sleep 30",
+      command:
+        "printf 'resize-ready\\n'; IFS= read -r input; printf 'resize-after:%s\\n' \"$input\"; " +
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.01; done`,
       shell: { executable: { path: "/bin/zsh", clean_start: true } },
       backend: "tmux",
       returnWhen: { match: "resize-ready" },
@@ -2844,10 +2849,20 @@ test.skipIf(!tmuxAvailable())("tmux resize checkpoint failures roll back without
       "wait",
     );
     expect(continued.outcome, failurePoint).toEqual({ condition_met: {} });
-    success(
-      await requestAction(connected.client, connected.revision!, 141, "close", {
+    writeFileSync(releasePath, "release");
+    const exited = success(
+      await requestAction(connected.client, connected.revision!, 141, "wait", {
         session_id: sessionId,
-        policy: "force",
+        return_when: { exit: {} },
+        safety_ceiling_ms: 5_000,
+      }),
+      "wait",
+    );
+    expect(exited.outcome, failurePoint).toEqual({ exited: 0 });
+    success(
+      await requestAction(connected.client, connected.revision!, 142, "close", {
+        session_id: sessionId,
+        policy: "graceful",
       }),
       "close",
     );
@@ -2891,6 +2906,69 @@ test.skipIf(!tmuxAvailable())("revision four client cannot opt into Part 8 tmux 
   host.kill("SIGKILL");
   await waitForExit(host);
 }, 15_000);
+
+test.skipIf(!tmuxAvailable() || process.platform !== "linux")(
+  "terminal helpers keep running after the on-disk fx binary is replaced",
+  async () => {
+    if (!existsSync("/bin/zsh")) return;
+    const home = makeHome();
+    const paths = hostPaths(home);
+    const liveBin = join(home, "fx");
+    copyFileSync(FX_BIN, liveBin);
+    chmodSync(liveBin, 0o755);
+
+    const host = startHost(home, undefined, 30_000, {}, liveBin);
+    await waitFor(() => existsSync(paths.socket));
+    const connected = await handshake(paths.socket, { minimum: 4, current: 5 });
+
+    // Simulate `zig build` replacing the running binary.
+    unlinkSync(liveBin);
+    copyFileSync("/bin/sh", liveBin);
+    chmodSync(liveBin, 0o755);
+
+    const tmux = await startCommand(connected.client, connected.revision!, 510, {
+      cwd: home,
+      command: "printf 'rebuild-tmux-ok\\n'; exit 0",
+      shell: { executable: { path: "/bin/zsh", clean_start: true } },
+      backend: "tmux",
+      returnWhen: { exit: {} },
+      waitMs: 15_000,
+    });
+    expect(tmux.outcome, "tmux").toEqual({ exited: 0 });
+    const tmuxId = (tmux.session as { session_id: string }).session_id;
+    const tmuxOut = await readSession(
+      connected.client,
+      connected.revision!,
+      512,
+      tmuxId,
+    );
+    expect(tmuxOut.output, "tmux").toContain("rebuild-tmux-ok");
+
+    const native = await startCommand(connected.client, connected.revision!, 511, {
+      cwd: home,
+      command: "printf 'rebuild-native-ok\\n'; exit 0",
+      shell: { executable: { path: "/bin/zsh", clean_start: true } },
+      backend: "native",
+      returnWhen: { exit: {} },
+      waitMs: 15_000,
+    });
+    expect(native.outcome, "native").toEqual({ exited: 0 });
+    const nativeId = (native.session as { session_id: string }).session_id;
+    const nativeOut = await readSession(
+      connected.client,
+      connected.revision!,
+      513,
+      nativeId,
+    );
+    expect(nativeOut.output, "native").toContain("rebuild-native-ok");
+
+    connected.client.close();
+    host.kill("SIGKILL");
+    await waitForExit(host);
+  },
+  TMUX_COMMAND_STARTUP_OBSERVATION_BUDGET_MS +
+    NATIVE_STARTUP_OBSERVATION_BUDGET_MS,
+);
 
 test.skipIf(!tmuxAvailable())("tmux recovers every durable starting boundary", async () => {
   if (!existsSync("/bin/zsh")) return;

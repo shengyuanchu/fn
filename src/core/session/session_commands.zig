@@ -169,12 +169,15 @@ fn appendShadowedUserSources(
     sources: config_runtime.ConfigSources,
 ) !void {
     var wrote_header = false;
-    try appendShadowedUserSource(writer, "model", patch.model != null, sources.model, &wrote_header);
+    const model_source = if (patch.model_preference) |preference|
+        sources.models.get(preference.provider)
+    else
+        .compiled_default;
+    try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
-    try appendShadowedUserSource(writer, "input_appearance", patch.input_appearance != null, sources.input_appearance, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
         const source: ?config_runtime.ConfigSource = switch (item.item) {
@@ -929,7 +932,7 @@ pub fn Commands(comptime App: type) type {
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
-                @tagName(detailed.sources.model),
+                @tagName(detailed.sources.models.get(.gateway)),
                 permissions.permissionModeLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
@@ -2927,7 +2930,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
         workspace_root,
     );
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("user/new", settings.model.?);
+    try std.testing.expectEqualStrings("user/new", settings.models.get(.gateway).?);
 }
 
 test "session_commands durable user save survives post-commit resolver diagnostic" {

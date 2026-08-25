@@ -31,6 +31,66 @@ pub fn persistInterruptedTurnOnce(
     retained_candidate: ?[]const u8,
     terminal_materializing: *bool,
 ) !void {
+    return persistInterruptedTurnWithPresentation(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        active_tool_call,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+        null,
+    );
+}
+
+pub fn persistInterruptedCommandTurnOnce(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: ?[]const u8,
+    active_tool_call: ToolCall,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+    cancelled_command: ?types.CancelledCommandPresentation,
+) !void {
+    return persistInterruptedTurnWithPresentation(
+        hooks,
+        finalization,
+        job,
+        partial_assistant,
+        active_tool_call,
+        completed_tool_names,
+        persisted,
+        trace_ctx,
+        current_turn_messages,
+        retained_candidate,
+        terminal_materializing,
+        cancelled_command,
+    );
+}
+
+fn persistInterruptedTurnWithPresentation(
+    hooks: *const AgentRuntimeDeps,
+    finalization: *TurnFinalizationGuard,
+    job: QueuedPrompt,
+    partial_assistant: ?[]const u8,
+    active_tool_call: ?ToolCall,
+    completed_tool_names: [][]u8,
+    persisted: *bool,
+    trace_ctx: TraceContext,
+    current_turn_messages: []const types.ChatMessage,
+    retained_candidate: ?[]const u8,
+    terminal_materializing: *bool,
+    cancelled_command: ?types.CancelledCommandPresentation,
+) !void {
     if (persisted.*) return;
 
     const durable_active_tool_call = if (active_tool_call) |call|
@@ -64,6 +124,7 @@ pub fn persistInterruptedTurnOnce(
             .tool_call = durable_active_tool_call,
             .completed_tool_names = completed_tool_names,
             .execution = execution,
+            .cancelled_command = cancelled_command,
         } };
         const finished = try types.dupeFinishedPrompt(
             std.heap.c_allocator,
@@ -104,6 +165,7 @@ pub fn persistInterruptedTurnOnce(
         .tool_call = durable_active_tool_call,
         .completed_tool_names = completed_tool_names,
         .execution = execution,
+        .cancelled_command = cancelled_command,
     } };
 
     var propagation_error: ?anyerror = null;

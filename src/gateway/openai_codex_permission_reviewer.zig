@@ -1,23 +1,16 @@
 const std = @import("std");
 const permission_auto_classifier = @import("../core/permissions/auto_classifier.zig");
-const gateway_json = @import("../core/gateway/gateway_json.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
-const session_usage = @import("../core/session/session_usage.zig");
 const openai_codex = @import("openai_codex.zig");
 const openai_codex_models = @import("openai_codex_models.zig");
+const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
+const responses_reviewer = @import("responses_permission_reviewer.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const provider = permission_auto_classifier.Provider{
     .review_fn = reviewCodex,
-};
-
-const ReviewConfig = struct {
-    credential: []const u8,
-    cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
 };
 
 fn reviewCodex(
@@ -26,142 +19,29 @@ fn reviewCodex(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
-    if (input.credential.len == 0) return .invalid;
-    var config = ReviewConfig{
-        .credential = input.credential,
-        .cancel_flag = input.cancel_flag,
-        .usage = input.usage,
-        .usage_allocator = input.usage_allocator,
-    };
-    return permission_auto_classifier.Reviewer.withTransportModel(
-        .{
-            .context = @ptrCast(&config),
-            .build_fn = buildReviewPayload,
-            .send_fn = sendReview,
-        },
-        config.cancel_flag,
-        permission_auto_classifier.Reviewer.default_timeout_ms,
-        openai_codex_models.reviewer_model,
-    ).review(alloc, request);
-}
-
-fn buildReviewPayload(
-    _: *anyopaque,
-    alloc: Allocator,
-    model: []const u8,
-    tools_json: []const u8,
-    messages: []const types.ChatMessage,
-    target_call_id: []const u8,
-    deadline: std.Io.Clock.Timestamp,
-    cancel_flag: *std.atomic.Value(bool),
-) ![]u8 {
-    const expanded = try gateway_json.expandPendingToolReviewMessages(
-        alloc,
-        messages,
-        target_call_id,
-        deadline,
-        cancel_flag,
-    );
-    defer alloc.free(expanded);
-    return openai_codex.agent_stream_provider.build(alloc, .{
-        .model = model,
-        .serialized_tools = tools_json,
-        .messages = expanded,
-        .tool_choice = .required,
-        .provider_options = .{},
-        .max_output_tokens = 2048,
-        .budget = .{ .deadline = deadline, .cancel_flag = cancel_flag },
+    return responses_reviewer.review(alloc, input, request, .{
+        .source = .chatgpt_subscription,
+        .model = openai_codex_models.reviewer_model,
+        .validate_fn = validateCredential,
+        .build_fn = openai_codex.buildRequest,
+        .send_fn = sendPrepared,
     });
 }
 
-const OwnedResult = struct {
-    result: stream_provider.Result,
-};
-
-fn deinitOwnedResult(raw: *anyopaque, alloc: Allocator) void {
-    const owned: *OwnedResult = @ptrCast(@alignCast(raw));
-    owned.result.deinit(alloc);
-    alloc.destroy(owned);
+fn validateCredential(
+    alloc: Allocator,
+    input: permission_auto_classifier.ProviderInput,
+) !void {
+    const account_id = try chatgpt_oauth.extractAccountId(alloc, input.credential);
+    alloc.free(account_id);
 }
 
-fn ignoreChunk(_: *anyopaque, _: []const u8) void {}
-
-fn sendReview(
-    raw: *anyopaque,
+fn sendPrepared(
     alloc: Allocator,
-    model: []const u8,
+    request: stream_provider.ModelRequest,
     payload: []const u8,
-    deadline: std.Io.Clock.Timestamp,
-    cancel_flag: *std.atomic.Value(bool),
-) !permission_auto_classifier.TransportOutcome {
-    const config: *ReviewConfig = @ptrCast(@alignCast(raw));
-    if (cancel_flag.load(.seq_cst)) return .cancelled;
-    if (std.Io.Clock.Timestamp.now(@import("../core/shared/io.zig").getIo(), .awake).raw.nanoseconds >=
-        deadline.raw.nanoseconds)
-    {
-        return .timed_out;
-    }
-    var delivery = stream_provider.DeliveryCertainty.init();
-    var evidence: stream_provider.AttemptEvidence = .{};
-    var callback_context: u8 = 0;
-    const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
-    var result = openai_codex.agent_stream_provider.stream(alloc, .{
-        .api_key = config.credential,
-        .credential_source = .chatgpt_subscription,
-        .team = null,
-        .model = model,
-        .retry_count = 1,
-        .chat_url = "",
-        .payload = payload,
-        .trace_ctx = .{},
-        .content_capture_limit = 16 * 1024,
-        .delivery = &delivery,
-        .attempt_evidence = &evidence,
-        .callback_ctx = @ptrCast(&callback_context),
-        .on_content_chunk = ignoreChunk,
-        .on_tool_start = null,
-        .on_reasoning_chunk = null,
-        .cancel_flag = cancel_flag,
-        .provider_attempt_owner = .transport,
-    }) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch return .permanent_failure;
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (err == error.Cancelled or cancel_flag.load(.seq_cst)) return .cancelled;
-        return .transient_failure;
-    };
-    var result_owned = true;
-    defer if (result_owned) result.deinit(alloc);
-    usage_observation.complete(
-        config.usage_allocator,
-        result.status,
-        result.completion,
-        "https://chatgpt.com/backend-api/codex",
-        null,
-    ) catch return .permanent_failure;
-    if (cancel_flag.load(.seq_cst)) return .cancelled;
-    if (result.status != .ok) {
-        const code: u16 = @intFromEnum(result.status);
-        return if (code == 408 or code == 425 or code == 429 or code >= 500)
-            .transient_failure
-        else
-            .permanent_failure;
-    }
-    if (result.completion.finish_reason) |reason| switch (reason) {
-        .provider_error => return .transient_failure,
-        .content_filter => return .permanent_failure,
-        .stop, .length, .tool_calls, .other => {},
-    };
-    const owned = try alloc.create(OwnedResult);
-    owned.* = .{ .result = result };
-    result_owned = false;
-    return .{ .completion = .{
-        .completion = owned.result.completion,
-        .context = @ptrCast(owned),
-        .deinit_fn = deinitOwnedResult,
-    } };
+) anyerror!stream_provider.Result {
+    return openai_codex.streamPrepared(alloc, request, payload);
 }
 
 test "Codex reviewer model remains catalog-selected gpt-5.4-mini" {
@@ -182,12 +62,9 @@ test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
         .{ .role = .system, .content = "Review the pending action." },
     };
     var cancelled = std.atomic.Value(bool).init(false);
-    var context: u8 = 0;
-    const body = try buildReviewPayload(
-        @ptrCast(&context),
+    const body = try responses_reviewer.buildPayloadForTest(
         std.testing.allocator,
         openai_codex_models.reviewer_model,
-        "[{\"type\":\"function\",\"name\":\"permission_decision\",\"parameters\":{\"type\":\"object\"}}]",
         &messages,
         "call_review",
         std.Io.Clock.Timestamp.fromNow(@import("../core/shared/io.zig").getIo(), .{
@@ -195,6 +72,7 @@ test "Codex reviewer builds a direct Responses request with gpt-5.4-mini" {
             .raw = .fromSeconds(5),
         }),
         &cancelled,
+        openai_codex.buildRequest,
     );
     defer std.testing.allocator.free(body);
 
