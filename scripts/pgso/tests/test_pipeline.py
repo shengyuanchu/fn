@@ -8,6 +8,7 @@ import unittest
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
+    BENCHMARK_USE_FLAGS,
     GENERATION_FLAGS,
     PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
@@ -19,6 +20,7 @@ from scripts.pgso.pipeline import (
     instrumentation_argv,
     instrumented_run_argv,
     instrumented_link_argv,
+    link_candidate,
     merge_profile_batch,
     parse_compiler_runtime,
     profile_use_argv,
@@ -102,10 +104,20 @@ class PgsoPipelineTests(unittest.TestCase):
                 "--disable-vp",
                 "-pgo-kind=pgo-instr-use-pipeline",
                 "-pgo-cold-func-opt=minsize",
-                "-profile-summary-cutoff-cold=990000",
-                "-passes=default<O2>",
+                "-profile-summary-cutoff-cold=600000",
+                "-passes=default<O2>,mergefunc,iroutliner",
             ),
             USE_FLAGS,
+        )
+        self.assertEqual(
+            (
+                "--disable-vp",
+                "-pgo-kind=pgo-instr-use-pipeline",
+                "-pgo-cold-func-opt=minsize",
+                "-profile-summary-cutoff-cold=990000",
+                "-passes=default<O2>,mergefunc,iroutliner",
+            ),
+            BENCHMARK_USE_FLAGS,
         )
         self.assertEqual(
             (
@@ -128,6 +140,21 @@ class PgsoPipelineTests(unittest.TestCase):
                 str(self.paths.profile_use_bitcode),
             ),
             profile_use_argv(self.toolchain, self.paths),
+        )
+        benchmark_paths = PipelinePaths.create(
+            self.root / "benchmark-run",
+            selector="ui_activity",
+        )
+        self.assertEqual(
+            (
+                str(self.toolchain.opt),
+                *BENCHMARK_USE_FLAGS,
+                f"-profile-file={benchmark_paths.merged_profile}",
+                str(benchmark_paths.bitcode),
+                "-o",
+                str(benchmark_paths.profile_use_bitcode),
+            ),
+            profile_use_argv(self.toolchain, benchmark_paths),
         )
         mapped_profile = self.paths.profiles / "production.profdata"
         self.assertEqual(
@@ -245,6 +272,63 @@ class PgsoPipelineTests(unittest.TestCase):
                 "-lc",
             ),
             candidate,
+        )
+
+    def test_candidate_object_and_signing_contract(self) -> None:
+        actions = self.root / "candidate-actions.txt"
+        artifact_tool = self.write_executable(
+            "artifact-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('artifact ' + ' '.join(sys.argv[1:]) + '\\n')
+output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_bytes(b'artifact')""",
+        )
+        strip = self.write_executable(
+            "strip-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('strip ' + ' '.join(sys.argv[1:]) + '\\n')""",
+        )
+        codesign = self.write_executable(
+            "codesign-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('codesign ' + ' '.join(sys.argv[1:]) + '\\n')""",
+        )
+        toolchain = dataclasses.replace(
+            self.toolchain,
+            zig=artifact_tool,
+            opt=artifact_tool,
+            llc=artifact_tool,
+            strip=strip,
+            codesign=codesign,
+        )
+        self.paths.profile_use_bitcode.write_bytes(b'profile-use bitcode')
+
+        link_candidate(
+            toolchain,
+            self.paths,
+            require_release_safe_evidence=False,
+        )
+
+        self.assertEqual(
+            [
+                "artifact -S "
+                f"{self.paths.profile_use_bitcode} -o "
+                f"{self.paths.profile_use_ir}",
+                "artifact -filetype=obj -O=2 "
+                f"{self.paths.profile_use_bitcode} -o "
+                f"{self.paths.profile_use_object}",
+                "artifact cc -target aarch64-macos -O2 -Wl,-dead_strip -s "
+                f"{self.paths.profile_use_object} -o "
+                f"{self.paths.candidate_binary} -lc",
+                f"strip -S -x {self.paths.candidate_binary}",
+                "codesign --force --sign - --options linker-signed "
+                f"--pagesize 16384 {self.paths.candidate_binary}",
+            ],
+            actions.read_text().splitlines(),
         )
 
     def test_bitcode_hash_must_match_the_original(self) -> None:

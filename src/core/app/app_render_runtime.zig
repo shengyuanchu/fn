@@ -14,17 +14,18 @@ const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_projection = @import("../subagent/ui_projection.zig");
 const file_index = @import("../workspace/file_index.zig");
+const statusline_identity = @import("../workspace/statusline_identity.zig");
 const activity_runtime = @import("../output/activity_runtime.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const event_loop = @import("../../ui/event_loop.zig");
@@ -415,7 +416,7 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
                     },
                     .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else app.selected_model.items;
+                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
                         const capabilities = model_capabilities.resolveForApp(App, app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
                         for (0..effort_count) |i| {
@@ -453,13 +454,16 @@ pub fn Runtime(comptime App: type) type {
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
-            const visible_model = pending_model orelse app.selected_model.items;
+            const visible_model = pending_model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
-            const model_supports_fast = visible_capabilities.supports_fast_mode;
-            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0;
+            const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
+            const model_supports_fast = visible_capabilities.supports_fast_mode or
+                (active_capabilities_pending and app.fast_mode);
+            const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
+                (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
-            else if (model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
+            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
             else
                 .auto;
@@ -582,11 +586,6 @@ pub fn Runtime(comptime App: type) type {
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
-                ),
-                .sandbox_menu = render_input.sandboxMenuProjection(
-                    &app.input_runtime.sandbox_menu,
-                    settings_snapshot,
-                    sandbox.osSandboxAvailable(),
                 ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
@@ -1078,7 +1077,7 @@ pub fn Runtime(comptime App: type) type {
             slash_registry: command_specs.SlashRegistry,
         ) render_input.RenderContext {
             const chat = view.chat;
-            const visible_model = chat.configuration.model orelse app.selected_model.items;
+            const visible_model = chat.configuration.model orelse provider_runtime.model(app);
             const capabilities = model_capabilities.resolveForApp(App, app, visible_model);
             var ctx = base;
             ctx.slash_registry = slash_registry;
@@ -1120,7 +1119,6 @@ pub fn Runtime(comptime App: type) type {
             ctx.session_menu = .{};
             ctx.appearance_menu = .{};
             ctx.statusline_menu = .{};
-            ctx.sandbox_menu = .{};
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";
@@ -1129,7 +1127,8 @@ pub fn Runtime(comptime App: type) type {
             ctx.esc_clear_armed = view.editor.gestures.escapeClearArmed();
             ctx.question = null;
             ctx.statusline = .{
-                .sandbox_label = base.statusline.sandbox_label,
+                .workspace_label = base.statusline.workspace_label,
+                .git_branch = base.statusline.git_branch,
             };
             const worker_status_projection = if (app.subagents.childConversationRuntime()) |child_runtime|
                 child_runtime.worker_status_state().projection()
@@ -1215,15 +1214,15 @@ pub fn Runtime(comptime App: type) type {
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
             var items: ui_render.StatuslineItems = .{};
-            if (app.statusline_sandbox) {
-                const permission_mode: types.PermissionMode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .auto;
-                items.sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-                    permission_mode,
-                    app.permission_state.sandbox_backend,
-                )).label();
+            if (comptime @hasField(App, "workspace_identity") and
+                @hasField(App, "workspace_root"))
+            {
+                const identity = app.workspace_identity.refresh(
+                    app.alloc,
+                    app.workspace_root,
+                ) catch app.workspace_identity.snapshot();
+                items.workspace_label = identity.workspace_label;
+                items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
                 items.context_used = app.total_input_tokens;
@@ -2798,11 +2797,11 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             if (comptime @hasDecl(@TypeOf(app.subagents), "setDefaults") and
-                @hasField(App, "selected_model") and @hasField(App, "effort"))
+                provider_runtime.supported(App) and @hasField(App, "effort"))
             {
                 try app.subagents.setDefaults(
                     app.alloc,
-                    app.selected_model.items,
+                    provider_runtime.model(app),
                     app.effort,
                 );
             }
@@ -3120,7 +3119,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             if (comptime !@hasField(App, "session") or
-                !@hasField(App, "selected_model") or !@hasField(App, "effort"))
+                !provider_runtime.supported(App) or !@hasField(App, "effort"))
             {
                 app.subagents.mutationRejected(app.alloc, .{
                     .code = .store_failure,
@@ -3165,7 +3164,8 @@ pub fn Runtime(comptime App: type) type {
             var result = host.executeHumanCommand(app.alloc, &mutation.command, .{
                 .invocation_id = mutation.invocation_id,
                 .defaults = .{
-                    .model = app.selected_model.items,
+                    .provider = provider_runtime.provider(app),
+                    .model = provider_runtime.model(app),
                     .effort = app.effort,
                     .fast_mode = if (comptime @hasField(App, "fast_mode")) app.fast_mode else false,
                     .conversation_language = app.session.languageSnapshot(),
@@ -4516,15 +4516,17 @@ const CoordinatorTestApp = struct {
     worker: CoordinatorTestWorker = .{},
     subagents: ui_subagents.Controller = .{},
     selected_model: std.ArrayList(u8) = .empty,
+    workspace_root: []const u8 = "",
+    workspace_identity: statusline_identity.Runtime = .{},
     pacer: CoordinatorTestPacer = .{},
     auth: auth_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
+    model_cache_loading: bool = false,
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
     gateway_metadata_model: ?[]const u8 = null,
@@ -4545,6 +4547,7 @@ const CoordinatorTestApp = struct {
         self.question_prompt.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
+        self.workspace_identity.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
         self.model_cache.deinit();
     }
@@ -4563,8 +4566,8 @@ const CoordinatorTestApp = struct {
         return 0;
     }
 
-    fn isModelCacheLoading(_: *CoordinatorTestApp) bool {
-        return false;
+    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
+        return self.model_cache_loading;
     }
 
     fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
@@ -4659,6 +4662,50 @@ test "core.app_render_runtime keeps final token progress during paced response t
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
+}
+
+test "core.app_render_runtime keeps configured controls visible while model capabilities load" {
+    const alloc = std.testing.allocator;
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{},
+        .model_cache_loading = true,
+        .fast_mode = true,
+        .effort = types.ReasoningEffort.literal("xhigh"),
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.8");
+
+    var upgrade_status_buf: [64]u8 = undefined;
+    const queued_cards: QueuedCardProjection = .{};
+    const ctx = Runtime(CoordinatorTestApp).footerContext(
+        &app,
+        &upgrade_status_buf,
+        0,
+        &queued_cards,
+    );
+
+    var hint_buf: [128]u8 = undefined;
+    const line = ui_render.buildHintLine(
+        ctx.stream.active,
+        false,
+        ctx.has_api_key,
+        ctx.model,
+        ctx.permission_mode,
+        ctx.queued_count,
+        null,
+        ctx.fast_mode,
+        ctx.model_supports_fast,
+        ctx.effort,
+        ctx.model_supports_effort,
+        ctx.statusline,
+        80,
+        &hint_buf,
+    );
+    try std.testing.expectEqualStrings(
+        "run /login · ask · opus 4.8 · xhigh · ⚡︎",
+        line,
+    );
 }
 
 test "core.app_render_runtime projects only the visible inline completion suffix" {

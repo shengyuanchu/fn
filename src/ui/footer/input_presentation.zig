@@ -350,13 +350,7 @@ pub fn composeHintRow(
     else
         base_hint_line;
 
-    var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
-    try row_text.appendClipped(alloc, &row, hint_line, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-
     const width_usize: usize = width;
-    const hint_width = display_width.visibleWidthIgnoringAnsi(hint_line);
     const danger_text = dangerStatusText(approval_active, ctx, width);
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
@@ -371,6 +365,20 @@ pub fn composeHintRow(
         ctx.upgrade_status;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
+    const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
+        @intCast(width_usize - right_width - 1)
+    else
+        width;
+
+    var row: std.ArrayList(u8) = .empty;
+    try row.appendSlice(alloc, if (question_hint != null) ui_render.dim_style else ui_render.statusline_style);
+    try row_text.appendClipped(alloc, &row, hint_line, left_width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+
+    const hint_width = @min(
+        display_width.visibleWidthIgnoringAnsi(hint_line),
+        @as(usize, left_width),
+    );
     if (right_text.len > 0 and right_width > 0 and
         ((danger_visible and width_usize >= right_width) or
             (!danger_visible and width_usize > hint_width + right_width)))
@@ -519,11 +527,6 @@ pub fn composeCompactCommandMenuHintRow(
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
         .statusline => [_][]const u8{
-            "",
-            "",
-            "",
-        },
-        .sandbox => [_][]const u8{
             "↑↓ Navigate     ←→ Change     Esc Close",
             "↑↓ Move  ←→ Change  Esc",
             "←→ Esc",
@@ -946,7 +949,7 @@ const input_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a session", .presentation_category = .session },
-    .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true },
+    .{ .kind = .appearance, .command = "/maxxing", .help_entry = "/maxxing [minimal|normal]", .completion_description = "choose transcript presentation", .presentation_category = .appearance, .has_args = true },
 };
 const input_test_slash_registry = command_specs.SlashRegistry{ .commands = input_test_slash_specs[0..] };
 
@@ -1335,19 +1338,19 @@ test "footer slash anchor contract handles top level and argument completions" {
 
     var arg = InputRuntime{};
     defer arg.deinit(alloc);
-    try arg.edit_state.input.appendSlice(alloc, "  /sandbox ");
+    try arg.edit_state.input.appendSlice(alloc, "  /maxxing ");
     arg.edit_state.cursor = arg.edit_state.input.items.len;
     const arg_geometry = measureRawInputGeometry(testRenderContext(&arg), 80, 20, true, false, false, false);
-    try std.testing.expectEqual(@as(usize, 2 + "/sandbox ".len), arg_geometry.summary.anchor.?.raw_offset);
+    try std.testing.expectEqual(@as(usize, 2 + "/maxxing ".len), arg_geometry.summary.anchor.?.raw_offset);
     try std.testing.expectEqual(@as(usize, 11), arg_geometry.summary.anchor.?.content_column);
     try std.testing.expectEqual(@as(u16, 14), arg_geometry.picker_start_col);
 
     var wrapped = InputRuntime{};
     defer wrapped.deinit(alloc);
-    try wrapped.edit_state.input.appendSlice(alloc, "       /sandbox ");
+    try wrapped.edit_state.input.appendSlice(alloc, "       /maxxing ");
     wrapped.edit_state.cursor = wrapped.edit_state.input.items.len;
     // Margin spaces hang on their row instead of wrapping, so row 0 holds
-    // all 7 leading spaces, row 1 is "/sandb", and row 2 is "ox " with the
+    // all 7 leading spaces, row 1 is "/maxx", and row 2 is "ing " with the
     // trailing space hanging at column 2.
     const wrapped_geometry = measureRawInputGeometry(testRenderContext(&wrapped), 8, 4, true, false, false, false);
     try std.testing.expectEqual(@as(usize, 3), wrapped_geometry.summary.total_rows);
@@ -1402,7 +1405,7 @@ test "footer slash completion separates query activity from candidate count" {
     try std.testing.expect(!no_args.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_args.slash_completion_count);
 
-    try input.textReplacementState().replace(alloc, "/sandbox ");
+    try input.textReplacementState().replace(alloc, "/maxxing ");
     const arguments = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
     try std.testing.expect(arguments.show_slash_query);
     try std.testing.expectEqual(@as(usize, 2), arguments.slash_completion_count);
@@ -1607,6 +1610,9 @@ test "compose hint row right-aligns upgrade status" {
         .selected_subagent_label = null,
         .selected_subagent_status = null,
         .upgrade_status = "Update installed: ctrl+g to reload",
+        .statusline = .{
+            .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
+        },
         .input = &input,
     };
 
@@ -1652,7 +1658,7 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: permissions and sandboxing disabled";
+    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
     ctx.danger_status_compact = "YOLO: unrestricted";
 
     var full = try composeHintRow(std.testing.allocator, false, null, ctx, 80);
@@ -1676,7 +1682,7 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: permissions and sandboxing disabled";
+    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
     ctx.danger_status_compact = "YOLO: unrestricted";
     ctx.ctrl_c_pending = true;
 

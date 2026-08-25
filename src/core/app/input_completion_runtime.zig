@@ -10,7 +10,6 @@ const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_commands = @import("../session/session_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -18,6 +17,7 @@ const file_index = @import("../workspace/file_index.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_commands = @import("app_commands.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const types = @import("../shared/types.zig");
@@ -596,8 +596,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn currentArgLabel(app: *App, trimmed: []const u8) ?[]const u8 {
             if (command_specs.inputArgCompletionPrefix(trimmed) != null)
                 return app.input_runtime.input_appearance.label();
-            if (command_specs.sandboxArgCompletionPrefix(trimmed) != null)
-                return sandbox.publicModeForBackend(app.permission_state.sandbox_backend).label();
             return null;
         }
 
@@ -931,11 +929,12 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn modelPickerCompletions(app: *App, query: []const u8, out: *[32][]const u8) usize {
             const count = app.modelCompletions(query, out);
-            if (comptime !@hasField(App, "selected_model")) return count;
+            if (comptime !provider_runtime.supported(App)) return count;
             if (!app.input_runtime.picker.model_completion_anchor_current or query.len != 0) return count;
 
-            if (modelCompletionIndex(out[0..count], app.selected_model.items) == null) {
-                if (catalogModelCompletion(app, app.selected_model.items)) |current| {
+            const selected_model = provider_runtime.model(app);
+            if (modelCompletionIndex(out[0..count], selected_model) == null) {
+                if (catalogModelCompletion(app, selected_model)) |current| {
                     if (count < out.len) {
                         out[count] = current;
                         return count + 1;
@@ -957,9 +956,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn modelPickerIndex(app: *App, completions: []const []const u8) usize {
             if (completions.len == 0) return 0;
-            if (comptime !@hasField(App, "selected_model")) return app.input_runtime.picker.model_completion_index % completions.len;
+            if (comptime !provider_runtime.supported(App)) return app.input_runtime.picker.model_completion_index % completions.len;
             if (app.input_runtime.picker.model_completion_anchor_current) {
-                if (modelCompletionIndex(completions, app.selected_model.items)) |index| return index;
+                if (modelCompletionIndex(completions, provider_runtime.model(app))) |index| return index;
             }
             return app.input_runtime.picker.model_completion_index % completions.len;
         }
@@ -1407,9 +1406,9 @@ const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
         .help_entry = "/resume",
     },
     .{
-        .kind = .sandbox,
-        .command = "/sandbox",
-        .help_entry = "/sandbox [os|none]",
+        .kind = .appearance,
+        .command = "/maxxing",
+        .help_entry = "/maxxing [minimal|normal]",
         .has_args = true,
     },
 };
@@ -1582,7 +1581,7 @@ test "root slash completion follows multiline and command argument ownership" {
     try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
     try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
 
-    try app.input_runtime.textReplacementState().replace(alloc, "/sandbox ");
+    try app.input_runtime.textReplacementState().replace(alloc, "/maxxing ");
     try std.testing.expectEqual(@as(usize, 2), rt.visibleSlashCompletionCount(&app));
 }
 

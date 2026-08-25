@@ -366,13 +366,12 @@ const test_snapshot: settings_catalog.Snapshot = .{
     .permission_mode = "ask",
     .input_appearance = "tint",
     .maxxing_mode = "minimal",
-    .statusline_sandbox = false,
     .statusline_context = true,
     .statusline_session = false,
+    .statusline_workspace = false,
     .startup_scrollback = true,
     .prompt_history = true,
     .sound_level = "on",
-    .sandbox = "os",
 };
 
 test "settings menu renders each setting on one row at wide and narrow widths" {
@@ -382,7 +381,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
         .snapshot = test_snapshot,
     };
     const wide_rows = menuRowCount(projection, 100, 40);
-    try std.testing.expectEqual(@as(u16, 23), wide_rows);
+    try std.testing.expectEqual(@as(u16, 22), wide_rows);
 
     var header = try composeSettingsMenuRow(alloc, projection, 0, 100, wide_rows);
     defer header.deinit(alloc);
@@ -407,7 +406,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
     try std.testing.expect(std.mem.find(u8, compact_item.items, "tint") != null);
 
     const narrow_rows = menuRowCount(projection, 24, 40);
-    try std.testing.expectEqual(@as(u16, 23), narrow_rows);
+    try std.testing.expectEqual(@as(u16, 22), narrow_rows);
     var narrow_item = try composeSettingsMenuRow(alloc, projection, 3, 24, narrow_rows);
     defer narrow_item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_item.items, "Input appeara") != null);

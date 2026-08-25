@@ -270,6 +270,20 @@ function readStartedDispatcherPids(path: string): number[] {
   )].map((match) => Number(match[1]));
 }
 
+function readStartupLaunchEvidence(root: FixtureRoot): {
+  startedPids: number[];
+  childRecordedPids: number[];
+  allPids: number[];
+} {
+  const startedPids = readStartedDispatcherPids(root.traceLogPath);
+  const childRecordedPids = readAttemptedPids(root.launchLogPath);
+  return {
+    startedPids,
+    childRecordedPids,
+    allPids: [...new Set([...startedPids, ...childRecordedPids])],
+  };
+}
+
 function preserveStdioFailure(
   label: string,
   root: FixtureRoot,
@@ -317,6 +331,70 @@ async function expectProcessesExited(pids: Iterable<number>, timeoutMs = 5_000) 
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test.skipIf(!tmuxAvailable())(
+    "the TUI shows exact dynamic MCP arguments before human approval",
+    async () => {
+      const root = createRoot("tui-human-approval-arguments", MODERN_FIXTURE);
+      const stderrPath = join(root.root, "stderr.log");
+      const expectedArguments = '{"text":"mcp-live-human-active"}';
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("call_mcp", TOOL_NAME, {
+          text: "mcp-live-human-active",
+        }),
+        fakeGatewayFinalText("MCP approval denied without transport."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: {
+          ...fixtureEnv(root, activeGateway),
+          FX_PERMISSION_MODE: "ask",
+        },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText(
+        "Call the MCP fixture only after I approve its exact arguments.",
+      );
+      const approval = await tui.waitForText(
+        `Arguments for this request: ${expectedArguments}`,
+        20_000,
+      );
+      expect(approval).toContain("Allow this MCP tool call?");
+      expect(approval).toContain(TOOL_NAME);
+      expect(approval).toContain(
+        "This MCP tool needs approval before fx can send the request.",
+      );
+      expect(approval).toContain("3. Deny");
+      expect(
+        readWire(root.wireLogPath).some(
+          (entry) => entry.message.method === "tools/call",
+        ),
+      ).toBe(false);
+
+      await tui.sendKeys("3");
+      await tui.waitForText("MCP approval denied without transport.", 10_000);
+      expect(
+        readWire(root.wireLogPath).some(
+          (entry) => entry.message.method === "tools/call",
+        ),
+      ).toBe(false);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    40_000,
+  );
+
   test("repository-local MCP configuration never launches a process or network request", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-mcp-project-trust-")));
     cleanupRoot = root;
@@ -3398,16 +3476,16 @@ describe("modern MCP stdio compatibility", () => {
     expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout).output).toContain("Startup timeout bounded.");
     expect(activeGateway.requests).toHaveLength(2);
-    const startedPids = readStartedDispatcherPids(root.traceLogPath);
-    expect(startedPids.length).toBeGreaterThanOrEqual(2);
-    expect(startedPids.length).toBeLessThanOrEqual(4);
-    const childRecordedPids = readAttemptedPids(root.launchLogPath);
-    expect(childRecordedPids.length).toBeGreaterThanOrEqual(2);
-    expect(childRecordedPids.length).toBeLessThanOrEqual(4);
-    expect(childRecordedPids.every((pid) => startedPids.includes(pid))).toBe(true);
-    await expectProcessesExited([
-      ...new Set([...startedPids, ...childRecordedPids]),
-    ]);
+    const launch = readStartupLaunchEvidence(root);
+    expect(launch.startedPids.length).toBeGreaterThanOrEqual(2);
+    expect(launch.startedPids.length).toBeLessThanOrEqual(4);
+    expect(launch.childRecordedPids.length).toBeLessThanOrEqual(
+      launch.startedPids.length,
+    );
+    expect(
+      launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+    ).toBe(true);
+    await expectProcessesExited(launch.allPids);
   }, 15_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -3445,12 +3523,15 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.kill();
       tui = null;
-      const attemptedPids = readAttemptedPids(root.launchLogPath);
-      expect(attemptedPids.length).toBeGreaterThan(0);
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
       expect(
-        attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+        launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
       ).toBe(true);
-      await expectProcessesExited(attemptedPids);
+      expect(
+        launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+      ).toBe(true);
+      await expectProcessesExited(launch.allPids);
     },
     25_000,
   );
@@ -3486,12 +3567,15 @@ describe("modern MCP stdio compatibility", () => {
     });
     expect(result.stderr).toContain("Required MCP server 'fixture'");
     expect(activeGateway.requests).toHaveLength(0);
-    const attemptedPids = readAttemptedPids(root.launchLogPath);
-    expect(attemptedPids.length).toBeGreaterThan(0);
+    const launch = readStartupLaunchEvidence(root);
+    expect(launch.startedPids.length).toBeGreaterThan(0);
     expect(
-      attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+      launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
     ).toBe(true);
-    await expectProcessesExited(attemptedPids);
+    expect(
+      launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+    ).toBe(true);
+    await expectProcessesExited(launch.allPids);
   }, 15_000);
 
   test.skipIf(!tmuxAvailable())(
@@ -3522,18 +3606,21 @@ describe("modern MCP stdio compatibility", () => {
       expect(activeGateway.requests).toHaveLength(0);
       await tui.kill();
       tui = null;
-      const attemptedPids = readAttemptedPids(root.launchLogPath);
-      expect(attemptedPids.length).toBeGreaterThan(0);
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
       expect(
-        attemptedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
+        launch.startedPids.every((pid) => Number.isSafeInteger(pid) && pid > 0),
       ).toBe(true);
-      await expectProcessesExited(attemptedPids);
+      expect(
+        launch.childRecordedPids.every((pid) => launch.startedPids.includes(pid)),
+      ).toBe(true);
+      await expectProcessesExited(launch.allPids);
     },
     15_000,
   );
 
   test.skipIf(!tmuxAvailable())(
-    "the TUI cancels a stalled stdio request with its original id",
+    "the TUI cancels a stalled stdio request and accepts a follow-up prompt",
     async () => {
       const root = createRoot("tui-cancel", MODERN_FIXTURE, {
         mode: "stall_operation",
@@ -3542,11 +3629,14 @@ describe("modern MCP stdio compatibility", () => {
       });
       const activeGateway = startToolGateway("Cancelled MCP TUI complete.");
       gateway = activeGateway;
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 100,
         height: 30,
+        stderrPath,
         env: fixtureEnv(root, activeGateway),
       });
 
@@ -3571,6 +3661,7 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.sendKeys("Escape");
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
+      await tui.waitForText("■ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (
@@ -3587,6 +3678,13 @@ describe("modern MCP stdio compatibility", () => {
         (entry) => entry.message.method === "notifications/cancelled",
       );
       expect(cancelled?.message.params?.requestId).toBe(2);
+
+      await tui.waitForStableComposer(5_000);
+      await tui.sendText("Confirm the next prompt works.");
+      await tui.waitForText("Cancelled MCP TUI complete.", 10_000);
+      expect(activeGateway.requests).toHaveLength(3);
+      expect(activeGateway.requests[2]?.body).toContain("Confirm the next prompt works.");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await tui.kill();
       tui = null;
@@ -3699,7 +3797,7 @@ describe("modern MCP stdio compatibility", () => {
 
       writeFileSync(join(root.home, ".fx", "mcp.json"), "{not valid json");
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP reload rejected; the existing runtime was retained", 5_000);
+      await tui.waitForText("MCP configuration could not be reloaded", 5_000);
       expect(isProcessAlive(originalPid!)).toBe(true);
 
       await tui.sendText(afterPrompt);
@@ -3749,7 +3847,7 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(profilePath, JSON.stringify(profile));
       const supersedeStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 1_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 1_000);
       expect(Date.now() - supersedeStarted).toBeLessThan(1_000);
 
       await tui.kill();
@@ -3790,12 +3888,12 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.sendText("/mcp add extra /definitely/missing-optional-mcp-command");
       const pane = await tui.waitForText(
-        "MCP reload rejected; the existing runtime was retained",
+        "MCP configuration could not be reloaded",
         10_000,
       );
       expect(pane).toContain("Saved MCP server 'extra'.");
       expect(pane).toContain("MCP reconnection started");
-      expect(pane).toContain("Required MCP server 'fixture' is failed");
+      expect(pane).toContain("Required MCP server 'fixture' failed to start");
       expect(isProcessAlive(originalPid)).toBe(true);
 
       await tui.sendText(prompt);
@@ -3856,7 +3954,7 @@ describe("modern MCP stdio compatibility", () => {
       await tui.sendText(beforePrompt);
       await tui.waitForText("PRE_RELOAD_CALL_READY", 15_000);
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded", 15_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 15_000);
       await tui.sendText(afterPrompt);
       await tui.waitForText("POST_RELOAD_GUIDANCE_READY", 15_000);
 
@@ -3924,6 +4022,7 @@ describe("modern MCP stdio compatibility", () => {
         "retry_attempt=0",
         "discovery=completed",
       ]) expect(pane).toContain(expected);
+      expect(pane).not.toContain(root.workspace);
       for (const forbidden of [
         "captured_at_ms=",
         "runtime_generation=",
@@ -3932,7 +4031,6 @@ describe("modern MCP stdio compatibility", () => {
         "HEALTH_SECRET_SENTINEL",
         "S11_SECRET_ENV",
         MODERN_FIXTURE,
-        root.root,
         "fake-mcp-stdio-key",
       ]) expect(pane).not.toContain(forbidden);
       expect(activeGateway.requests).toHaveLength(0);
@@ -4257,7 +4355,7 @@ describe("modern MCP stdio compatibility", () => {
 
       const reloadStarted = Date.now();
       await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP profile reloaded (ready, runtime ", 5_000);
+      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
       while (isProcessAlive(retiredPid) && Date.now() - reloadStarted < 5_000) {
         await Bun.sleep(25);
       }

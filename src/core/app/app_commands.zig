@@ -27,9 +27,9 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -82,6 +82,49 @@ fn format_trace_notice(
         .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
         .unavailable => try out.writer.writeAll("Could not create trace."),
     }
+    return out.toOwnedSlice();
+}
+
+fn formatMcpPublishedReload(
+    alloc: std.mem.Allocator,
+    published: app_mcp_runtime.PublishedReload,
+) ![]u8 {
+    if (published.health == .ready) {
+        return alloc.dupe(
+            u8,
+            if (published.configured_server_count == 0)
+                "MCP configuration reloaded. No servers are configured."
+            else
+                "MCP configuration reloaded successfully.",
+        );
+    }
+
+    if (published.unavailable_server_names.len == 0) {
+        return alloc.dupe(
+            u8,
+            "MCP configuration reloaded, but some servers are unavailable. Run /mcp list for details.",
+        );
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (published.unavailable_server_names.len == 1) {
+        try out.writer.print(
+            "MCP configuration reloaded, but server '{s}' is unavailable. Run /mcp list for details.",
+            .{published.unavailable_server_names[0]},
+        );
+        return out.toOwnedSlice();
+    }
+
+    try out.writer.print(
+        "MCP configuration reloaded, but {d} servers are unavailable: ",
+        .{published.unavailable_server_names.len},
+    );
+    for (published.unavailable_server_names, 0..) |name, index| {
+        if (index > 0) try out.writer.writeAll(", ");
+        try out.writer.print("'{s}'", .{name});
+    }
+    try out.writer.writeAll(". Run /mcp list for details.");
     return out.toOwnedSlice();
 }
 
@@ -306,7 +349,6 @@ pub fn Handlers(comptime App: type) type {
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
                 .handle_appearance = commandHandleAppearance,
-                .handle_sandbox = commandHandleSandbox,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
@@ -323,23 +365,42 @@ pub fn Handlers(comptime App: type) type {
             var warning = false;
             const body = switch (completion) {
                 .outcome => |outcome| switch (outcome) {
-                    .published => |published| if (published.generation) |generation|
-                        try std.fmt.allocPrint(
-                            app.alloc,
-                            "MCP profile reloaded ({s}, runtime {d}).",
-                            .{ @tagName(published.health), generation },
-                        )
-                    else
-                        try std.fmt.allocPrint(
-                            app.alloc,
-                            "MCP profile reloaded ({s}; no servers configured).",
-                            .{@tagName(published.health)},
-                        ),
+                    .published => |published| published: {
+                        warning = published.health != .ready;
+                        if (published.generation) |generation| {
+                            debug_trace.logf(
+                                "mcp",
+                                "profile reload published health={s} runtime_generation={d} configured_servers={d} unavailable_servers={d}",
+                                .{
+                                    @tagName(published.health),
+                                    generation,
+                                    published.configured_server_count,
+                                    published.unavailable_server_names.len,
+                                },
+                            );
+                        } else {
+                            debug_trace.logf(
+                                "mcp",
+                                "profile reload published health={s} runtime_generation=none configured_servers={d} unavailable_servers={d}",
+                                .{
+                                    @tagName(published.health),
+                                    published.configured_server_count,
+                                    published.unavailable_server_names.len,
+                                },
+                            );
+                        }
+                        break :published try formatMcpPublishedReload(app.alloc, published);
+                    },
                     .retained_required_failure => |failure| retained: {
                         warning = true;
+                        debug_trace.logf(
+                            "mcp",
+                            "profile reload retained current runtime required_server_failure={s}",
+                            .{failure},
+                        );
                         break :retained try std.fmt.allocPrint(
                             app.alloc,
-                            "MCP reload rejected; the existing runtime was retained. {s}",
+                            "MCP configuration could not be reloaded. Your existing MCP servers are still active. {s} Check the configuration or run /mcp list for details.",
                             .{failure},
                         );
                     },
@@ -351,10 +412,9 @@ pub fn Handlers(comptime App: type) type {
                         "profile reload retained current runtime err={s}",
                         .{@errorName(err)},
                     );
-                    break :failed try std.fmt.allocPrint(
-                        app.alloc,
-                        "MCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and retry.",
-                        .{@errorName(err)},
+                    break :failed try app.alloc.dupe(
+                        u8,
+                        "MCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
                     );
                 },
             };
@@ -505,10 +565,10 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandLogout(ctx: *anyopaque) !void {
+        fn commandLogout(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "runLogoutCommand")) {
-                try app.runLogoutCommand();
+                try app.runLogoutCommand(rest);
             } else {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1003,23 +1063,22 @@ pub fn Handlers(comptime App: type) type {
                 app.beginMcpReload() catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
-                        try std.fmt.allocPrint(
-                            app.alloc,
-                            "MCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and retry.",
-                            .{@errorName(err)},
+                        try app.alloc.dupe(
+                            u8,
+                            "MCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
                         )
                     else
                         try std.fmt.allocPrint(
                             app.alloc,
-                            "{s}\nMCP reload rejected; the existing runtime was retained. Fix the trusted profile configuration ({s}) and run /mcp reload.",
-                            .{ command_body, @errorName(err) },
+                            "{s}\nMCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
+                            .{command_body},
                         );
                     debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
                     const notice = reload_notice.?;
                     try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
                     return;
                 };
-                const started = "MCP reconnection started. The existing runtime remains active until replacement completes.";
+                const started = "MCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.";
                 reload_notice = if (result.report_reload)
                     try app.alloc.dupe(u8, started)
                 else
@@ -1456,7 +1515,6 @@ pub fn Handlers(comptime App: type) type {
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "appearance_menu")) app.input_runtime.appearance_menu.close();
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "sandbox_menu")) app.input_runtime.sandbox_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }
@@ -1541,6 +1599,10 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             var snapshot = app.creditsProvider().fetch(app.alloc, .{
                 .credential = app.auth.apiKey(),
+                .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                    app.auth.credentialSource()
+                else
+                    null,
                 .tenant = app.auth.gatewayTeam(),
             });
             defer snapshot.deinit(app.alloc);
@@ -1593,21 +1655,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             };
             try applySettingsCatalogChange(app, change);
-        }
-
-        fn commandHandleSandbox(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-                closeHelpMenuIfPresent(app);
-                app.input_runtime.settings_menu.close();
-                closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.sandbox_menu.open();
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            try handleSandboxCommand(app, rest);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -1770,15 +1817,10 @@ fn buildTraceReport(app: anytype) ![]u8 {
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
     try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
     try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
-    try out.writer.print("model: {s}\n", .{app.selected_model.items});
+    try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
-    const sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-        app.permission_engine.mode,
-        app.permission_state.sandbox_backend,
-    )).label();
-    try out.writer.print("sandbox: {s}\n", .{sandbox_label});
     try out.writer.print("workspace: {s}\n", .{app.workspace_root});
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
@@ -3028,45 +3070,6 @@ fn persistMaxxingModeSetting(app: anytype, next: presentation_mode.MaxxingMode, 
     try persistUserPreferences(app, "maxxing", patch, runtime_changed);
 }
 
-fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-
-    const mode = sandbox.PublicMode.parse(trimmed) orelse {
-        debug_trace.logf("core", "sandbox command rejected arg_bytes={d}", .{trimmed.len});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .@"error", .body = "Use: os, none" }, true);
-        return;
-    };
-
-    if (mode == .os and !sandbox.osSandboxAvailable()) {
-        debug_trace.logf("core", "sandbox command rejected mode=os reason=unsupported_os_sandbox", .{});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = sandbox.unsupported_os_sandbox_message }, true);
-        return;
-    }
-
-    const parsed = sandbox.backendForPublicMode(mode);
-    const changed = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(app, parsed);
-
-    if (!changed) {
-        persistSandboxSetting(app, mode.label()) catch |err| {
-            try writeSandboxPersistenceFailure(app, err);
-        };
-        debug_trace.logf("core", "sandbox command unchanged mode={s}", .{mode.label()});
-        const msg = try std.fmt.allocPrint(app.alloc, "already set to {s}", .{mode.label()});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    persistSandboxSetting(app, mode.label()) catch |err| {
-        try writeSandboxPersistenceFailure(app, err);
-    };
-
-    debug_trace.logf("core", "sandbox command switched mode={s}", .{mode.label()});
-    const msg = try std.fmt.allocPrint(app.alloc, "switched to {s}", .{mode.label()});
-    defer app.alloc.free(msg);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-}
-
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
@@ -3105,74 +3108,86 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
 
-fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
+const StatuslineFeedback = enum { announce, silent };
 
-    if (std.mem.eql(u8, trimmed, "sandbox")) {
-        app.statusline_sandbox = !app.statusline_sandbox;
-        const label: []const u8 = if (app.statusline_sandbox) "on" else "off";
-        persistStatuslineSetting(app, "sandbox", app.statusline_sandbox) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "sandbox active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "sandbox: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
+fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    inline for (std.meta.fields(config_runtime.StatuslineItem)) |field| {
+        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
     }
-
-    if (std.mem.eql(u8, trimmed, "context")) {
-        app.statusline_context = !app.statusline_context;
-        const label: []const u8 = if (app.statusline_context) "on" else "off";
-        persistStatuslineSetting(app, "context", app.statusline_context) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "context active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "context: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    if (std.mem.eql(u8, trimmed, "session")) {
-        app.statusline_session = !app.statusline_session;
-        const label: []const u8 = if (app.statusline_session) "on" else "off";
-        persistStatuslineSetting(app, "session", app.statusline_session) catch |err| {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
-                "session active for this process but not saved to user settings ({s})",
-                .{@errorName(err)},
-            );
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .warning, .body = notice }, true);
-        };
-        const msg = try std.fmt.allocPrint(app.alloc, "session: {s}", .{label});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    try app.writeDomainNotice(.{ .topic = "statusline", .tone = .@"error", .body = "Use: sandbox, context, session" }, true);
+    return null;
 }
 
-fn persistStatuslineSetting(app: anytype, key: []const u8, value: bool) !void {
-    const item: config_runtime.UserSettingsPatch = if (std.mem.eql(u8, key, "sandbox"))
-        .{ .statusline_item = .{ .item = .sandbox, .enabled = value } }
-    else if (std.mem.eql(u8, key, "session"))
-        .{ .statusline_item = .{ .item = .session, .enabled = value } }
-    else
-        .{ .statusline_item = .{ .item = .context, .enabled = value } };
-    try persistUserPreferences(app, "statusline", item, true);
+fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime.StatuslineItem {
+    return switch (setting) {
+        .statusline_context => .context,
+        .statusline_session => .session,
+        .statusline_workspace => .workspace,
+        else => null,
+    };
+}
+
+fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool {
+    const App = @TypeOf(app.*);
+    return switch (item) {
+        .context => app.statusline_context,
+        .session => app.statusline_session,
+        .workspace => if (comptime @hasField(App, "workspace_identity"))
+            app.workspace_identity.enabled
+        else
+            false,
+    };
+}
+
+fn assignStatuslineItem(app: anytype, item: config_runtime.StatuslineItem, enabled: bool) bool {
+    const App = @TypeOf(app.*);
+    const current = statuslineItemEnabled(app, item);
+    switch (item) {
+        .context => app.statusline_context = enabled,
+        .session => app.statusline_session = enabled,
+        .workspace => if (comptime @hasField(App, "workspace_identity")) {
+            app.workspace_identity.enabled = enabled;
+        },
+    }
+    return current != enabled;
+}
+
+fn applyStatuslineItem(
+    app: anytype,
+    item: config_runtime.StatuslineItem,
+    enabled: bool,
+    feedback: StatuslineFeedback,
+) !void {
+    const runtime_changed = assignStatuslineItem(app, item, enabled);
+    const patch: config_runtime.UserSettingsPatch = .{
+        .statusline_item = .{ .item = item, .enabled = enabled },
+    };
+    switch (feedback) {
+        .announce => {
+            try persistUserPreferences(app, "statusline", patch, runtime_changed);
+            const message = try std.fmt.allocPrint(
+                app.alloc,
+                "{s}: {s}",
+                .{ @tagName(item), if (enabled) "on" else "off" },
+            );
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "statusline", .tone = .neutral, .body = message }, true);
+        },
+        .silent => try persistUserPreferencesSilently(app, "statusline", patch, runtime_changed),
+    }
+    app.shell.render_requests.request(.footer);
+}
+
+fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
+    const item = parseStatuslineItem(rest) orelse {
+        try app.writeDomainNotice(.{
+            .topic = "statusline",
+            .tone = .@"error",
+            .body = "Use: context, session, workspace",
+        }, true);
+        return;
+    };
+    try applyStatuslineItem(app, item, !statuslineItemEnabled(app, item), .announce);
 }
 
 const SoundLevel = enum {
@@ -3266,11 +3281,11 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
 pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     const App = @TypeOf(app.*);
     var snapshot: settings_catalog.Snapshot = .{};
-    if (comptime @hasField(App, "selected_model")) snapshot.model = app.selected_model.items;
+    if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
-    if (comptime @hasDecl(App, "resolvedModelCapabilities") and @hasField(App, "selected_model")) {
-        const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+    if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
+        const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
     }
@@ -3287,9 +3302,9 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.maxxing_mode = app.shell.maxxing_mode.label();
         }
     }
-    if (comptime @hasField(App, "statusline_sandbox")) snapshot.statusline_sandbox = app.statusline_sandbox;
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
+    if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
@@ -3298,9 +3313,6 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             notifications.attention_required,
             notifications.max,
         );
-    }
-    if (comptime @hasField(App, "permission_state")) {
-        snapshot.sandbox = sandbox.publicModeForBackend(app.permission_state.sandbox_backend).label();
     }
     return snapshot;
 }
@@ -3334,53 +3346,14 @@ pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Cha
                 runtime_changed,
             );
         },
-        .statusline_sandbox, .statusline_context, .statusline_session => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            const runtime_changed = switch (change.setting) {
-                .statusline_sandbox => blk: {
-                    const changed = enabled != app.statusline_sandbox;
-                    app.statusline_sandbox = enabled;
-                    break :blk changed;
-                },
-                .statusline_context => blk: {
-                    const changed = enabled != app.statusline_context;
-                    app.statusline_context = enabled;
-                    break :blk changed;
-                },
-                .statusline_session => blk: {
-                    const changed = enabled != app.statusline_session;
-                    app.statusline_session = enabled;
-                    break :blk changed;
-                },
-                else => unreachable,
-            };
-            const item: config_runtime.UserSettingsPatch = switch (change.setting) {
-                .statusline_sandbox => .{ .statusline_item = .{ .item = .sandbox, .enabled = enabled } },
-                .statusline_context => .{ .statusline_item = .{ .item = .context, .enabled = enabled } },
-                .statusline_session => .{ .statusline_item = .{ .item = .session, .enabled = enabled } },
-                else => unreachable,
-            };
-            try persistUserPreferencesSilently(app, "statusline", item, runtime_changed);
-        },
-        .sandbox => {
-            const mode = sandbox.PublicMode.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (mode == .os and !sandbox.osSandboxAvailable()) {
-                try app.writeDomainNotice(.{
-                    .topic = "sandbox",
-                    .tone = .warning,
-                    .body = sandbox.unsupported_os_sandbox_message,
-                }, true);
-                return;
-            }
-            _ = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(
+            try applyStatuslineItem(
                 app,
-                sandbox.backendForPublicMode(mode),
+                statuslineItemForSetting(change.setting).?,
+                enabled,
+                .silent,
             );
-            var outcome = config_runtime.setSandbox(app.alloc, app.workspace_root, mode.label()) catch |err| {
-                try writeSandboxPersistenceFailure(app, err);
-                return;
-            };
-            outcome.deinit(app.alloc);
         },
         else => try applySettingsCatalogChange(app, change),
     }
@@ -3412,17 +3385,12 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .model => unreachable,
         .input_appearance => try handleInputAppearanceCommand(app, change.value),
         .maxxing_mode => try handleMaxxingCommand(app, change.value),
-        .statusline_sandbox => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_sandbox) try handleStatuslineCommand(app, "sandbox");
-        },
-        .statusline_context => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_context) try handleStatuslineCommand(app, "context");
-        },
-        .statusline_session => {
-            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (enabled != app.statusline_session) try handleStatuslineCommand(app, "session");
+            const item = statuslineItemForSetting(change.setting).?;
+            if (enabled != statuslineItemEnabled(app, item)) {
+                try applyStatuslineItem(app, item, enabled, .announce);
+            }
         },
         .slash_menu_categories => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -3441,12 +3409,12 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .effort => {
             const effort = types.ReasoningEffort.parseDisplayLabel(change.value) orelse
                 return error.InvalidSettingsCatalogValue;
-            const capabilities = app.resolvedModelCapabilities(app.selected_model.items);
+            const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
                 const message = try std.fmt.allocPrint(
                     app.alloc,
                     "{s} is not available for {s}",
-                    .{ effort.displayLabel(), app.selected_model.items },
+                    .{ effort.displayLabel(), provider_runtime.model(app) },
                 );
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
@@ -3460,7 +3428,6 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
-        .sandbox => try handleSandboxCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try session_commands.Commands(@TypeOf(app.*)).handleSettings(
@@ -3479,30 +3446,6 @@ fn parseOnOff(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "on")) return true;
     if (std.mem.eql(u8, value, "off")) return false;
     return null;
-}
-
-fn persistSandboxSetting(app: anytype, label: []const u8) !void {
-    if (@hasDecl(@TypeOf(app.*), "persistSandbox")) {
-        try app.persistSandbox(label);
-    } else {
-        var outcome = try config_runtime.setSandbox(app.alloc, app.workspace_root, label);
-        defer outcome.deinit(app.alloc);
-    }
-    try app.writeDomainNotice(.{
-        .topic = "sandbox",
-        .tone = .neutral,
-        .body = "saved to local settings (scope=local)",
-    }, true);
-}
-
-fn writeSandboxPersistenceFailure(app: anytype, err: anyerror) !void {
-    const notice = try std.fmt.allocPrint(
-        app.alloc,
-        "active for this process but not saved to local settings (scope=local, error={s})",
-        .{@errorName(err)},
-    );
-    defer app.alloc.free(notice);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = notice }, true);
 }
 
 const SurfaceOnlyApp = struct {};
@@ -3562,7 +3505,14 @@ const CreditsCommandFakeApp = struct {
 };
 
 const McpCommandFakeApp = struct {
-    const ReloadBehavior = enum { published, retained, failed };
+    const ReloadBehavior = enum {
+        published_empty,
+        published_healthy,
+        published_degraded,
+        retained,
+        completion_failed,
+        begin_failed,
+    };
 
     alloc: std.mem.Allocator,
     notice_body: std.ArrayList(u8) = .empty,
@@ -3571,7 +3521,7 @@ const McpCommandFakeApp = struct {
     notice_count: usize = 0,
     last_topic: ?[]const u8 = null,
     last_tone: ?types.NoticeTone = null,
-    reload_behavior: ReloadBehavior = .published,
+    reload_behavior: ReloadBehavior = .published_empty,
     reload_pending: bool = false,
 
     fn deinit(self: *McpCommandFakeApp) void {
@@ -3617,7 +3567,7 @@ const McpCommandFakeApp = struct {
 
     fn beginMcpReload(self: *McpCommandFakeApp) !void {
         self.reload_count += 1;
-        if (self.reload_behavior == .failed) return error.TestReloadFailed;
+        if (self.reload_behavior == .begin_failed) return error.TestReloadFailed;
         self.reload_pending = true;
     }
 
@@ -3625,14 +3575,39 @@ const McpCommandFakeApp = struct {
         if (!self.reload_pending) return null;
         self.reload_pending = false;
         return switch (self.reload_behavior) {
-            .published => .{ .outcome = .{ .published = .{ .generation = null, .health = .ready } } },
+            .published_empty => .{ .outcome = .{ .published = .{
+                .generation = null,
+                .health = .ready,
+                .configured_server_count = 0,
+                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
+            } } },
+            .published_healthy => .{ .outcome = .{ .published = .{
+                .generation = 42,
+                .health = .ready,
+                .configured_server_count = 1,
+                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
+            } } },
+            .published_degraded => degraded: {
+                const names = try self.alloc.alloc([]u8, 2);
+                errdefer self.alloc.free(names);
+                names[0] = try self.alloc.dupe(u8, "alpha");
+                errdefer self.alloc.free(names[0]);
+                names[1] = try self.alloc.dupe(u8, "beta");
+                break :degraded .{ .outcome = .{ .published = .{
+                    .generation = 43,
+                    .health = .degraded,
+                    .configured_server_count = 3,
+                    .unavailable_server_names = names,
+                } } };
+            },
             .retained => .{ .outcome = .{
                 .retained_required_failure = try self.alloc.dupe(
                     u8,
                     "Required MCP server 'fixture' failed to start.",
                 ),
             } },
-            .failed => unreachable,
+            .completion_failed => .{ .failed = error.TestReloadFailed },
+            .begin_failed => unreachable,
         };
     }
 
@@ -3689,16 +3664,6 @@ test "quit command requests resume handoff before exit" {
     );
 }
 
-const SandboxCommandFakeWorker = struct {
-    synced: ?worker_runtime.PermissionSnapshot = null,
-    sync_count: usize = 0,
-
-    pub fn syncQueuedPromptPermissionSnapshot(self: *SandboxCommandFakeWorker, snapshot: worker_runtime.PermissionSnapshot) void {
-        self.synced = snapshot;
-        self.sync_count += 1;
-    }
-};
-
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
         copied,
@@ -3748,37 +3713,6 @@ const ClipboardCommandFakeApp = struct {
         self.last_topic = notice.topic;
         self.last_tone = notice.tone;
         self.last_body = notice.body;
-    }
-};
-
-const SandboxCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    workspace_root: []const u8 = "/tmp/workspace",
-    permission_state: app_permission_runtime.State = .{},
-    permission_engine: struct { mode: types.PermissionMode = .auto } = .{},
-    worker: SandboxCommandFakeWorker = .{},
-    transcript: std.ArrayList(u8) = .empty,
-    persisted: std.ArrayList(u8) = .empty,
-    persist_calls: usize = 0,
-    persist_error: ?anyerror = null,
-    last_tone: ?types.NoticeTone = null,
-
-    fn deinit(self: *SandboxCommandFakeApp) void {
-        self.transcript.deinit(self.alloc);
-        self.persisted.deinit(self.alloc);
-    }
-
-    noinline fn writeDomainNotice(self: *SandboxCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.last_tone = notice.tone;
-        try self.transcript.appendSlice(self.alloc, notice.body);
-        try self.transcript.append(self.alloc, '\n');
-    }
-
-    fn persistSandbox(self: *SandboxCommandFakeApp, label: []const u8) !void {
-        self.persist_calls += 1;
-        if (self.persist_error) |err| return err;
-        self.persisted.clearRetainingCapacity();
-        try self.persisted.appendSlice(self.alloc, label);
     }
 };
 
@@ -3962,10 +3896,6 @@ const ChangeCommandFakeApp = struct {
     }
 };
 
-fn runSandboxCommandForTest(app: *SandboxCommandFakeApp, rest: []const u8) !void {
-    try handleSandboxCommand(app, rest);
-}
-
 fn runInputAppearanceCommandForTest(app: *InputAppearanceCommandFakeApp, rest: []const u8) !void {
     try handleInputAppearanceCommand(app, rest);
 }
@@ -4003,13 +3933,6 @@ fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: [
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn expectNoHiddenSandboxLabels(text: []const u8) !void {
-    try std.testing.expect(std.mem.find(u8, text, "macos") == null);
-    try std.testing.expect(std.mem.find(u8, text, "auto") == null);
-    try std.testing.expect(std.mem.find(u8, text, "vercel") == null);
-    try std.testing.expect(std.mem.find(u8, text, "just-bash") == null);
 }
 
 test "trace notice distinguishes Markdown file outcomes without a feedback CTA" {
@@ -4313,7 +4236,7 @@ test "app_commands renders transactional status for explicit MCP reload" {
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "MCP reconnection started. The existing runtime remains active until replacement completes.",
+        "MCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
         app.notice_body.items,
     );
     try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
@@ -4321,8 +4244,43 @@ test "app_commands renders transactional status for explicit MCP reload" {
     try std.testing.expect(std.mem.endsWith(
         u8,
         app.notice_body.items,
-        "MCP profile reloaded (ready; no servers configured).",
+        "MCP configuration reloaded. No servers are configured.",
     ));
+}
+
+test "app_commands explains healthy and degraded MCP reloads without internal state" {
+    const cases = [_]struct {
+        behavior: McpCommandFakeApp.ReloadBehavior,
+        tone: types.NoticeTone,
+        expected: []const u8,
+    }{
+        .{
+            .behavior = .published_healthy,
+            .tone = .neutral,
+            .expected = "MCP configuration reloaded successfully.",
+        },
+        .{
+            .behavior = .published_degraded,
+            .tone = .warning,
+            .expected = "MCP configuration reloaded, but 2 servers are unavailable: 'alpha', 'beta'. Run /mcp list for details.",
+        },
+    };
+
+    for (cases) |case| {
+        var app = McpCommandFakeApp{
+            .alloc = std.testing.allocator,
+            .reload_behavior = case.behavior,
+        };
+        defer app.deinit();
+
+        try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "reload");
+        try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
+
+        try std.testing.expectEqual(case.tone, app.last_tone.?);
+        try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, case.expected));
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "runtime 42") == null);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "degraded") == null);
+    }
 }
 
 test "app_commands preserves command display after implicit MCP reload" {
@@ -4336,15 +4294,15 @@ test "app_commands preserves command display after implicit MCP reload" {
     try std.testing.expectEqualStrings("mcp", app.last_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
     try std.testing.expectEqualStrings(
-        "Authenticated MCP server 'fixture'.\nMCP reconnection started. The existing runtime remains active until replacement completes.",
+        "Authenticated MCP server 'fixture'.\nMCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
         app.notice_body.items,
     );
     try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
     try std.testing.expectEqual(@as(usize, 2), app.notice_count);
 }
 
-test "app_commands warns when implicit MCP reload retains the active runtime" {
-    for ([_]McpCommandFakeApp.ReloadBehavior{ .retained, .failed }) |behavior| {
+test "app_commands warns when implicit MCP reload cannot replace the active servers" {
+    for ([_]McpCommandFakeApp.ReloadBehavior{ .retained, .completion_failed, .begin_failed }) |behavior| {
         var app = McpCommandFakeApp{
             .alloc = std.testing.allocator,
             .reload_behavior = behavior,
@@ -4356,7 +4314,7 @@ test "app_commands warns when implicit MCP reload retains the active runtime" {
         try std.testing.expectEqual(@as(usize, 1), app.reload_count);
         try std.testing.expectEqual(@as(usize, 1), app.notice_count);
         try std.testing.expectEqualStrings("mcp", app.last_topic.?);
-        if (behavior == .retained) {
+        if (behavior != .begin_failed) {
             try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
             try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
             try std.testing.expectEqual(@as(usize, 2), app.notice_count);
@@ -4364,16 +4322,18 @@ test "app_commands warns when implicit MCP reload retains the active runtime" {
             try std.testing.expect(std.mem.find(
                 u8,
                 app.notice_body.items,
-                "MCP reload rejected; the existing runtime was retained.",
+                "MCP configuration could not be reloaded. Your existing MCP servers are still active.",
             ) != null);
         } else {
             try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
             try std.testing.expect(std.mem.find(
                 u8,
                 app.notice_body.items,
-                "MCP reload rejected; the existing runtime was retained.",
+                "MCP configuration could not be reloaded. Your existing MCP servers are still active.",
             ) != null);
         }
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "TestReloadFailed") == null);
+        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "/mcp list") != null);
     }
 }
 
@@ -4743,102 +4703,4 @@ test "maxxing command accepts normal as a hidden legacy alias" {
 
     try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
     try std.testing.expectEqualStrings("legacy", app.persisted_mode);
-}
-
-test "sandbox command unknown argument prints only public usage" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "vercel");
-
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: os, none") != null);
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command switches and persists canonical public labels" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    if (@import("builtin").os.tag == .macos) {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.worker.synced.?.sandbox_backend);
-        try std.testing.expectEqualStrings("os", app.persisted.items);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to os") != null);
-    } else {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-        try std.testing.expectEqual(@as(usize, 0), app.persist_calls);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "operating system sandbox is not available") != null);
-    }
-
-    app.permission_state.sandbox_backend = .macos;
-    app.persisted.clearRetainingCapacity();
-    app.persist_calls = 0;
-    app.transcript.clearRetainingCapacity();
-    try runSandboxCommandForTest(&app, "none");
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command persists explicit unchanged public label" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command reports runtime state when local persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .permission_state = .{ .sandbox_backend = .macos },
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.persisted.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        app.transcript.items,
-        "active for this process but not saved to local settings (scope=local, error=AccessDenied)",
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-}
-
-test "sandbox unchanged selection stays explicit when persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "active for this process but not saved") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
 }

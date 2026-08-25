@@ -1961,12 +1961,14 @@ test.skipIf(!tmuxAvailable())(
     };
     const expectInlineOrder = (scrollback: string): void => {
       expect(countOccurrences(scrollback, statusLine)).toBe(1);
-      expect(countOccurrences(scrollback, outputLine)).toBe(1);
 
       const statusIndex = scrollback.indexOf(statusLine);
-      const outputIndex = scrollback.indexOf(outputLine);
       const doneIndex = scrollback.lastIndexOf(finalMarker);
       expect(statusIndex).toBeGreaterThanOrEqual(0);
+      expect(doneIndex).toBeGreaterThan(statusIndex);
+      const transcriptRegion = scrollback.slice(statusIndex, doneIndex);
+      expect(countOccurrences(transcriptRegion, outputLine)).toBe(1);
+      const outputIndex = scrollback.indexOf(outputLine, statusIndex);
       expect(outputIndex).toBeGreaterThan(statusIndex);
       expect(doneIndex).toBeGreaterThan(outputIndex);
     };

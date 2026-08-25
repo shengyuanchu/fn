@@ -11,6 +11,7 @@ not affiliated with or endorsed by Vercel.
 
 - OpenAI Chat Completions and Responses APIs
 - Anthropic Messages API
+- ChatGPT Codex and Grok subscription sign-in inherited from fx
 - Local models through oMLX, MLXTP, MLX Serve, MLX, Ollama, LM Studio,
   llama.cpp, and compatible servers
 - Native Zig binary with built-in coding tools
@@ -26,6 +27,8 @@ curl -fsSL https://raw.githubusercontent.com/shengyuanchu/fn/main/install.sh | s
 Endpoints may be a bare host, a base URL, a `/v1` URL, or a full API route.
 OpenAI endpoints default to Chat Completions; use a full Responses route to
 select the Responses API.
+
+For subscription access, run `fn login codex` or `fn login grok`.
 
 ### OpenAI Responses
 
