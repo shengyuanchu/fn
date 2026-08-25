@@ -177,7 +177,7 @@ fn testToolSpec() tool_dispatch.Tool {
     return .{
         .name = "web_search",
         .description = "Web search test spec.",
-        .gateway_schema = .{
+        .model_schema = .{
             .name = "web_search",
             .description = "Web search test spec.",
         },

@@ -9,14 +9,11 @@ const worker_runtime = @import("../../worker_runtime.zig");
 const background_runtime = @import("../../../background/background_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
-const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
-const gateway_json = @import("../../../gateway/gateway_json.zig");
-const gateway_failure_diagnostics = @import("../../../gateway/gateway_failure_diagnostics.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
@@ -202,6 +199,8 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
 pub const FakeCompletion = struct {
     status: std.http.Status = .ok,
     err_body: ?[]const u8 = null,
+    failure_schema: ?[]const u8 = null,
+    failure_request_shape: ?[]const u8 = null,
     retry_after_seconds: ?u64 = null,
     pre_send_error: ?anyerror = null,
     stream_error: ?anyerror = null,
@@ -261,17 +260,20 @@ pub const FakeGateway = struct {
     fn stream(
         self: *FakeGateway,
         alloc: Allocator,
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
     ) !agent_stream_provider.Result {
-        try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, request.payload));
+        const payload = try builtin_gateway.buildAgentRequest(alloc, request.data());
+        defer alloc.free(payload);
+        try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
-        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.api_key));
+        try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret));
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        try request.admission.admit();
 
         if (completion.pre_send_error) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -291,24 +293,20 @@ pub const FakeGateway = struct {
         }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
-            return .{ .status = .ok };
+            return .{ .completed = .{} };
         }
 
-        if (request.on_reasoning_chunk) |reasoning| {
-            for (completion.reasoning_chunks) |chunk| reasoning(request.callback_ctx, chunk);
-        }
+        for (completion.reasoning_chunks) |chunk| request.events.emit(.{ .reasoning_delta = chunk });
         for (completion.chunks) |chunk| {
-            request.on_content_chunk(request.callback_ctx, chunk);
+            request.events.emit(.{ .content_delta = chunk });
         }
         if (completion.cancel_after_chunks) request.cancel_flag.store(true, .seq_cst);
         if (completion.stream_error_after_chunks) |err| {
             recordNetworkFailureEvidence(request, err);
             return err;
         }
-        if (request.on_tool_start) |start| {
-            for (completion.streamed_tool_starts) |call| {
-                start(request.callback_ctx, call.id, call.name, null);
-            }
+        for (completion.streamed_tool_starts) |call| {
+            request.events.emit(.{ .tool_started = .{ .id = call.id, .name = call.name } });
         }
         if (completion.stream_error_after_tool_starts) |err| {
             recordNetworkFailureEvidence(request, err);
@@ -320,19 +318,23 @@ pub const FakeGateway = struct {
         }
         if (completion.status != .ok) {
             const err_body = if (completion.err_body) |body| try alloc.dupe(u8, body) else null;
-            const diagnostics = gateway_failure_diagnostics.collect(alloc, request.payload, err_body);
-            return .{
-                .status = completion.status,
-                .err_body = err_body,
+            errdefer if (err_body) |value| alloc.free(value);
+            const failure_schema = if (completion.failure_schema) |value| try alloc.dupe(u8, value) else null;
+            errdefer if (failure_schema) |value| alloc.free(value);
+            const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
+            return .{ .failed = .{
+                .kind = failureKind(completion.status),
+                .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
-                .failure_schema = diagnostics.schema,
-                .failure_request_shape = diagnostics.request_shape,
+                .diagnostics = .{
+                    .schema = failure_schema,
+                    .request_shape = failure_request_shape,
+                },
                 .ownership = .owned,
-            };
+            } };
         }
 
-        return .{
-            .status = .ok,
+        return .{ .completed = .{
             .completion = .{
                 .content = completion.content,
                 .tool_calls = completion.tool_calls,
@@ -345,18 +347,57 @@ pub const FakeGateway = struct {
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
                 .usage = completion.usage,
             },
-            .generation_origin = "https://ai-gateway.vercel.sh",
-        };
+            .usage = .{ .unavailable = .possibly_billed },
+        } };
     }
 
     fn recordNetworkFailureEvidence(
-        request: agent_stream_provider.Request,
+        request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
-            err,
-            request.delivery.load(),
-        );
+        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
+            .system_resumed
+        else if (err == error.TlsInitializationFailed or
+            err == error.ConnectionSetupTimedOut or
+            err == error.UnknownHostName or
+            err == error.NameServerFailure or
+            err == error.NoAddressReturned or
+            err == error.DetectingNetworkConfigurationFailed or
+            err == error.AddressUnavailable or
+            err == error.ConnectionPending or
+            err == error.ConnectionRefused or
+            err == error.HostUnreachable or
+            err == error.NetworkUnreachable or
+            err == error.NetworkDown or
+            err == error.WouldBlock or
+            err == error.WriteFailed or
+            err == error.ReadFailed or
+            err == error.HttpConnectionClosing or
+            err == error.ConnectionResetByPeer or
+            err == error.ConnectionTimedOut or
+            err == error.Timeout)
+            .transport_interrupted
+        else
+            return;
+        request.attempt_evidence.network_failure = .{
+            .cause = cause,
+            .delivery = request.delivery.load(),
+        };
+    }
+
+    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
+        return switch (status) {
+            .bad_request => .invalid_request,
+            .unauthorized => .unauthorized,
+            .forbidden => .forbidden,
+            .payload_too_large => .request_too_large,
+            .too_many_requests => .rate_limited,
+            .internal_server_error => .server_error,
+            .bad_gateway => .bad_gateway,
+            .service_unavailable => .unavailable,
+            .gateway_timeout => .gateway_timeout,
+            else => .provider_error,
+        };
     }
 };
 
@@ -368,7 +409,7 @@ pub const ModelCapabilityOverride = struct {
 fn fakeGatewayStream(
     context: ?*anyopaque,
     alloc: Allocator,
-    request: agent_stream_provider.Request,
+    request: agent_stream_provider.ModelRequest,
 ) !agent_stream_provider.Result {
     const gateway: *FakeGateway = @ptrCast(@alignCast(context.?));
     return gateway.stream(alloc, request);
@@ -429,6 +470,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    root_permission_mode: ?PermissionMode = null,
     execute_mutex: std.Io.Mutex = .init,
     log: std.ArrayList([]u8) = .empty,
     texts: std.ArrayList([]u8) = .empty,
@@ -442,7 +484,6 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_review_models: std.ArrayList([]u8) = .empty,
     permission_review_target_call_ids: std.ArrayList([]u8) = .empty,
     permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
-    permission_review_phases: std.ArrayList(permission_auto_classifier.AutoPermissionPhase) = .empty,
     permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
     permission_review_feedback_counts: std.ArrayList(usize) = .empty,
     permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
@@ -460,6 +501,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_root_user_intent_context: ?[]u8 = null,
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
+    last_execute_permission_mode: ?PermissionMode = null,
     propagated_grants: std.ArrayList(PermissionGrant) = .empty,
     event_grants: std.ArrayList(PermissionGrant) = .empty,
     last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
@@ -579,6 +621,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_fast_mode: bool = false,
     last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    default_model_capabilities: model_capabilities.Capabilities = .{
+        .prompt_caching = true,
+        .context_window = 1_000_000,
+    },
     capability_overrides: []const ModelCapabilityOverride = &.{},
     available_capability_overrides: []const ModelCapabilityOverride = &.{},
     capability_queries: std.ArrayList([]u8) = .empty,
@@ -616,7 +662,6 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.permission_review_models);
         freeStringList(self.alloc, &self.permission_review_target_call_ids);
         self.permission_review_origins.deinit(self.alloc);
-        self.permission_review_phases.deinit(self.alloc);
         self.permission_review_root_authority_counts.deinit(self.alloc);
         self.permission_review_feedback_counts.deinit(self.alloc);
         self.permission_review_pending_call_counts.deinit(self.alloc);
@@ -668,6 +713,10 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .snapshot_root_permission_mode = if (self.root_permission_mode != null)
+                snapshotRootPermissionMode
+            else
+                null,
             .finalize_turn = finalizeTurn,
             .prepare_parent_turn_context = prepareParentTurnContext,
             .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
@@ -725,6 +774,11 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
+    fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.root_permission_mode.?;
+    }
+
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.capability_queries.append(self.alloc, try self.alloc.dupe(u8, model));
@@ -736,7 +790,7 @@ pub const FakeAgentRuntimeDeps = struct {
             for (self.capability_overrides) |override| {
                 if (std.mem.eql(u8, override.model, model)) break :blk override.capabilities;
             }
-            break :blk model_capabilities.capabilitiesForModel(model);
+            break :blk self.default_model_capabilities;
         };
         if (self.cancel_after_capability_resolution) |cancel_flag| {
             cancel_flag.store(true, .seq_cst);
@@ -749,7 +803,7 @@ pub const FakeAgentRuntimeDeps = struct {
         for (self.available_capability_overrides) |override| {
             if (std.mem.eql(u8, override.model, model)) return override.capabilities;
         }
-        return model_capabilities.capabilitiesForModel(model);
+        return self.default_model_capabilities;
     }
 
     fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
@@ -905,7 +959,6 @@ pub const FakeAgentRuntimeDeps = struct {
         const result = results[index] orelse return null;
         return permission_auto_classifier.Result{
             .risk = result.risk,
-            .authorization = result.authorization,
             .decision = result.decision,
             .rationale = try arena.dupe(u8, result.rationale),
         };
@@ -951,10 +1004,6 @@ pub const FakeAgentRuntimeDeps = struct {
             try self.alloc.dupe(u8, review_turn.target_call_id),
         );
         try self.permission_review_origins.append(self.alloc, review_turn.origin);
-        try self.permission_review_phases.append(
-            self.alloc,
-            review_turn.auto_permission_phase,
-        );
         try self.permission_review_root_authority_counts.append(
             self.alloc,
             @intFromBool(review_turn.current_root_request.len > 0),
@@ -1264,6 +1313,7 @@ pub const FakeAgentRuntimeDeps = struct {
             }
             self.last_execute_root_user_evidence_complete =
                 request.root_user_evidence_complete;
+            self.last_execute_permission_mode = request.permission_mode;
             try self.record("execute:{s}", .{call.name});
             self.last_execute_grant_count = request.session_grants.len;
             for (self.last_execute_grants.items) |grant| {
@@ -1350,6 +1400,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 1,
                 self.command_replay_capability,
             );
+            capture.setPolicyBeforeCapture(.required);
             capture.appendAccepted(request.result_allocator, .stdout, output);
             capture.seal(request.result_allocator);
             result.command_replay_capture = capture;
@@ -1623,6 +1674,7 @@ pub const PromptFixture = struct {
             .images = self.images[0..],
             .model = @constCast("anthropic/claude-opus-4.6"),
             .api_key = @constCast("key"),
+            .credential_source = .ai_gateway_api_key,
             .permission_mode = .ask,
             .history = self.history[0..],
             .grants = self.grants[0..],
@@ -1635,7 +1687,6 @@ pub const PromptFixture = struct {
             .gateway_retry_count = 1,
             .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
-            .gateway_tools_json = "[]",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
             .workspace_root = self.workspace_root,
@@ -1938,7 +1989,7 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
         const entry = prompt[i];
         if (entry != .object) continue;
         const role = entry.object.get("role") orelse continue;
-        if (role != .string or !std.mem.eql(u8, role.string, gateway_json.roleName(.user))) continue;
+        if (role != .string or !std.mem.eql(u8, role.string, @tagName(types.ChatRole.user))) continue;
         try std.testing.expectEqual(@as(usize, 1), countPromptEntryText(entry, expected_text));
         return;
     }

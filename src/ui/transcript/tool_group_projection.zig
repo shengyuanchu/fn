@@ -280,12 +280,10 @@ fn normalizeCanonicalStatus(
 ) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(text, &index)) {}
-    const marker = if (std.mem.startsWith(u8, text[index..], "●"))
-        "●"
-    else if (std.mem.startsWith(u8, text[index..], "■"))
-        "■"
-    else
-        return null;
+    const markers = [_][]const u8{ "●", "■", "⊘", "↻" };
+    const marker = for (markers) |candidate| {
+        if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
+    } else return null;
     index += marker.len;
     while (skipSgrSequence(text, &index)) {}
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
@@ -1114,6 +1112,28 @@ test "small minimal tool groups surface canonical action targets" {
             "├ Read runtime.zig\n" ++
             "├ Searched snapshot\n" ++
             "└ Editing store.zig",
+        projection.entry_actions.items[0].override.bytes,
+    );
+}
+
+test "minimal tool groups preserve denied and deferred action text" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "⊘ Denied by auto agent zig build\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "↻ Context updated runtime.zig\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("terminal"), .activity_kind = .command, .outcome = .denied },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .deferred },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "● 2 tool calls · 1 read · 1 command · 1 denied · 1 deferred\n" ++
+            "├ Denied by auto agent zig build\n" ++
+            "└ Context updated runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }

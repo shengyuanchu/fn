@@ -2,6 +2,7 @@ const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
+const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
 const max_error_body_bytes = 1024 * 1024;
@@ -32,31 +33,44 @@ pub const Transport = struct {
 };
 
 pub const ProviderContext = struct {
-    build_fn: stream_provider.BuildFn,
+    build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
+    endpoint: Endpoint,
     transport: Transport,
+};
+
+pub const Endpoint = union(enum) {
+    fixed: []const u8,
+    resolve: *const fn () []const u8,
+
+    fn url(self: Endpoint) []const u8 {
+        return switch (self) {
+            .fixed => |fixed| fixed,
+            .resolve => |resolve| resolve(),
+        };
+    }
 };
 
 pub fn provider(context: *ProviderContext) stream_provider.Provider {
     return .{
         .context = context,
-        .build_fn = build,
         .stream_fn = stream,
     };
 }
 
-pub fn initContext(build_fn: stream_provider.BuildFn, transport: Transport) ProviderContext {
-    return .{ .build_fn = build_fn, .transport = transport };
+pub fn initContext(
+    build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
+    endpoint: Endpoint,
+    transport: Transport,
+) ProviderContext {
+    return .{ .build_fn = build_fn, .endpoint = endpoint, .transport = transport };
 }
 
-fn build(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.BuildRequest) anyerror![]u8 {
-    const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
-    return context.build_fn(null, alloc, request);
-}
-
-fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) anyerror!stream_provider.Result {
+fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
     const context: *ProviderContext = @ptrCast(@alignCast(raw.?));
     const transport = context.transport;
-    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    const payload = try context.build_fn(alloc, request.data());
+    defer alloc.free(payload);
+    const auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer alloc.free(auth);
 
     const Header = struct { name: []const u8, value: []const u8 };
@@ -72,7 +86,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
         .{ .name = "ai-language-model-id", .value = request.model },
         .{ .name = "ai-language-model-streaming", .value = "true" },
     });
-    if (request.team) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
+    if (request.credential.tenant) |team| if (team.len > 0) try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     if (request.session_id) |session_id| if (session_id.len > 0) try headers.appendSlice(alloc, &.{
         .{ .name = "x-session-id", .value = session_id },
         .{ .name = "x-session-affinity", .value = session_id },
@@ -82,8 +96,10 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
     defer headers_json.deinit();
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
+    const endpoint = context.endpoint.url();
+    try request.admission.admit();
     request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", request.chat_url, headers_json.writer.buffered(), request.payload);
+    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), payload);
     if (handle < 0) return error.HostStreamFailed;
     defer transport.close(handle);
 
@@ -98,28 +114,98 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.Request) 
     }
 
     const status: std.http.Status = @enumFromInt(status_code);
-    if (status != .ok) return .{
-        .status = status,
-        .err_body = try readBody(alloc, transport, handle, request.cancel_flag, request.cooperative_pulse),
+    if (status != .ok) return .{ .failed = .{
+        .kind = failureKind(status),
+        .detail = try readBody(alloc, transport, handle, request.cancel_flag, request.cooperative_pulse),
         .ownership = .owned,
-    };
+    } };
 
     var reader: HostStreamReader = undefined;
     reader.init(transport, handle, request.cancel_flag, request.cooperative_pulse);
+    var events = request.events;
     const completion = gateway_client.consumeGatewaySseStream(
         alloc,
         &reader.interface,
-        request.callback_ctx,
-        request.on_content_chunk,
-        request.on_tool_start,
-        request.on_reasoning_chunk,
+        &events,
+        EventBridge.content,
+        EventBridge.toolStart,
+        EventBridge.reasoning,
         request.cancel_flag,
         request.content_capture_limit,
     ) catch |err| switch (err) {
         error.ReadFailed => return if (request.cancel_flag.load(.seq_cst) or reader.aborted) error.Cancelled else error.HostStreamFailed,
         else => return err,
     };
-    return .{ .status = .ok, .completion = completion, .ownership = .owned };
+    return .{ .completed = .{
+        .completion = completion,
+        .usage = gatewayUsageOutcome(request, completion),
+        .ownership = .owned,
+    } };
+}
+
+fn gatewayUsageOutcome(
+    request: stream_provider.ModelRequest,
+    completion: @import("../core/shared/types.zig").ModelCompletion,
+) stream_provider.UsageOutcome {
+    const reference = gatewayUsageReference(request, completion) orelse
+        return .{ .unavailable = .possibly_billed };
+    return if (completion.billing != null)
+        .{ .immediate = reference }
+    else
+        .{ .deferred = reference };
+}
+
+fn gatewayUsageReference(
+    request: stream_provider.ModelRequest,
+    completion: @import("../core/shared/types.zig").ModelCompletion,
+) ?stream_provider.DeferredUsageReference {
+    const generation_id = completion.generation_id orelse return null;
+    const source = request.credential.source orelse return null;
+    return .{
+        .provider = .gateway,
+        .generation_id = generation_id,
+        .scope = gateway_client.generationBaseUrl(),
+        .tenant = request.credential.tenant,
+        .account_id = request.credential.account_id,
+        .credential_source = source,
+        .credential_identity = credential_authority.derive(
+            source,
+            request.credential.account_id,
+        ),
+    };
+}
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
 }
 
 fn pulse(value: ?stream_provider.CooperativePulse) !void {

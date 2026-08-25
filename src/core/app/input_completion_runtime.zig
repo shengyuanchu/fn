@@ -577,28 +577,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        pub fn syncArgCompletionIndex(app: *App) void {
-            const prefix = command_specs.slashCompletionPrefix(
-                app.slashRegistry(),
-                app.input_runtime.edit_state.input.items,
-            ) orelse return;
-            const current_label = currentArgLabel(app, prefix) orelse return;
-            app.input_runtime.picker.slash_completion_index = command_specs.argCompletionIndexForLabel(prefix, current_label) orelse 0;
-            const count = command_specs.slashCompletionCount(app.slashRegistry(), prefix);
-            app.input_runtime.picker.slash_completion_window_start = list_window.updateEdgeStart(
-                0,
-                count,
-                app.input_runtime.picker.slash_completion_index,
-                list_window.default_max_picker_rows,
-            );
-        }
-
-        fn currentArgLabel(app: *App, trimmed: []const u8) ?[]const u8 {
-            if (command_specs.inputArgCompletionPrefix(trimmed) != null)
-                return app.input_runtime.input_appearance.label();
-            return null;
-        }
-
         pub fn hasModelQuery(app: *App) bool {
             return app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null;
         }
@@ -1405,12 +1383,6 @@ const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
         .command = "/resume",
         .help_entry = "/resume",
     },
-    .{
-        .kind = .appearance,
-        .command = "/maxxing",
-        .help_entry = "/maxxing [minimal|normal]",
-        .has_args = true,
-    },
 };
 const inline_completion_test_slash_registry = command_specs.SlashRegistry{
     .commands = inline_completion_test_slash_specs[0..],
@@ -1580,9 +1552,6 @@ test "root slash completion follows multiline and command argument ownership" {
     try app.input_runtime.textReplacementState().replace(alloc, "/resume ");
     try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
     try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
-
-    try app.input_runtime.textReplacementState().replace(alloc, "/maxxing ");
-    try std.testing.expectEqual(@as(usize, 2), rt.visibleSlashCompletionCount(&app));
 }
 
 test "inline skill completion stays inactive when its suffix cannot render" {

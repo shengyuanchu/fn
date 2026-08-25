@@ -40,7 +40,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 38", 5_000);
+      const pane = await session.waitForText("Commands 37", 5_000);
       expect(pane).toContain("General");
       expect(pane).toContain("Enter Open");
       expect(pane).not.toContain("Run /help for commands");
@@ -177,7 +177,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        `${JSON.stringify({ statusLine: { workspace: true } })}\n`,
+        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
       );
       writeFileSync(stderrPath, "");
 
@@ -367,7 +367,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens account and provider actions without source rows",
+    "/setup opens an inline status-first hub",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -386,15 +386,31 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const setup = await session.waitForPane(
         (pane) =>
           pane.includes("Setup") &&
-          pane.includes("Sign in with Vercel") &&
-          pane.includes("Sign in with Codex") &&
-          pane.includes("Sign in with Grok") &&
-          pane.includes("API key") &&
-          pane.includes("Switch provider"),
+          pane.includes("Connections") &&
+          pane.includes("Model provider") &&
+          pane.includes("Vercel team") &&
+          pane.includes("Credential source") &&
+          pane.includes("Enter Open") &&
+          pane.includes("Esc Close"),
         TIMEOUT,
       );
       expect(setup).not.toContain("AI_GATEWAY_API_KEY");
       expect(setup).not.toContain("fx login");
+      expect(setup).not.toContain("Vercel account");
+      expect(setup).not.toContain("run /login");
+
+      for (let index = 0; index < 2; index += 1) {
+        await session.sendKeys("Down");
+      }
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Escape");
+      await session.waitForText("Setup", TIMEOUT);
+      await session.sendKeys("Escape");
+      await session.waitForComposer(TIMEOUT);
     },
     TIMEOUT,
   );

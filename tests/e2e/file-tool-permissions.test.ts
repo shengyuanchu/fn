@@ -203,7 +203,7 @@ describe("external file permissions", () => {
         const trace = readFileSync(tracePath, "utf-8");
         expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
         expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
-        expect(trace).toContain("event=auto_review_result tool_name=write_file decision=allow");
+        expect(trace).toContain("event=auto_review_result tool_name=write_file decision=clear");
         expect(classifiedGateway.classifierRequests).toHaveLength(1);
         const classified = parseFxJson(classifiedResult);
         expect(classified.tool_calls).toContainEqual({ name: "write_file", status: "success" });

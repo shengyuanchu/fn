@@ -3,8 +3,6 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const types = @import("../../shared/types.zig");
 const session_usage = @import("../../session/session_usage.zig");
-const message = @import("../../shared/message.zig");
-const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
@@ -17,163 +15,95 @@ const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 pub const DeliveryCertainty = agent_stream_provider.DeliveryCertainty;
 pub const AttemptEvidence = agent_stream_provider.AttemptEvidence;
 
-pub const StreamResult = struct {
-    status: std.http.Status,
-    completion: types.GatewayCompletion = .{},
-    err_body: ?[]u8 = null,
-    retry_after_seconds: ?u64 = null,
+pub const StreamResult = agent_stream_provider.Result;
+
+const InvocationAdmission = struct {
+    usage: ?*session_usage.Usage,
+    attempt_evidence: *AttemptEvidence,
+    trace_ctx: TraceContext,
+    model: []const u8,
+    observation: ?session_usage.InvocationObservation = null,
+
+    fn admit(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.observation != null) return error.ProviderAdmissionRepeated;
+        self.observation = try session_usage.InvocationObservation.begin(self.usage);
+        self.attempt_evidence.provider_admitted = true;
+        debug_trace.eventf(
+            "agent",
+            "provider_admitted",
+            self.trace_ctx,
+            "model={s}",
+            .{self.model},
+        );
+    }
 };
 
-pub fn streamGatewayCompletion(
+pub fn streamModelCompletion(
     provider: agent_stream_provider.Provider,
     alloc: Allocator,
-    api_key: []const u8,
-    credential_source: ?types.CredentialSource,
-    account_id: ?[]const u8,
-    team: ?[]const u8,
-    session_id: ?[]const u8,
-    model: []const u8,
-    retry_count: usize,
-    chat_url: []const u8,
-    payload: []const u8,
-    cooperative_pulse: ?agent_stream_provider.CooperativePulse,
-    delivery: *DeliveryCertainty,
-    attempt_evidence: *AttemptEvidence,
-    callback_ctx: *anyopaque,
-    on_content_chunk: agent_stream_provider.StreamCallback,
-    on_tool_start: ?agent_stream_provider.ToolStartCallback,
-    on_reasoning_chunk: ?agent_stream_provider.StreamCallback,
-    on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
-    cancel_flag: *std.atomic.Value(bool),
+    request_value: agent_stream_provider.ModelRequest,
     usage: ?*session_usage.Usage,
     usage_allocator: Allocator,
-    trace_ctx: TraceContext,
-    content_capture_limit: ?usize,
-    provider_attempt_owner: agent_stream_provider.ProviderAttemptOwner,
 ) !StreamResult {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request_value.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const started_at_ms = io_mod.milliTimestamp();
-    const usage_observation = try session_usage.GatewayObservation.begin(usage);
-    attempt_evidence.provider_admitted = true;
-    var result = provider.stream(alloc, .{
-        .api_key = api_key,
-        .credential_source = credential_source,
-        .account_id = account_id,
-        .team = team,
-        .session_id = session_id,
-        .model = model,
-        .retry_count = retry_count,
-        .chat_url = chat_url,
-        .payload = payload,
-        .trace_ctx = trace_ctx,
-        .content_capture_limit = content_capture_limit,
-        .delivery = delivery,
-        .attempt_evidence = attempt_evidence,
-        .on_reasoning_chunk = on_reasoning_chunk,
-        .on_tool_input_chunk = on_tool_input_chunk,
-        .cooperative_pulse = cooperative_pulse,
-        .provider_attempt_owner = provider_attempt_owner,
-        .callback_ctx = callback_ctx,
-        .on_content_chunk = on_content_chunk,
-        .on_tool_start = on_tool_start,
-        .cancel_flag = cancel_flag,
-    }) catch |err| {
-        runtime_telemetry.recordGatewayCallMetric(model, started_at_ms, 0, 0, 0, 0, trace_ctx.turn_id, trace_ctx.step_id, trace_ctx.subagent_id, @errorName(err), "");
-        try usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled);
+    var admission = InvocationAdmission{
+        .usage = usage,
+        .attempt_evidence = request_value.attempt_evidence,
+        .trace_ctx = request_value.trace_ctx,
+        .model = request_value.model,
+    };
+    var request = request_value;
+    request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
+    var result = provider.stream(alloc, request) catch |err| {
+        runtime_telemetry.recordGatewayCallMetric(request.model, started_at_ms, 0, 0, 0, 0, request.trace_ctx.turn_id, request.trace_ctx.step_id, request.trace_ctx.subagent_id, @errorName(err), "");
+        if (admission.observation) |observation| try observation.fail(
+            if (request.delivery.load() == .possibly_sent) .ambiguous_delivery else .unbilled,
+        );
         return err;
     };
-    defer result.deinit(alloc);
+    errdefer result.deinit(alloc);
+    const observation = admission.observation orelse
+        return error.ProviderAdmissionMissing;
 
-    recordGatewayResultMetric(
-        model,
-        started_at_ms,
-        result.status,
-        result.completion,
-        result.err_body,
-        result.failure_schema,
-        result.failure_request_shape,
-        trace_ctx,
-    );
-    try usage_observation.complete(
-        usage_allocator,
-        result.status,
-        result.completion,
-        result.generation_origin,
-        team,
-    );
-    if (comptime @import("builtin").os.tag != .wasi) {
-        if (result.reconcile_generation_usage) {
-            if (usage) |ledger| {
-                if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
-                    ledger.clearReconciliationCredential();
-                } else {
-                    ledger.startReconciliation(usage_allocator, api_key);
-                }
+    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
+    switch (result) {
+        .failed => try observation.fail(.unbilled),
+        .completed => |completed| {
+            try observation.complete(
+                usage_allocator,
+                completed.completion,
+                completed.usage,
+            );
+            if (comptime @import("builtin").os.tag != .wasi) {
+                if (std.meta.activeTag(completed.usage) == .deferred) if (usage) |ledger| {
+                    ledger.startDeferredReconciliation(
+                        usage_allocator,
+                        completed.usage.deferred,
+                        request.credential.secret,
+                    );
+                };
             }
-        }
-    }
-
-    if (result.ownership == .borrowed) {
-        return .{
-            .status = result.status,
-            .completion = result.completion,
-            .err_body = result.err_body,
-            .retry_after_seconds = result.retry_after_seconds,
-        };
-    }
-
-    const tool_calls = try dupeGatewayToolCalls(alloc, result.completion.tool_calls);
-    errdefer message.freeToolCalls(alloc, tool_calls);
-    const content = if (result.completion.content) |content_text| try alloc.dupe(u8, content_text) else null;
-    errdefer if (content) |owned| alloc.free(owned);
-    const generation_id = if (result.completion.generation_id) |id| try alloc.dupe(u8, id) else null;
-    errdefer if (generation_id) |owned| alloc.free(owned);
-    const provider_failure_detail = if (result.completion.provider_failure_detail) |detail| try alloc.dupe(u8, detail) else null;
-    errdefer if (provider_failure_detail) |owned| alloc.free(owned);
-    const provider_state_json = if (result.completion.provider_state_json) |state| try alloc.dupe(u8, state) else null;
-    errdefer if (provider_state_json) |owned| alloc.free(owned);
-    const err_body = if (result.err_body) |body| try alloc.dupe(u8, body) else null;
-    errdefer if (err_body) |owned| alloc.free(owned);
-
-    const status = result.status;
-    const finish_reason = result.completion.finish_reason;
-    const completion_usage = result.completion.usage;
-    const delivery_ambiguous = result.completion.delivery_ambiguous;
-    const generation_metadata_invalid = result.completion.generation_metadata_invalid;
-    const provider_result_identity_failure = result.completion.provider_result_identity_failure;
-    const retry_after_seconds = result.retry_after_seconds;
-    return .{
-        .status = status,
-        .completion = .{
-            .content = content,
-            .tool_calls = tool_calls,
-            .generation_id = generation_id,
-            .generation_metadata_invalid = generation_metadata_invalid,
-            .delivery_ambiguous = delivery_ambiguous,
-            .provider_result_identity_failure = provider_result_identity_failure,
-            .provider_failure_detail = provider_failure_detail,
-            .provider_state_json = provider_state_json,
-            .finish_reason = finish_reason,
-            .usage = completion_usage,
         },
-        .err_body = err_body,
-        .retry_after_seconds = retry_after_seconds,
-    };
+    }
+    return result;
 }
 
-fn recordGatewayResultMetric(
+fn recordProviderResultMetric(
     model: []const u8,
     started_at_ms: i64,
-    status: std.http.Status,
-    completion: types.GatewayCompletion,
-    err_body: ?[]const u8,
-    failure_schema: ?[]const u8,
-    failure_request_shape: ?[]const u8,
+    result: agent_stream_provider.Result,
     trace_ctx: TraceContext,
 ) void {
+    const completion: types.ModelCompletion = switch (result) {
+        .completed => |value| value.completion,
+        .failed => .{},
+    };
+    const failure = switch (result) {
+        .completed => null,
+        .failed => |value| value,
+    };
     var response_bytes: u64 = 0;
     if (completion.content) |content| response_bytes += content.len;
     if (completion.provider_state_json) |state| response_bytes += state.len;
@@ -181,19 +111,18 @@ fn recordGatewayResultMetric(
         response_bytes += call.id.len + call.name.len + call.arguments_json.len;
         if (call.provider_result) |pr| response_bytes += pr.len;
     }
-    if (err_body) |body| response_bytes += body.len;
+    if (failure) |value| {
+        if (value.detail) |detail| response_bytes += detail.len;
+    }
     const truncated_bytes: u32 = @intCast(@min(response_bytes, std.math.maxInt(u32)));
     const input_tokens = clampTokenCount(completion.usage.input_tokens);
     const output_tokens = clampTokenCount(completion.usage.output_tokens);
-    const terminal_stop_reason = if (status == .ok)
-        if (completion.finish_reason) |reason| reason.label() else "missing_provider_finish"
-    else
-        "";
+    const terminal_stop_reason = if (completion.finish_reason) |reason| reason.label() else "";
 
     runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
         model,
         started_at_ms,
-        @intFromEnum(status),
+        if (failure) |value| failureMetricCode(value.kind) else 200,
         truncated_bytes,
         input_tokens,
         output_tokens,
@@ -203,10 +132,25 @@ fn recordGatewayResultMetric(
         "",
         terminal_stop_reason,
         .{
-            .schema = failure_schema orelse "",
-            .request_shape = failure_request_shape orelse "",
+            .schema = if (failure) |value| value.diagnostics.schema orelse "" else "",
+            .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
         },
     );
+}
+
+fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
+    return switch (kind) {
+        .invalid_request => 400,
+        .unauthorized => 401,
+        .forbidden => 403,
+        .request_too_large => 413,
+        .rate_limited => 429,
+        .server_error => 500,
+        .bad_gateway => 502,
+        .unavailable => 503,
+        .gateway_timeout => 504,
+        .provider_error => 520,
+    };
 }
 
 fn clampTokenCount(value: ?u64) u32 {
@@ -214,78 +158,40 @@ fn clampTokenCount(value: ?u64) u32 {
     return @intCast(@min(t, std.math.maxInt(u32)));
 }
 
-fn dupeGatewayToolCalls(alloc: Allocator, source: anytype) ![]types.ToolCall {
-    if (source.len == 0) return &.{};
-    const copy = try alloc.alloc(types.ToolCall, source.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].id);
-            alloc.free(copy[i].name);
-            alloc.free(copy[i].arguments_json);
-            if (copy[i].provisional_id) |provisional_id| alloc.free(provisional_id);
-            if (copy[i].provider_result) |provider_result| alloc.free(provider_result);
-        }
-    }
-
-    for (source, 0..) |call, i| {
-        const id = try alloc.dupe(u8, call.id);
-        errdefer alloc.free(id);
-        const name = try alloc.dupe(u8, call.name);
-        errdefer alloc.free(name);
-        const arguments_json = try alloc.dupe(u8, call.arguments_json);
-        errdefer alloc.free(arguments_json);
-        const provisional_id = if (call.provisional_id) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (provisional_id) |value| alloc.free(value);
-        const provider_result = if (call.provider_result) |result| try alloc.dupe(u8, result) else null;
-        errdefer if (provider_result) |result| alloc.free(result);
-        copy[i] = .{
-            .id = id,
-            .name = name,
-            .arguments_json = arguments_json,
-            .argument_integrity = call.argument_integrity,
-            .provisional_id = provisional_id,
-            .provider_result = provider_result,
-            .final_identity = call.final_identity,
-            .provenance = call.provenance,
-        };
-        copied += 1;
-    }
-    return copy;
-}
-
-test "dupeGatewayToolCalls preserves argument integrity for shared agent admission" {
-    const source = [_]types.ToolCall{.{
-        .id = "call_1",
-        .name = "ask_user_question",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-    }};
-
-    const copy = try dupeGatewayToolCalls(std.testing.allocator, &source);
-    defer types.freeToolCallSlice(std.testing.allocator, copy);
-
-    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, copy[0].argument_integrity);
-}
-
 pub const VisionToolMode = agent_stream_provider.VisionMode;
 
 pub fn recordSelectedDynamicTool(
     alloc: Allocator,
     names: *std.ArrayList([]const u8),
-    schemas: *std.ArrayList([]const u8),
+    tools: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
     execution: ToolExecutionResult,
 ) !void {
     const name = execution.selected_dynamic_tool_name orelse return;
-    const schema = execution.selected_dynamic_tool_schema_json orelse return;
+    const schema_json = execution.selected_dynamic_tool_schema_json orelse return;
     for (names.items) |existing| {
         if (std.mem.eql(u8, existing, name)) return;
     }
+    const schema = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        schema_json,
+        .{},
+    );
+    if (schema != .object) return error.InvalidToolSchema;
+    const schema_name = schema.object.get("name") orelse return error.InvalidToolSchema;
+    const description = schema.object.get("description") orelse return error.InvalidToolSchema;
+    const input_schema = schema.object.get("inputSchema") orelse return error.InvalidToolSchema;
+    if (schema_name != .string or description != .string or input_schema != .object or
+        !std.mem.eql(u8, schema_name.string, name))
+    {
+        return error.InvalidToolSchema;
+    }
     try names.append(alloc, name);
-    try schemas.append(alloc, schema);
+    try tools.append(alloc, .{
+        .name = name,
+        .description = description.string,
+        .input_schema = input_schema,
+    });
 }
 
 pub fn gatewayHttpErrorDetail(
@@ -340,9 +246,9 @@ test "gateway 413 detail reports selected model and only known limits" {
     try std.testing.expect(std.mem.find(u8, unknown, "max_output_tokens=") == null);
 }
 
-test "pre-send gateway failure settles usage as unbilled" {
+test "provider preflight failure does not reserve usage" {
     const Callbacks = struct {
-        fn content(_: *anyopaque, _: []const u8) void {}
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
 
     const alloc = std.testing.allocator;
@@ -352,32 +258,25 @@ test "pre-send gateway failure settles usage as unbilled" {
     var delivery = DeliveryCertainty.init();
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
-    const result = streamGatewayCompletion(
+    const result = streamModelCompletion(
         agent_stream_provider.unavailable_provider,
         alloc,
-        "test-key",
-        null,
-        null,
-        null,
-        null,
-        "test/model",
-        1,
-        "not a valid URL",
-        "{}",
-        null,
-        &delivery,
-        &attempt_evidence,
-        &callback_ctx,
-        Callbacks.content,
-        null,
-        null,
-        null,
-        &cancel_flag,
+        .{
+            .credential = .{ .secret = "test-key" },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .cancel_flag = &cancel_flag,
+        },
         &usage,
         alloc,
-        .{},
-        null,
-        .agent,
     );
     if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
 
@@ -385,7 +284,7 @@ test "pre-send gateway failure settles usage as unbilled" {
     defer snapshot.deinit(alloc);
     try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
 }
 
 test "possibly sent gateway failure marks billing incomplete" {
@@ -393,14 +292,15 @@ test "possibly sent gateway failure marks billing incomplete" {
         fn stream(
             _: ?*anyopaque,
             _: Allocator,
-            request: agent_stream_provider.Request,
+            request: agent_stream_provider.ModelRequest,
         ) anyerror!agent_stream_provider.Result {
+            try request.admission.admit();
             request.delivery.markPossiblySent();
             return error.ConnectionResetByPeer;
         }
     };
     const Callbacks = struct {
-        fn content(_: *anyopaque, _: []const u8) void {}
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
     };
 
     const alloc = std.testing.allocator;
@@ -411,32 +311,25 @@ test "possibly sent gateway failure marks billing incomplete" {
     var attempt_evidence: agent_stream_provider.AttemptEvidence = .{};
     var callback_ctx: u8 = 0;
 
-    const result = streamGatewayCompletion(
+    const result = streamModelCompletion(
         .{ .stream_fn = Gateway.stream },
         alloc,
-        "test-key",
-        null,
-        null,
-        null,
-        null,
-        "test/model",
-        1,
-        "https://example.test/chat",
-        "{}",
-        null,
-        &delivery,
-        &attempt_evidence,
-        &callback_ctx,
-        Callbacks.content,
-        null,
-        null,
-        null,
-        &cancel_flag,
+        .{
+            .credential = .{ .secret = "test-key" },
+            .model = "test/model",
+            .retry_count = 1,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt_evidence,
+            .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+            .cancel_flag = &cancel_flag,
+        },
         &usage,
         alloc,
-        .{},
-        null,
-        .agent,
     );
     if (result) |_| return error.TestExpectedGatewayFailure else |_| {}
 
@@ -445,4 +338,85 @@ test "possibly sent gateway failure marks billing incomplete" {
     try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
     try std.testing.expect(snapshot.api_duration_complete);
     try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+}
+
+test "provider-local immediate usage bypasses durable Gateway observations" {
+    const LocalProvider = struct {
+        calls: usize = 0,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) anyerror!agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            return .{ .completed = .{
+                .completion = .{
+                    .generation_id = "resp_provider_local",
+                    .finish_reason = .stop,
+                    .usage = .{ .input_tokens = 3, .output_tokens = 1 },
+                },
+                .usage = .{ .immediate = null },
+            } };
+        }
+    };
+    const Callbacks = struct {
+        fn event(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+
+    const alloc = std.testing.allocator;
+    var local_provider: LocalProvider = .{};
+    const provider = agent_stream_provider.Provider{
+        .context = &local_provider,
+        .stream_fn = LocalProvider.stream,
+    };
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+
+    for (0..65) |_| {
+        var delivery = DeliveryCertainty.init();
+        var attempt_evidence: AttemptEvidence = .{};
+        var result = try streamModelCompletion(
+            provider,
+            alloc,
+            .{
+                .credential = .{
+                    .secret = "subscription-token",
+                    .source = .chatgpt_subscription,
+                    .account_id = "acct_test",
+                },
+                .session_id = "session-test",
+                .model = "gpt-test",
+                .retry_count = 1,
+                .messages = &.{},
+                .tool_choice = .auto,
+                .provider_options = .{},
+                .trace_ctx = .{},
+                .content_capture_limit = null,
+                .delivery = &delivery,
+                .attempt_evidence = &attempt_evidence,
+                .events = .{ .context = &callback_ctx, .emit_fn = Callbacks.event },
+                .cancel_flag = &cancel_flag,
+                .provider_attempt_owner = .agent,
+            },
+            null,
+            alloc,
+        );
+        defer result.deinit(alloc);
+        try std.testing.expect(std.meta.activeTag(result) == .completed);
+    }
+
+    try std.testing.expectEqual(@as(usize, 65), local_provider.calls);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.next_sequence);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }

@@ -47,6 +47,7 @@ type FixtureRoot = {
   launchLogPath: string;
   traceLogPath: string;
   invalidationReleasePath: string;
+  environmentCapturePath: string;
 };
 
 type WireEntry = {
@@ -125,6 +126,7 @@ type RootOptions = {
   required?: boolean;
   resourcesSubscribe?: boolean;
   resourceTtlMs?: number;
+  captureEnvironment?: boolean;
 };
 
 function createRoot(
@@ -139,6 +141,7 @@ function createRoot(
   const wireLogPath = join(root, "mcp-wire.jsonl");
   const launchLogPath = join(root, "mcp-launches.txt");
   const invalidationReleasePath = join(root, "mcp-invalidation-release");
+  const environmentCapturePath = join(root, "mcp-environment.json");
   const command = options.recordLaunchAttempts
     ? [
       "/bin/sh",
@@ -150,7 +153,7 @@ function createRoot(
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "settings.json"),
-    JSON.stringify({ maxxing_mode: "minimal" }),
+    JSON.stringify({}),
   );
   writeFileSync(
     join(home, ".fx", "mcp.json"),
@@ -195,6 +198,12 @@ function createRoot(
               options.legacyRejectNewerInitialize ? "1" : undefined,
             FX_MCP_DRAFT7_PATTERN: options.draft7Pattern,
             FX_MCP_URL_REQUIRED_OPERATION: options.urlRequiredOperation,
+            FX_MCP_ENV_CAPTURE: options.captureEnvironment
+              ? environmentCapturePath
+              : undefined,
+            FX_MCP_ENV_SENTINEL: options.captureEnvironment
+              ? "configured"
+              : undefined,
           },
           startup_timeout_ms: options.startupTimeoutMs,
           operation_timeout_ms: options.operationTimeoutMs,
@@ -211,6 +220,7 @@ function createRoot(
     launchLogPath,
     traceLogPath: join(root, "fx-trace.log"),
     invalidationReleasePath,
+    environmentCapturePath,
   };
 }
 
@@ -403,7 +413,7 @@ describe("modern MCP stdio compatibility", () => {
     const marker = join(root, "project-mcp-launched");
     mkdirSync(join(home, ".fx"), { recursive: true });
     mkdirSync(join(workspace, ".fx"), { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ maxxing_mode: "minimal" }));
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
     writeFileSync(join(home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
 
     let projectRequestCount = 0;
@@ -598,7 +608,7 @@ describe("modern MCP stdio compatibility", () => {
       }
       return fakeGatewayFinalText("unexpected scoped MCP child request");
     }, {
-      classifierDecision: "allow",
+      classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
     gateway = activeGateway;
@@ -667,7 +677,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected feature-only child request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -765,7 +775,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected disabled MCP child request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -823,7 +833,6 @@ describe("modern MCP stdio compatibility", () => {
       writeFileSync(
         join(root.home, ".fx", "settings.json"),
         JSON.stringify({
-          maxxing_mode: "minimal",
           permission: { mcp_denied_blocked: "deny" },
         }),
       );
@@ -874,7 +883,7 @@ describe("modern MCP stdio compatibility", () => {
         }
         return fakeGatewayFinalText("unexpected scoped refresh request");
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;
@@ -984,7 +993,6 @@ describe("modern MCP stdio compatibility", () => {
     writeFileSync(
       join(root.home, ".fx", "settings.json"),
       JSON.stringify({
-        maxxing_mode: "minimal",
         permission: { edit: { "**": "deny" } },
       }),
     );
@@ -1893,6 +1901,49 @@ describe("modern MCP stdio compatibility", () => {
       await expectFixtureProcessesExited(wire);
     });
   }
+
+  test("configured MCP stdio environment overlays inherited process values", async () => {
+    const root = createRoot("ask-environment-overlay", MODERN_FIXTURE, {
+      captureEnvironment: true,
+    });
+    const activeGateway = startToolGateway("Environment overlay complete.");
+    gateway = activeGateway;
+    const inheritedSentinel = "inherited-parent-value";
+    const proxySentinel = "http://proxy.example.test:8080";
+    const parentPath = process.env.PATH ?? "/usr/bin:/bin";
+
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the environment MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: {
+          ...fixtureEnv(root, activeGateway),
+          PATH: parentPath,
+          FX_MCP_INHERITED_SENTINEL: inheritedSentinel,
+          HTTPS_PROXY: proxySentinel,
+        },
+        timeoutMs: 20_000,
+      },
+    );
+
+    expect(result.code, result.stderr || result.stdout).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Environment overlay complete.");
+    const captured = JSON.parse(readFileSync(root.environmentCapturePath, "utf8")) as {
+      configured?: string;
+      inherited?: string;
+      path?: string;
+      home?: string;
+      httpsProxy?: string;
+    };
+    expect(captured).toEqual({
+      configured: "configured",
+      inherited: inheritedSentinel,
+      path: parentPath,
+      home: root.home,
+      httpsProxy: proxySentinel,
+    });
+    await expectFixtureProcessesExited(readWire(root.wireLogPath));
+  }, 30_000);
 
   test("fx ask does not start an unused optional MCP server", async () => {
     const root = createRoot("ask-unused-optional", MODERN_FIXTURE, {
@@ -4311,7 +4362,7 @@ describe("modern MCP stdio compatibility", () => {
           },
         });
       }, {
-        classifierDecision: "allow",
+        classifierDecision: "clear",
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       gateway = activeGateway;

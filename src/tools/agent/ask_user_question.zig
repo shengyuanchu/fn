@@ -7,7 +7,8 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const Allocator = std.mem.Allocator;
 
 const whitespace = " \t\r\n";
-pub const permission_request_id_hex_bytes = std.crypto.hash.sha2.Sha256.digest_length * 2;
+const legacy_permission_request_sentinel =
+    "(ask_user_question: permission_request_id is no longer supported; use the safety review advice to choose a different action)";
 
 pub const cancel_sentinel = "(user cancelled the question)";
 pub const not_available_sentinel = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
@@ -42,33 +43,6 @@ pub const Input = struct {
     }
 };
 
-pub const PermissionRequestReference = union(enum) {
-    none,
-    invalid,
-    id: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-};
-
-pub fn permissionRequestReference(
-    alloc: Allocator,
-    args_json: []const u8,
-) Allocator.Error!PermissionRequestReference {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .invalid,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return .invalid;
-    const value = parsed.value.object.get("permission_request_id") orelse
-        return .none;
-    if (value != .string or
-        value.string.len != permission_request_id_hex_bytes) return .invalid;
-    var id: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&id, value.string) catch return .invalid;
-    const canonical = std.fmt.bytesToHex(id, .lower);
-    if (!std.mem.eql(u8, &canonical, value.string)) return .invalid;
-    return .{ .id = id };
-}
-
 pub const Requester = struct {
     ctx: ?*anyopaque,
     response_alloc: Allocator,
@@ -90,8 +64,28 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
+pub fn validate(
+    ctx: tool_dispatch.DispatchContext,
+    erased: tool_dispatch.ToolInput,
+) tool_dispatch.DispatchError!?[]u8 {
+    const input = erased.as(Input);
+    if (try hasLegacyPermissionRequestId(ctx.allocator, input.args_json)) {
+        return try ctx.allocator.dupe(u8, legacy_permission_request_sentinel);
+    }
     return null;
+}
+
+fn hasLegacyPermissionRequestId(
+    alloc: Allocator,
+    args_json: []const u8,
+) Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer parsed.deinit();
+    return parsed.value == .object and
+        parsed.value.object.get("permission_request_id") != null;
 }
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
@@ -394,41 +388,24 @@ test "ask_user_question cancellation returns sentinel" {
     try std.testing.expectEqualStrings(cancel_sentinel, output);
 }
 
-test "permission request reference accepts only canonical action ids" {
-    const valid_hex = "0123456789abcdef" ** 4;
-    const valid = try permissionRequestReference(
-        std.testing.allocator,
-        "{\"permission_request_id\":\"" ++ valid_hex ++ "\",\"questions\":[]}",
+test "ask_user_question validation rejects legacy permission references before prompting" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"permission_request_id\":\"legacy\",\"questions\":[]}",
     );
-    try std.testing.expectEqual(
-        std.meta.Tag(PermissionRequestReference).id,
-        std.meta.activeTag(valid),
-    );
-    const expected = [_]u8{
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-    } ** 4;
-    try std.testing.expectEqualSlices(u8, &expected, &valid.id);
-
-    const absent = try permissionRequestReference(
-        std.testing.allocator,
-        "{\"questions\":[]}",
-    );
-    try std.testing.expectEqual(
-        std.meta.Tag(PermissionRequestReference).none,
-        std.meta.activeTag(absent),
-    );
-    for ([_][]const u8{
-        "{\"permission_request_id\":\"short\",\"questions\":[]}",
-        "{\"permission_request_id\":\"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\",\"questions\":[]}",
-        "{\"permission_request_id\":3,\"questions\":[]}",
-        "not-json",
-    }) |input| {
-        const invalid = try permissionRequestReference(std.testing.allocator, input);
-        try std.testing.expectEqual(
-            std.meta.Tag(PermissionRequestReference).invalid,
-            std.meta.activeTag(invalid),
-        );
-    }
+    const input = switch (decoded) {
+        .failure => |body| {
+            defer alloc.free(body);
+            return error.TestExpectedEqual;
+        },
+        .input => |owned| owned,
+    };
+    defer input.deinit(alloc);
+    const failure = (try validate(.{ .allocator = alloc }, input)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(failure);
+    try std.testing.expectEqualStrings(legacy_permission_request_sentinel, failure);
 }
 
 test "ask_user_question noninteractive returns sentinel before parsing" {

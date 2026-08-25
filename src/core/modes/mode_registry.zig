@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const mode_contract = @import("mode_contract.zig");
-const tool_advertisement = @import("../tooling/tool_advertisement.zig");
+const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -19,18 +19,18 @@ pub const Registry = struct {
         return null;
     }
 
-    pub fn buildGatewayToolProjection(
+    pub fn buildModelToolProjection(
         self: Registry,
         alloc: std.mem.Allocator,
         tool_set: tool_set_contract.ToolSet,
         id: []const u8,
-        options: tool_advertisement.Options,
-    ) !tool_advertisement.EffectiveToolProjection {
+        options: tool_projection.Options,
+    ) !tool_projection.EffectiveToolProjection {
         const mode = self.lookup(id) orelse
-            return tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options);
+            return tool_projection.buildModelToolProjectionForSet(alloc, tool_set, options);
         return switch (mode.tool_policy) {
-            .full => tool_advertisement.buildGatewayToolProjectionForSet(alloc, tool_set, options),
-            .read_only => tool_advertisement.buildReadOnlyGatewayToolProjectionForSet(alloc, tool_set, options),
+            .full => tool_projection.buildModelToolProjectionForSet(alloc, tool_set, options),
+            .read_only => tool_projection.buildReadOnlyModelToolProjectionForSet(alloc, tool_set, options),
         };
     }
 
@@ -106,7 +106,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "inspect",
                 .description = "Inspect",
-                .gateway_schema = .{
+                .model_schema = .{
                     .name = "inspect",
                     .description = "Inspect",
                     .input_schema = .{},
@@ -119,7 +119,7 @@ test "mode registry applies tool policy to the supplied tool set" {
             .{
                 .name = "mutate",
                 .description = "Mutate",
-                .gateway_schema = .{
+                .model_schema = .{
                     .name = "mutate",
                     .description = "Mutate",
                     .input_schema = .{},

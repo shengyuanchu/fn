@@ -108,6 +108,9 @@ pub const ToolExecutionRequest = struct {
     result_allocator: Allocator,
     call: ToolCall,
     authority: command_admission.ToolExecutionAuthority,
+    /// Action-scoped root mode sampled before permission admission. Direct
+    /// callers without a sampled mode retain their execution context value.
+    permission_mode: ?types.PermissionMode = null,
     /// Borrowed root-user evidence for subagent execution. This is never
     /// populated from an assistant-authored task prompt.
     root_user_intent_context: []const u8 = "",

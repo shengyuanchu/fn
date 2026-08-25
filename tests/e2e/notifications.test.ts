@@ -278,6 +278,7 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewayToolCall("ask_permission_1", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: "touch ask-permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_ASK_PERMISSION_COMPLETE"),
@@ -330,6 +331,7 @@ test.skipIf(!tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewayToolCall("permission_1", "terminal", {
         action: "exec",
+        timeout_ms: 600_000,
         command: "touch permission-marker.txt",
       }),
       fakeGatewayFinalText("NOTIFICATION_PERMISSION_COMPLETE"),

@@ -5,18 +5,17 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
-const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
+const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const output_contracts = @import("core/output/output_contracts.zig");
-const web_search_contract = @import("core/tooling/web_search_contract.zig");
-const web_search_policy = @import("core/tooling/web_search_policy.zig");
-const web_search_provider = @import("core/tooling/web_search_provider.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
+const provider_catalog = @import("core/auth/provider_catalog.zig");
+const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
 const Allocator = std.mem.Allocator;
@@ -39,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,
         .gateway_provider = js_host_gateway_provider,
+        .provider_set = js_host_provider_set,
         .background_process_provider = background_process_provider.unavailable_provider,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = builtin_context.prompt_policy,
@@ -56,15 +56,19 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const js_host_gateway_provider = gateway_provider.Provider{
-    .agent_stream = js_host_stream_provider.provider(),
     .oauth_transport = oauth_transport.unavailable_provider,
     .chat_url = .{ .resolve_fn = resolveChatUrl },
-    .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
-    .credits = .{ .fetch_fn = fetchCredits },
-    .generation_usage = generation_usage_provider.unavailable_provider,
-    .web_search = unavailable_web_search_provider,
-    .model_catalog = js_host_model_catalog.provider,
 };
+
+const js_host_provider_set = provider_set.gateway_only(.{
+    .presentation = provider_catalog.find(.gateway),
+    .auth_strategy = .vercel,
+    .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
+    .agent_stream = js_host_stream_provider.provider(),
+    .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
+    .model_catalog = js_host_model_catalog.provider,
+    .credits = .{ .fetch_fn = fetchCredits },
+});
 
 fn resolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
     return fallback;
@@ -105,30 +109,4 @@ fn fetchCredits(
     _: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
     return .{};
-}
-
-const unavailable_web_search_policy = web_search_policy.WebSearchPolicy{
-    .preferred_backends = &.{},
-    .backend_policies = &.{},
-};
-
-const unavailable_web_search_provider = web_search_provider.Provider{
-    .policy = unavailable_web_search_policy,
-    .preferred_backends_fn = preferredWebSearchBackends,
-    .execute_fn = executeWebSearch,
-};
-
-fn preferredWebSearchBackends(_: ?*anyopaque) anyerror!?[]const web_search_contract.SearchBackendId {
-    return null;
-}
-
-fn executeWebSearch(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: web_search_provider.Inputs,
-    _: web_search_contract.ProviderRequest,
-    _: ?web_search_contract.ProgressFn,
-    _: ?*anyopaque,
-) anyerror!web_search_contract.ProviderResponse {
-    return error.WebSearchUnavailable;
 }

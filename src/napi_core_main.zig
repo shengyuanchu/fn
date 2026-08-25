@@ -4,7 +4,7 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const background_process_provider = @import("core/execution/background_process_provider.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
-const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
+const provider_set = @import("core/gateway/provider_set.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
@@ -433,15 +433,13 @@ const Runtime = struct {
 
     fn run(self: *Runtime) void {
         const provider = gateway_provider.Provider{
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
             .oauth_transport = oauth_transport.unavailable_provider,
             .chat_url = builtin_gateway.provider.chat_url,
-            .cli_model_catalog = builtin_gateway.provider.cli_model_catalog,
-            .credits = builtin_gateway.provider.credits,
-            .generation_usage = generation_usage_provider.unavailable_provider,
-            .web_search = builtin_gateway.provider.web_search,
-            .model_catalog = builtin_gateway.provider.model_catalog,
         };
+        var gateway = builtin_gateway.provider_bundle;
+        gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
+        gateway.permission_reviewer = null;
+        const providers = provider_set.gateway_only(gateway);
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -451,6 +449,7 @@ const Runtime = struct {
                 .gateway_chat_url = self.gateway_chat_url,
                 .gateway_models_path = builtin_gateway.models_path,
                 .gateway_provider = provider,
+                .provider_set = providers,
                 .background_process_provider = background_process_provider.unavailable_provider,
                 .secret_store = host.unavailable_secret_store,
                 .prompt_policy = builtin_context.prompt_policy,
@@ -656,7 +655,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .gateway_chat_url = gateway_chat_url,
         .thread = undefined,
     };
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{
+    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,

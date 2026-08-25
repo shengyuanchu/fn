@@ -14,6 +14,7 @@ const recoveryReleasePath = process.env.FX_MCP_RECOVERY_RELEASE_PATH;
 const initialToolName = process.env.FX_MCP_INITIAL_TOOL_NAME ?? "echo";
 const recoveredToolName = process.env.FX_MCP_RECOVERED_TOOL_NAME ?? initialToolName;
 const expectedElicitation = process.env.FX_MCP_EXPECT_ELICITATION ?? "none";
+const environmentCapturePath = process.env.FX_MCP_ENV_CAPTURE;
 const resourcesSubscribe = process.env.FX_MCP_RESOURCES_SUBSCRIBE !== "0";
 const resourceTtlMs = process.env.FX_MCP_RESOURCE_TTL_MS === undefined
   ? null
@@ -35,6 +36,15 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (environmentCapturePath) {
+  writeFileSync(environmentCapturePath, JSON.stringify({
+    configured: process.env.FX_MCP_ENV_SENTINEL,
+    inherited: process.env.FX_MCP_INHERITED_SENTINEL,
+    path: process.env.PATH,
+    home: process.env.HOME,
+    httpsProxy: process.env.HTTPS_PROXY,
+  }));
+}
 if (stallRecovery) setInterval(() => {}, 1000);
 
 function send(message) {

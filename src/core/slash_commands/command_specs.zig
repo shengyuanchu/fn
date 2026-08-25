@@ -68,7 +68,6 @@ pub const SlashKind = enum {
     credits,
     paste,
     fast,
-    appearance,
     statusline,
     notifications,
     workspace,
@@ -119,7 +118,7 @@ pub const TopLevelResource = struct {
 
 pub const TopLevelRegistry = struct {
     specs: []const TopLevelSpec = &.{},
-    program_name: []const u8 = "fx",
+    program_name: []const u8 = "fn",
     brand: []const u8 = "𝒇x",
     description: []const u8,
     interactive_hint: []const u8,
@@ -552,15 +551,6 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return permissionsArgCompletionCount(query);
     }
-    if (appearanceArgCompletionPrefix(prefix)) |query| {
-        return appearanceArgCompletionCount(query);
-    }
-    if (inputArgCompletionPrefix(prefix)) |query| {
-        return inputArgCompletionCount(query);
-    }
-    if (maxxingArgCompletionPrefix(prefix)) |query| {
-        return maxxingArgCompletionCount(query);
-    }
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return workspaceArgCompletionCount(query);
     }
@@ -586,15 +576,6 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return nthPermissionsArgCompletion(query, n);
     }
-    if (appearanceArgCompletionPrefix(prefix)) |query| {
-        return nthAppearanceArgCompletion(query, n);
-    }
-    if (inputArgCompletionPrefix(prefix)) |query| {
-        return nthInputArgCompletion(query, n);
-    }
-    if (maxxingArgCompletionPrefix(prefix)) |query| {
-        return nthMaxxingArgCompletion(query, n);
-    }
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgCompletion(query, n);
     }
@@ -609,9 +590,6 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (statuslineArgCompletionPrefix(prefix) != null) return "/statusline ".len;
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
-    if (appearanceArgCompletionPrefix(prefix) != null) return "/appearance ".len;
-    if (inputArgCompletionPrefix(prefix) != null) return "/input ".len;
-    if (maxxingArgCompletionPrefix(prefix) != null) return "/maxxing ".len;
     if (workspaceArgCompletionPrefix(prefix) != null) return "/workspace ".len;
     if (allowlistArgCompletionAnchor(prefix)) |anchor| return anchor;
     return 0;
@@ -634,15 +612,6 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (permissionsArgCompletionPrefix(prefix)) |query| {
         return nthPermissionsArgLabel(query, n);
     }
-    if (appearanceArgCompletionPrefix(prefix)) |query| {
-        return nthAppearanceArgLabel(query, n);
-    }
-    if (inputArgCompletionPrefix(prefix)) |query| {
-        return nthInputArgLabel(query, n);
-    }
-    if (maxxingArgCompletionPrefix(prefix)) |query| {
-        return nthMaxxingArgLabel(query, n);
-    }
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
@@ -654,9 +623,6 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (statuslineArgCompletionPrefix(prefix) != null) return null;
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
     if (permissionsArgCompletionPrefix(prefix) != null) return null;
-    if (appearanceArgCompletionPrefix(prefix) != null) return null;
-    if (inputArgCompletionPrefix(prefix) != null) return null;
-    if (maxxingArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
@@ -745,23 +711,6 @@ const permissions_arg_completions = [_][]const u8{
     "/permissions revoke",
     "/permissions yolo",
     "/permissions reset",
-};
-
-const appearance_arg_completions = [_][]const u8{
-    "/appearance input lines",
-    "/appearance input tint",
-    "/appearance presentation normal",
-    "/appearance presentation minimal",
-};
-
-const input_arg_completions = [_][]const u8{
-    "/input lines",
-    "/input tint",
-};
-
-const maxxing_arg_completions = [_][]const u8{
-    "/maxxing minimal",
-    "/maxxing legacy",
 };
 
 const workspace_arg_completions = [_][]const u8{
@@ -906,18 +855,6 @@ pub fn permissionsArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/permissions");
 }
 
-pub fn appearanceArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
-    return argCompletionPrefix(prefix, "/appearance");
-}
-
-pub fn inputArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
-    return argCompletionPrefix(prefix, "/input");
-}
-
-pub fn maxxingArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
-    return argCompletionPrefix(prefix, "/maxxing");
-}
-
 pub fn workspaceArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/workspace");
 }
@@ -940,18 +877,6 @@ fn notificationsArgCompletionCount(query: []const u8) usize {
 
 fn permissionsArgCompletionCount(query: []const u8) usize {
     return argCompletionCount(&permissions_arg_completions, "/permissions ".len, query);
-}
-
-fn appearanceArgCompletionCount(query: []const u8) usize {
-    return argCompletionCount(&appearance_arg_completions, "/appearance ".len, query);
-}
-
-fn inputArgCompletionCount(query: []const u8) usize {
-    return argCompletionCount(&input_arg_completions, "/input ".len, query);
-}
-
-fn maxxingArgCompletionCount(query: []const u8) usize {
-    return argCompletionCount(&maxxing_arg_completions, "/maxxing ".len, query);
 }
 
 fn workspaceArgCompletionCount(query: []const u8) usize {
@@ -1000,33 +925,6 @@ fn nthPermissionsArgLabel(query: []const u8, n: usize) ?[]const u8 {
     return full["/permissions ".len..];
 }
 
-fn nthAppearanceArgCompletion(query: []const u8, n: usize) ?[]const u8 {
-    return nthArgCompletion(&appearance_arg_completions, "/appearance ".len, query, n);
-}
-
-fn nthAppearanceArgLabel(query: []const u8, n: usize) ?[]const u8 {
-    const full = nthAppearanceArgCompletion(query, n) orelse return null;
-    return full["/appearance ".len..];
-}
-
-fn nthInputArgCompletion(query: []const u8, n: usize) ?[]const u8 {
-    return nthArgCompletion(&input_arg_completions, "/input ".len, query, n);
-}
-
-fn nthInputArgLabel(query: []const u8, n: usize) ?[]const u8 {
-    const full = nthInputArgCompletion(query, n) orelse return null;
-    return full["/input ".len..];
-}
-
-fn nthMaxxingArgCompletion(query: []const u8, n: usize) ?[]const u8 {
-    return nthArgCompletion(&maxxing_arg_completions, "/maxxing ".len, query, n);
-}
-
-fn nthMaxxingArgLabel(query: []const u8, n: usize) ?[]const u8 {
-    const full = nthMaxxingArgCompletion(query, n) orelse return null;
-    return full["/maxxing ".len..];
-}
-
 fn nthWorkspaceArgCompletion(query: []const u8, n: usize) ?[]const u8 {
     return nthArgCompletion(&workspace_arg_completions, "/workspace ".len, query, n);
 }
@@ -1053,15 +951,6 @@ pub fn argCompletionIndexForLabel(prefix: []const u8, label: []const u8) ?usize 
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         const state = allowlistArgCompletionState(query);
         return indexOfArgLabel(state.completions, state.label_offset, state.query, label);
-    }
-    if (appearanceArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&appearance_arg_completions, "/appearance ".len, query, label);
-    }
-    if (inputArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&input_arg_completions, "/input ".len, query, label);
-    }
-    if (maxxingArgCompletionPrefix(prefix)) |query| {
-        return indexOfArgLabel(&maxxing_arg_completions, "/maxxing ".len, query, label);
     }
     if (statuslineArgCompletionPrefix(prefix)) |query| {
         return indexOfArgLabel(&statusline_arg_completions, "/statusline ".len, query, label);
@@ -1868,10 +1757,10 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 37), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
-    try std.testing.expectEqual(@as(usize, 4), helpCatalogCount(registry, "appearance"));
+    try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
 }
 
@@ -2161,44 +2050,7 @@ test "slash completions list permission modes and rule management" {
     try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/permissions x"));
 }
 
-test "slash completions include input appearance arguments only" {
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/input "));
-    try std.testing.expectEqualStrings("/input lines", nthSlashCompletion(testSlashRegistry(), "/input ", 0).?);
-    try std.testing.expectEqualStrings("/input tint", nthSlashCompletion(testSlashRegistry(), "/input ", 1).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/input l"));
-    try std.testing.expectEqualStrings("/input lines", nthSlashCompletion(testSlashRegistry(), "/input l", 0).?);
-    try std.testing.expectEqual(@as(usize, 1), slashCompletionCount(testSlashRegistry(), "/input t"));
-    try std.testing.expectEqualStrings("/input tint", nthSlashCompletion(testSlashRegistry(), "/input t", 0).?);
-    try std.testing.expectEqual(@as(usize, 0), slashCompletionCount(testSlashRegistry(), "/input x"));
-    try std.testing.expectEqual(@as(usize, "/input ".len), argCompletionAnchor("/input "));
-    try std.testing.expectEqual(@as(?usize, 0), argCompletionIndexForLabel("/input ", "lines"));
-    try std.testing.expectEqual(@as(?usize, 1), argCompletionIndexForLabel("/input ", "tint"));
-}
-
-test "slash completions include grouped appearance arguments" {
-    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(testSlashRegistry(), "/appearance "));
-    try std.testing.expectEqualStrings("/appearance input lines", nthSlashCompletion(testSlashRegistry(), "/appearance ", 0).?);
-    try std.testing.expectEqualStrings("/appearance input tint", nthSlashCompletion(testSlashRegistry(), "/appearance ", 1).?);
-    try std.testing.expectEqualStrings("/appearance presentation normal", nthSlashCompletion(testSlashRegistry(), "/appearance ", 2).?);
-    try std.testing.expectEqualStrings("/appearance presentation minimal", nthSlashCompletion(testSlashRegistry(), "/appearance ", 3).?);
-    try std.testing.expectEqualStrings("presentation minimal", nthSlashCompletionLabel(testSlashRegistry(), "/appearance presentation m", 0).?);
-    try std.testing.expectEqual(@as(usize, "/appearance ".len), argCompletionAnchor("/appearance "));
-}
-
-test "slash completions include maxxing presentation arguments only" {
-    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(testSlashRegistry(), "/maxxing "));
-    try std.testing.expectEqualStrings("/maxxing minimal", nthSlashCompletion(testSlashRegistry(), "/maxxing ", 0).?);
-    try std.testing.expectEqualStrings("/maxxing legacy", nthSlashCompletion(testSlashRegistry(), "/maxxing ", 1).?);
-    try std.testing.expectEqualStrings("minimal", nthSlashCompletionLabel(testSlashRegistry(), "/maxxing m", 0).?);
-    try std.testing.expectEqual(@as(usize, "/maxxing ".len), argCompletionAnchor("/maxxing "));
-    try std.testing.expectEqual(@as(?usize, 0), argCompletionIndexForLabel("/maxxing ", "minimal"));
-    try std.testing.expectEqual(@as(?usize, 1), argCompletionIndexForLabel("/maxxing ", "legacy"));
-}
-
 test "slash completion labels strip argument prefixes" {
-    try std.testing.expectEqualStrings("lines", nthSlashCompletionLabel(testSlashRegistry(), "/input ", 0).?);
-    try std.testing.expectEqualStrings("tint", nthSlashCompletionLabel(testSlashRegistry(), "/input ", 1).?);
-    try std.testing.expectEqualStrings("tint", nthSlashCompletionLabel(testSlashRegistry(), "/input t", 0).?);
     try std.testing.expectEqualStrings("ask", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 0).?);
     try std.testing.expectEqualStrings("auto", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 1).?);
     try std.testing.expectEqualStrings("remember", nthSlashCompletionLabel(testSlashRegistry(), "/permissions ", 2).?);
@@ -2222,7 +2074,7 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("/models", nthSlashCompletion(testSlashRegistry(), "/mo", 1).?);
     try std.testing.expectEqualStrings("start a fresh session and keep background processes", nthSlashCompletionDescription(testSlashRegistry(), "/cl", 0).?);
     try std.testing.expectEqualStrings("undo the latest tracked file operation", nthSlashCompletionDescription(testSlashRegistry(), "/un", 0).?);
-    try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
+    try std.testing.expectEqualStrings("open the fn issue tracker", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("compact older conversation turns", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
     try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);

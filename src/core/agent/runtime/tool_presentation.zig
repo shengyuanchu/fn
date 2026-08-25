@@ -37,6 +37,17 @@ pub fn streamStartMayHaveExecutedAtProvider(
     return spec.provider_executed;
 }
 
+fn fallbackToolDisplay(
+    registry: tool_dispatch.Registry,
+    tool_name: []const u8,
+) []const u8 {
+    const lookup_name = if (std.mem.eql(u8, tool_name, "run_command"))
+        "terminal"
+    else
+        tool_name;
+    return if (registry.lookup(lookup_name) != null) "tool call" else tool_name;
+}
+
 pub const ProvisionalToolStatuses = struct {
     const TrackedStatus = struct {
         id: []u8,
@@ -150,7 +161,7 @@ pub const ProvisionalToolStatuses = struct {
         const summary = try std.fmt.allocPrint(
             arena,
             "{s} failed: invalid JSON arguments",
-            .{call.name},
+            .{fallbackToolDisplay(hooks.tool_registry, call.name)},
         );
         try hooks.push_tool_lifecycle(hooks.ctx, .{
             .terminal = .{
@@ -404,7 +415,8 @@ pub const ProvisionalToolStatuses = struct {
                 continue;
             }
             errdefer self.forgetTerminal(alloc, status.id);
-            const detail = status.label_value orelse status.tool_name;
+            const detail = status.label_value orelse
+                fallbackToolDisplay(hooks.tool_registry, status.tool_name);
             const encoded = try text_utils.encodeTerminalSafe(
                 arena,
                 detail,
@@ -448,7 +460,8 @@ pub const ProvisionalToolStatuses = struct {
                 continue;
             }
             errdefer self.forgetTerminal(alloc, status.id);
-            const detail = status.label_value orelse status.tool_name;
+            const detail = status.label_value orelse
+                fallbackToolDisplay(hooks.tool_registry, status.tool_name);
             const encoded = try text_utils.encodeTerminalSafe(
                 arena,
                 detail,
@@ -1555,7 +1568,7 @@ test "provisional lifecycle formats labeled and unlabeled eligible tools" {
     }
 }
 
-test "tracked provisional cancellation retains names and the latest label" {
+test "tracked provisional cancellation retains labels without exposing registered names" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -1569,6 +1582,7 @@ test "tracked provisional cancellation retains names and the latest label" {
     try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", null);
     try statuses.publish(&hooks, alloc, 9, "read_1", "read_file", .read, "Reading", "src/main.zig");
     try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
 
     var terminal_count: usize = 0;
@@ -1579,17 +1593,55 @@ test "tracked provisional cancellation retains names and the latest label" {
         if (std.mem.eql(u8, event.terminal.id.call_id, "read_1")) {
             try std.testing.expectEqualStrings("Cancelled src/main.zig", event.terminal.outcome.summary);
         } else if (std.mem.eql(u8, event.terminal.id.call_id, "command_1")) {
-            try std.testing.expectEqualStrings("Cancelled run_command", event.terminal.outcome.summary);
+            try std.testing.expectEqualStrings("Cancelled tool call", event.terminal.outcome.summary);
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "mcp_1")) {
+            try std.testing.expectEqualStrings("Cancelled mcp_custom", event.terminal.outcome.summary);
         } else {
             return error.TestUnexpectedToolCallId;
         }
     }
-    try std.testing.expectEqual(@as(usize, 2), terminal_count);
+    try std.testing.expectEqual(@as(usize, 3), terminal_count);
     try std.testing.expectEqual(@as(usize, 0), statuses.tracked.items.len);
 
     const event_count = capture.events.items.len;
     try statuses.finishTrackedCancelled(&hooks, alloc, arena, 9);
     try std.testing.expectEqual(event_count, capture.events.items.len);
+}
+
+test "unmatched recovery starts hide registered names but retain unknown identities" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    var statuses = ProvisionalToolStatuses{};
+    defer statuses.deinit(alloc);
+
+    try statuses.publish(&hooks, alloc, 9, "command_1", "run_command", .command, "Running", null);
+    try statuses.publish(&hooks, alloc, 9, "mcp_1", "mcp_custom", .read, "Running", null);
+    try statuses.finishUnmatchedRecoveryStarts(&hooks, alloc, arena, 9, &.{});
+
+    var terminal_count: usize = 0;
+    for (capture.events.items) |event| {
+        if (event != .terminal) continue;
+        terminal_count += 1;
+        if (std.mem.eql(u8, event.terminal.id.call_id, "command_1")) {
+            try std.testing.expectEqualStrings(
+                "Connection interrupted before tool call ran",
+                event.terminal.outcome.summary,
+            );
+        } else if (std.mem.eql(u8, event.terminal.id.call_id, "mcp_1")) {
+            try std.testing.expectEqualStrings(
+                "Connection interrupted before mcp_custom ran",
+                event.terminal.outcome.summary,
+            );
+        } else {
+            return error.TestUnexpectedToolCallId;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), terminal_count);
 }
 
 test "provisional lifecycle remains distinct from authoritative lifecycle" {
@@ -1732,12 +1784,23 @@ test "provisional lifecycle terminal matching prefers final id then provisional 
     }};
     try statuses.finishMalformedProviderToolArguments(&hooks, arena, 1, &provider_calls);
 
-    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    _ = try statuses.record(alloc, "mcp_invalid");
+    try statuses.finishMalformedToolArguments(&hooks, arena, 1, .{
+        .id = "mcp_invalid",
+        .name = "mcp_lookup",
+        .arguments_json = "{",
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
     for (capture.events.items) |event| {
         switch (event) {
             .terminal => |terminal| {
-                try std.testing.expectEqualStrings("provisional_read", terminal.id.call_id);
-                try std.testing.expectEqualStrings("read_file failed: invalid JSON arguments", terminal.outcome.summary);
+                if (std.mem.eql(u8, terminal.id.call_id, "mcp_invalid")) {
+                    try std.testing.expectEqualStrings("mcp_lookup failed: invalid JSON arguments", terminal.outcome.summary);
+                } else {
+                    try std.testing.expectEqualStrings("provisional_read", terminal.id.call_id);
+                    try std.testing.expectEqualStrings("tool call failed: invalid JSON arguments", terminal.outcome.summary);
+                }
             },
             else => return error.TestExpectedEqual,
         }

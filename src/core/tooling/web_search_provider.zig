@@ -2,11 +2,13 @@ const std = @import("std");
 const session_usage = @import("../session/session_usage.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Inputs = struct {
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8,
     gateway_retry_count: usize,

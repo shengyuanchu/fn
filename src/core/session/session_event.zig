@@ -2731,7 +2731,7 @@ test "recovery checkpoint events replace and clear deterministically" {
         .assistant_source = @constCast("partial"),
         .cause = .network_interrupted,
         .action = .continuing_response,
-        .route_model = @constCast("test/model"),
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
         .requested_fast_mode = false,
         .fast_mode = false,
         .max_provider_attempts = 10,

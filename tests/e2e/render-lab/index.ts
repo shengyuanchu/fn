@@ -20,6 +20,7 @@ import {
   commandMoreCount,
   findFooters,
   readQuiescence,
+  TERMINAL_TOOL_MARKER,
   traceCountersFromTrace,
 } from "./analyzer";
 import type {
@@ -104,8 +105,7 @@ function permissionDecisionResponse(): Response {
       toolName: "permission_decision",
       input: {
         risk: "low",
-        authorization: "medium",
-        decision: "allow",
+        decision: "clear",
         rationale: "deterministic render-lab decision",
       },
     },
@@ -471,22 +471,16 @@ async function runActiveToolPlacement(
     );
     await capture(context, session, "active-tool-visible");
 
-    await session.waitForPane(
-      (pane) => commandMoreCount(pane) === 27,
-      ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
-    );
     await session.resize(80, 18);
     await session.waitForPane(
-      (pane) =>
-        commandMoreCount(pane) === 27 &&
-        pane.includes(ACTIVE_TOOL_MARKER),
+      (pane) => pane.includes(ACTIVE_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     await capture(context, session, "active-tool-clipped");
 
     writeFileSync(activeToolReleasePath, "");
     await session.waitForPane(
-      (pane) => pane.includes("● Ran sleep 1; i=1"),
+      (pane) => pane.includes(TERMINAL_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     await session.resize(80, 5);
@@ -502,18 +496,12 @@ async function runActiveToolPlacement(
 
     await session.resize(100, 52);
     await session.waitForPane(
-      (pane) =>
-        commandMoreCount(pane) === 27 &&
-        pane.includes("● Ran sleep 1; i=1"),
+      (pane) => pane.includes(TERMINAL_TOOL_MARKER),
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
     const resized = await capture(context, session, "active-tool-resized-visible");
     manifest.finalFrameIndex = resized.index;
 
-    await session.waitForPane(
-      (pane) => commandMoreCount(pane) === 27,
-      30_000,
-    );
     await waitForLocalGatewayRequestCount(
       gateway.requests,
       `POST ${LOCAL_GATEWAY_CHAT_PATH}`,
@@ -577,7 +565,10 @@ async function runActiveToolPlacement(
       context,
       session,
       "active-tool-command-output-collapsed-again",
-      (pane) => commandMoreCount(pane) === 27 && !pane.includes("ACTIVE_TOOL_LINE_32"),
+      (pane) =>
+        pane.includes(TERMINAL_TOOL_MARKER) &&
+        commandMoreCount(pane) === null &&
+        !pane.includes("ACTIVE_TOOL_LINE_32"),
       10_000,
     );
 
@@ -1094,7 +1085,7 @@ async function runStartupScrollbackOverflow(
   mkdirSync(join(fixture.home, ".fx"), { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ startup_scrollback: startupScrollback, maxxing_mode: "legacy" })}\n`,
+    `${JSON.stringify({ startup_scrollback: startupScrollback })}\n`,
   );
   const gateway = startLocalGatewayFixture(promptTail);
   let session: RenderLabTmux | null = null;
@@ -1155,7 +1146,7 @@ async function runStartupScrollbackOverflow(
     await session.waitForPane(
       (pane) =>
         pane.includes(promptTail) &&
-        pane.split("\n").some((row) => /^❯\s*$/.test(row)),
+        pane.split("\n").some((row) => /^┃\s*$/.test(row)),
       10_000,
     );
     const submittedFrame = await capture(context, session, "overflow-submitted-prompt-tail-visible");
@@ -1755,7 +1746,7 @@ function startActiveToolGatewayFixture(): LocalGatewayFixture {
           ? [
               `data: ${JSON.stringify({ type: "tool-input-start", id: "active_tool_1", toolName: "terminal" })}`,
               "",
-              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "terminal", input: { action: "exec", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done" } })}`,
+              `data: ${JSON.stringify({ type: "tool-call", toolCallId: "active_tool_1", toolName: "terminal", input: { action: "exec", command: "sleep 1; i=1; while [ \"$i\" -le 32 ]; do printf 'ACTIVE_TOOL_LINE_%02d\\n' \"$i\"; i=$((i+1)); sleep 0.03; done; while [ ! -f .active-tool-release ]; do sleep 0.05; done", timeout_ms: 600_000 } })}`,
               "",
               `data: ${JSON.stringify({ type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } } })}`,
               "",
@@ -1853,7 +1844,7 @@ function startObservabilityGatewayFixture(
                 type: "tool-call",
                 toolCallId: "observability-tool-1",
                 toolName: "terminal",
-                input: { action: "exec", command },
+                input: { action: "exec", command, timeout_ms: 600_000 },
               },
               {
                 type: "finish",
@@ -2338,7 +2329,7 @@ function createFixture(runId: string): Fixture {
   mkdirSync(fixture.work, { recursive: true });
   writeFileSync(
     join(fixture.home, ".fx", "settings.json"),
-    `${JSON.stringify({ maxxing_mode: "legacy" })}\n`,
+    `${JSON.stringify({})}\n`,
   );
   writeFileSync(join(fixture.work, "run-id.txt"), `${runId}\n`);
   writeFileSync(

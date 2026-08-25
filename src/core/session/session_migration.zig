@@ -1030,7 +1030,7 @@ fn loadMigrationPreferences(
     return .{
         .model = try alloc.dupe(
             u8,
-            detailed.settings.model orelse "anthropic/claude-opus-4.7",
+            detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
         ),
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,

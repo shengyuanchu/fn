@@ -17,8 +17,8 @@ pub const input_prefix = "❯ ";
 pub const TerminalRgb = user_message_card.Rgb;
 pub const reset_style = "\x1b[0m";
 pub const bold_style = "\x1b[1m";
-pub const app_name = "fx";
-pub const right_tag = "/fx";
+pub const app_name = "fn";
+pub const right_tag = "/fn";
 pub const ask_activity_label = "⏺ Asking";
 
 const user_message_card = @import("assistant/user_message_card.zig");
@@ -26,7 +26,6 @@ const user_message_card = @import("assistant/user_message_card.zig");
 pub const welcome_message_reserved_rows: u16 = 11;
 
 pub var is_light: bool = false;
-pub var input_bar_style: []const u8 = "";
 pub var divider_style: []const u8 = "\x1b[38;5;240m";
 pub var hint_style: []const u8 = "\x1b[38;5;255m";
 pub var statusline_style: []const u8 = "\x1b[38;5;245m";
@@ -68,7 +67,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
     active_terminal_background = terminal_bg;
     assistant_presentation.setInlineCodeTheme(light);
     if (light) {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;250m";
         hint_style = "\x1b[38;5;235m";
         statusline_style = "\x1b[38;5;241m";
@@ -87,7 +85,6 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         selected_completion_style = "\x1b[1;38;5;235m";
         permission_auto_style = "\x1b[38;5;238m";
     } else {
-        input_bar_style = "";
         divider_style = "\x1b[38;5;240m";
         hint_style = "\x1b[38;5;255m";
         statusline_style = "\x1b[38;5;245m";
@@ -117,11 +114,7 @@ pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
         diff_removed_marker_style = diff_removed_marker_fallback;
     }
 
-    // Delegate bar shade computation to the card module — it owns the logic
-    // that derives a subtle but visible shade from the terminal's actual bg.
-    user_message_card.setTruecolor(truecolor_enabled);
     user_message_card.setStyle(light, terminal_bg);
-    input_bar_style = user_message_card.user_message_style;
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
@@ -692,7 +685,7 @@ fn titleOutput(raw: ?*anyopaque) std.Io.File {
 }
 
 const terminal_title_osc_prefix = "\x1b]2;";
-const terminal_title_display_prefix = "fx · ";
+const terminal_title_display_prefix = "fn · ";
 const terminal_title_max_content_bytes: usize = 128;
 const terminal_title_max_label_bytes = terminal_title_max_content_bytes - terminal_title_display_prefix.len;
 
@@ -758,7 +751,7 @@ test "terminal title writes the label to the caller's output file" {
     defer written_file.close(io_mod.getIo());
     const written = try io_mod.readFileToEnd(alloc, &written_file, 128);
     defer alloc.free(written);
-    try std.testing.expectEqualStrings("\x1b]2;fx · release notes\x07", written);
+    try std.testing.expectEqualStrings("\x1b]2;fn · release notes\x07", written);
 }
 
 test "terminal title sanitizes and bounds untrusted labels" {
@@ -775,7 +768,7 @@ test "terminal title sanitizes and bounds untrusted labels" {
     const written = try io_mod.readFileToEnd(alloc, &written_file, 512);
     defer alloc.free(written);
     try std.testing.expect(written.len <= terminal_title_osc_prefix.len + terminal_title_max_content_bytes + 1);
-    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fx · safe]2;owned"));
+    try std.testing.expect(std.mem.startsWith(u8, written, "\x1b]2;fn · safe]2;owned"));
     try std.testing.expect(std.mem.endsWith(u8, written, "...\x07"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "\x07"));
     try std.testing.expect(std.mem.find(u8, written[terminal_title_osc_prefix.len..], "\x1b") == null);
@@ -804,7 +797,7 @@ pub fn formatResumeHandoff(
     terminal_cols: u16,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "fx --resume ";
+    const command = "fn --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.fmt.bufPrint(
@@ -818,30 +811,28 @@ test "initTheme sets light mode styles" {
     initTheme(true, null);
     try std.testing.expect(is_light);
     try std.testing.expect(!std.mem.eql(u8, subtitle_style, "\x1b[1;38;5;255m"));
-    try std.testing.expectEqualStrings("\x1b[48;5;255m\x1b[38;5;16m", input_bar_style);
 
     initTheme(false, null);
     try std.testing.expect(!is_light);
     try std.testing.expectEqualStrings("\x1b[1;38;5;255m", subtitle_style);
-    try std.testing.expectEqualStrings("\x1b[48;5;238m\x1b[38;5;250m", input_bar_style);
 }
 
 test "resume handoff uses one row only when the full instruction fits" {
     initTheme(false, null);
     defer initTheme(false, null);
 
-    const single_row = "Continue session with: fx --resume session-123";
+    const single_row = "Continue session with: fn --resume session-123";
     var exact_buffer: [128]u8 = undefined;
     const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with: fn --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
     const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with:\n  fn --resume session-123\x1b[0m\n",
         narrow,
     );
 }
@@ -853,7 +844,7 @@ test "resume handoff follows the active muted theme shade" {
     var buffer: [128]u8 = undefined;
     const message = try formatResumeHandoff(&buffer, "session-123", 80);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
+        "\x1b[38;5;247mContinue session with: fn --resume session-123\x1b[0m\n",
         message,
     );
 }

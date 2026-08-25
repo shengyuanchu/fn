@@ -34,7 +34,15 @@ pub fn decode(
     if (command.string.len > js_host_workspace.max_command_bytes) {
         return failure(ctx.allocator, "browser terminal field \"command\" exceeds 65536 bytes");
     }
-    return terminal.decode(ctx, args_json);
+    var native_args: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer native_args.deinit();
+    native_args.writer.writeAll("{\"action\":\"exec\",\"command\":") catch
+        return error.OutOfMemory;
+    std.json.Stringify.value(command.string, .{}, &native_args.writer) catch
+        return error.OutOfMemory;
+    native_args.writer.print(",\"timeout_ms\":{d}}}", .{js_host_workspace.max_timeout_ms}) catch
+        return error.OutOfMemory;
+    return terminal.decode(ctx, native_args.written());
 }
 
 fn failure(alloc: Allocator, message: []const u8) Allocator.Error!tool_dispatch.DecodeResult {

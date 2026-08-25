@@ -1,12 +1,11 @@
 const std = @import("std");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const gateway_client = @import("client.zig");
-const gateway_json = @import("../core/gateway/gateway_json.zig");
-const gateway_schema = @import("../core/tooling/gateway_schema.zig");
+const vercel_protocol = @import("vercel_protocol.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
-const tool_advertisement = @import("../core/tooling/tool_advertisement.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -210,18 +209,18 @@ pub fn validateEndpointUrl(url: []const u8) error{ InvalidEndpoint, InsecureEndp
 
 pub fn buildAgentRequest(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: agent_stream_provider.RequestData,
 ) ![]u8 {
     return buildAgentRequestForProtocol(alloc, request, try configuredProtocol(alloc));
 }
 
 fn buildAgentRequestForProtocol(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: agent_stream_provider.RequestData,
     protocol: Protocol,
 ) ![]u8 {
     try checkBudget(request.budget);
-    try gateway_json.validateToolMessageHistory(alloc, request.messages);
+    try vercel_protocol.validateToolMessageHistory(alloc, request.messages);
 
     if (request.verified_images != null and request.response_format == null) {
         return error.MissingStructuredResponseFormat;
@@ -230,32 +229,8 @@ fn buildAgentRequestForProtocol(
         return error.StructuredResponseRequiresVerifiedImages;
     }
 
-    var required_tool_choice = false;
-    var tools_json: []u8 = undefined;
-    if (request.vision_mode == .required) {
-        const vision_schema = try writeVisionSchema(alloc, request);
-        defer alloc.free(vision_schema);
-        tools_json = try std.fmt.allocPrint(alloc, "[{s}]", .{vision_schema});
-        required_tool_choice = true;
-    } else if (request.vision_mode != .unavailable or request.selected_dynamic_tool_schemas.len > 0) {
-        const vision_schema = if (request.vision_mode != .unavailable)
-            try writeVisionSchema(alloc, request)
-        else
-            null;
-        defer if (vision_schema) |schema| alloc.free(schema);
-
-        var schemas: std.ArrayList([]const u8) = .empty;
-        defer schemas.deinit(alloc);
-        try schemas.appendSlice(alloc, request.selected_dynamic_tool_schemas);
-        if (vision_schema) |schema| try schemas.append(alloc, schema);
-        tools_json = try tool_advertisement.buildGatewayToolsJsonWithSelectedDynamicSchemas(
-            alloc,
-            request.serialized_tools,
-            schemas.items,
-        );
-    } else {
-        tools_json = try alloc.dupe(u8, request.serialized_tools);
-    }
+    const required_tool_choice = request.vision_mode == .required;
+    const tools_json = try buildAgentToolsJson(alloc, request);
     defer alloc.free(tools_json);
 
     return switch (protocol) {
@@ -280,13 +255,73 @@ fn buildAgentRequestForProtocol(
     };
 }
 
-fn writeVisionSchema(alloc: Allocator, request: agent_stream_provider.BuildRequest) ![]u8 {
-    const vision_tool = request.tool_registry.lookup("vision") orelse
-        return error.VisionToolNotRegistered;
+fn buildAgentToolsJson(alloc: Allocator, request: agent_stream_provider.RequestData) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision_tool.gateway_schema);
+    try out.writer.writeByte('[');
+    var first = true;
+
+    if (request.vision_mode == .required) {
+        const vision = request.tools.registry.lookup("vision") orelse
+            return error.VisionToolNotRegistered;
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision.model_schema);
+        try out.writer.writeByte(']');
+        return out.toOwnedSlice();
+    }
+
+    for (request.tools.advertised_names) |name| {
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        if (request.tools.advertisedFunction(name)) |function| {
+            try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, function);
+        } else {
+            const tool = request.tools.registry.lookup(name) orelse
+                return error.AdvertisedToolNotRegistered;
+            const write_advertisement = tool.write_provider_advertisement_fn orelse
+                return error.AdvertisedToolSchemaMissing;
+            try write_advertisement(alloc, &out.writer);
+        }
+    }
+    for (request.tools.additional_functions) |tool| {
+        if (toolNameSelected(request.tools.advertised_names, tool.name)) continue;
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, tool);
+    }
+    for (request.tools.selected_dynamic) |tool| {
+        if (toolNameSelected(request.tools.advertised_names, tool.name)) continue;
+        if (!first) try out.writer.writeByte(',');
+        first = false;
+        try writeDynamicFunctionTool(&out.writer, tool);
+    }
+    if (request.vision_mode == .optional and
+        !toolNameSelected(request.tools.advertised_names, "vision"))
+    {
+        const vision = request.tools.registry.lookup("vision") orelse
+            return error.VisionToolNotRegistered;
+        if (!first) try out.writer.writeByte(',');
+        try model_tool_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision.model_schema);
+    }
+    try out.writer.writeByte(']');
     return out.toOwnedSlice();
+}
+
+fn toolNameSelected(names: []const []const u8, expected: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
+    return false;
+}
+
+fn writeDynamicFunctionTool(
+    writer: *std.Io.Writer,
+    tool: agent_stream_provider.DynamicFunctionTool,
+) !void {
+    try writer.writeAll("{\"type\":\"function\",\"name\":");
+    try std.json.Stringify.value(tool.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(tool.description, .{}, writer);
+    try writer.writeAll(",\"inputSchema\":");
+    try std.json.Stringify.value(tool.input_schema, .{}, writer);
+    try writer.writeByte('}');
 }
 
 fn checkBudget(budget: ?agent_stream_provider.BuildBudget) !void {
@@ -302,7 +337,7 @@ fn checkBudget(budget: ?agent_stream_provider.BuildBudget) !void {
 
 fn buildChatRequestBody(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: agent_stream_provider.RequestData,
     tools_json: []const u8,
     required_tool_choice: bool,
 ) ![]u8 {
@@ -351,7 +386,7 @@ fn writeMessage(
     budget: ?agent_stream_provider.BuildBudget,
 ) !void {
     try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(gateway_json.roleName(message.role), .{}, writer);
+    try std.json.Stringify.value(vercel_protocol.roleName(message.role), .{}, writer);
 
     switch (message.role) {
         .system => {
@@ -486,29 +521,24 @@ fn writeTools(alloc: Allocator, writer: *std.Io.Writer, tools_json: []const u8) 
 }
 
 fn writeResponseFormat(
-    alloc: Allocator,
+    _: Allocator,
     writer: *std.Io.Writer,
     format: agent_stream_provider.StructuredResponseFormat,
 ) !void {
-    var schema = std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidStructuredResponseSchema,
-    };
-    defer schema.deinit();
-    if (schema.value != .object) return error.InvalidStructuredResponseSchema;
+    if (format.schema != .object) return error.InvalidStructuredResponseSchema;
 
     try writer.writeAll(",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":");
     try std.json.Stringify.value(format.name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(format.description, .{}, writer);
     try writer.writeAll(",\"strict\":true,\"schema\":");
-    try std.json.Stringify.value(schema.value, .{}, writer);
+    try std.json.Stringify.value(format.schema, .{}, writer);
     try writer.writeAll("}}");
 }
 
 fn buildResponsesRequestBody(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: agent_stream_provider.RequestData,
     tools_json: []const u8,
     required_tool_choice: bool,
 ) ![]u8 {
@@ -592,7 +622,7 @@ fn writeResponsesMessage(
     budget: ?agent_stream_provider.BuildBudget,
 ) !void {
     try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(gateway_json.roleName(message.role), .{}, writer);
+    try std.json.Stringify.value(vercel_protocol.roleName(message.role), .{}, writer);
 
     const image_count = if (verified_images) |images| images.len else message.images.len;
     if (message.role != .user or image_count == 0) {
@@ -682,29 +712,24 @@ fn writeResponsesTools(alloc: Allocator, writer: *std.Io.Writer, tools_json: []c
 }
 
 fn writeResponsesTextFormat(
-    alloc: Allocator,
+    _: Allocator,
     writer: *std.Io.Writer,
     format: agent_stream_provider.StructuredResponseFormat,
 ) !void {
-    var schema = std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidStructuredResponseSchema,
-    };
-    defer schema.deinit();
-    if (schema.value != .object) return error.InvalidStructuredResponseSchema;
+    if (format.schema != .object) return error.InvalidStructuredResponseSchema;
 
     try writer.writeAll(",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":");
     try std.json.Stringify.value(format.name, .{}, writer);
     try writer.writeAll(",\"description\":");
     try std.json.Stringify.value(format.description, .{}, writer);
     try writer.writeAll(",\"strict\":true,\"schema\":");
-    try std.json.Stringify.value(schema.value, .{}, writer);
+    try std.json.Stringify.value(format.schema, .{}, writer);
     try writer.writeAll("}}");
 }
 
 fn buildAnthropicRequestBody(
     alloc: Allocator,
-    request: agent_stream_provider.BuildRequest,
+    request: agent_stream_provider.RequestData,
     tools_json: []const u8,
     required_tool_choice: bool,
 ) ![]u8 {
@@ -946,39 +971,38 @@ fn writeAnthropicTools(alloc: Allocator, writer: *std.Io.Writer, tools_json: []c
 }
 
 fn writeAnthropicOutputFormat(
-    alloc: Allocator,
+    _: Allocator,
     writer: *std.Io.Writer,
     format: agent_stream_provider.StructuredResponseFormat,
 ) !void {
-    var schema = std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidStructuredResponseSchema,
-    };
-    defer schema.deinit();
-    if (schema.value != .object) return error.InvalidStructuredResponseSchema;
+    if (format.schema != .object) return error.InvalidStructuredResponseSchema;
 
     try writer.writeAll(",\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":");
-    try std.json.Stringify.value(schema.value, .{}, writer);
+    try std.json.Stringify.value(format.schema, .{}, writer);
     try writer.writeAll("}}");
 }
 
 pub fn streamAgentCompletion(
     alloc: Allocator,
-    request: agent_stream_provider.Request,
+    request: agent_stream_provider.ModelRequest,
 ) !agent_stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const endpoint = try configuredEndpoint();
-    const resolved_url = try resolveEndpointAlloc(alloc, request.chat_url, endpoint.kind);
+    const resolved_url = try resolveEndpointAlloc(alloc, endpoint.url, endpoint.kind);
     defer alloc.free(resolved_url);
     const protocol = try protocolForUrl(resolved_url);
     const uri = std.Uri.parse(resolved_url) catch return error.InvalidEndpoint;
+    const payload = try buildAgentRequest(alloc, request.data());
+    defer alloc.free(payload);
     const retry_count = switch (request.provider_attempt_owner) {
         .agent => 1,
         .transport => @max(request.retry_count, 1),
     };
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer alloc.free(auth_header);
 
+    try request.admission.admit();
     var attempt: usize = 0;
     while (attempt < retry_count) : (attempt += 1) {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -990,7 +1014,7 @@ pub fn streamAgentCompletion(
         };
         const anthropic_headers = [_]std.http.Header{
             .{ .name = "Accept", .value = "text/event-stream" },
-            .{ .name = "x-api-key", .value = request.api_key },
+            .{ .name = "x-api-key", .value = request.credential.secret },
             .{ .name = "anthropic-version", .value = "2023-06-01" },
         };
         const extra_headers: []const std.http.Header = switch (protocol) {
@@ -1019,11 +1043,11 @@ pub fn streamAgentCompletion(
         };
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = request.payload.len };
+        req.transfer_encoding = .{ .content_length = payload.len };
         var send_buf: [8192]u8 = undefined;
         request.delivery.markPossiblySent();
         var body_writer = try req.sendBodyUnflushed(&send_buf);
-        try body_writer.writer.writeAll(request.payload);
+        try body_writer.writer.writeAll(payload);
         try body_writer.end();
         try req.connection.?.flush();
 
@@ -1041,58 +1065,95 @@ pub fn streamAgentCompletion(
                 io_mod.sleep((attempt + 1) * 150 * std.time.ns_per_ms);
                 continue;
             }
-            return .{
-                .status = status,
-                .err_body = body,
-                .completion = .{ .delivery_ambiguous = @intFromEnum(status) >= 500 },
+            return .{ .failed = .{
+                .kind = failureKind(status),
+                .detail = body,
                 .ownership = .owned,
-            };
+            } };
         }
 
         var transfer_buf: [256 * 1024]u8 = undefined;
         const reader = response.reader(&transfer_buf);
+        var events = request.events;
         const completion = switch (protocol) {
             .openai_chat_completions => try consumeOpenAiSseStream(
                 alloc,
                 reader,
-                request.callback_ctx,
-                request.on_content_chunk,
-                request.on_tool_start,
-                request.on_reasoning_chunk,
-                request.on_tool_input_chunk,
+                &events,
+                EventBridge.content,
+                EventBridge.toolStart,
+                EventBridge.reasoning,
+                EventBridge.toolInput,
                 request.cancel_flag,
                 request.content_capture_limit,
             ),
             .openai_responses => try consumeResponsesSseStream(
                 alloc,
                 reader,
-                request.callback_ctx,
-                request.on_content_chunk,
-                request.on_tool_start,
-                request.on_reasoning_chunk,
-                request.on_tool_input_chunk,
+                &events,
+                EventBridge.content,
+                EventBridge.toolStart,
+                EventBridge.reasoning,
+                EventBridge.toolInput,
                 request.cancel_flag,
                 request.content_capture_limit,
             ),
             .anthropic_messages => try consumeAnthropicSseStream(
                 alloc,
                 reader,
-                request.callback_ctx,
-                request.on_content_chunk,
-                request.on_tool_start,
-                request.on_reasoning_chunk,
-                request.on_tool_input_chunk,
+                &events,
+                EventBridge.content,
+                EventBridge.toolStart,
+                EventBridge.reasoning,
+                EventBridge.toolInput,
                 request.cancel_flag,
                 request.content_capture_limit,
             ),
         };
-        return .{
-            .status = .ok,
+        return .{ .completed = .{
             .completion = completion,
+            .usage = .{ .immediate = null },
             .ownership = .owned,
-        };
+        } };
     }
     return error.HttpConnectionClosing;
+}
+
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *agent_stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    }
+};
+
+fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
 }
 
 fn isRetryableStatus(status: std.http.Status) bool {
@@ -1131,7 +1192,7 @@ pub fn consumeOpenAiSseStream(
     on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -1202,7 +1263,7 @@ pub fn consumeOpenAiSseStream(
         }
     }
 
-    var completion: types.GatewayCompletion = .{};
+    var completion: types.ModelCompletion = .{};
     errdefer deinitCompletion(alloc, &completion);
     if (content.items.len > 0) completion.content = try alloc.dupe(u8, content.items);
     completion.tool_calls = try materializeToolCalls(alloc, tools.items, callback_ctx, on_tool_start);
@@ -1221,7 +1282,7 @@ fn consumeResponsesSseStream(
     on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -1315,7 +1376,7 @@ fn consumeResponsesSseStream(
         }
     }
 
-    var completion: types.GatewayCompletion = .{};
+    var completion: types.ModelCompletion = .{};
     errdefer deinitCompletion(alloc, &completion);
     if (content.items.len > 0) completion.content = try alloc.dupe(u8, content.items);
     completion.tool_calls = try materializeToolCalls(alloc, tools.items, callback_ctx, on_tool_start);
@@ -1387,7 +1448,7 @@ fn consumeAnthropicSseStream(
     on_tool_input_chunk: ?agent_stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
+) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
     var tools: std.ArrayList(ToolAccumulator) = .empty;
@@ -1500,7 +1561,7 @@ fn consumeAnthropicSseStream(
         if (std.mem.eql(u8, event_type.string, "error")) return error.ProviderStreamError;
     }
 
-    var completion: types.GatewayCompletion = .{};
+    var completion: types.ModelCompletion = .{};
     errdefer deinitCompletion(alloc, &completion);
     if (content.items.len > 0) completion.content = try alloc.dupe(u8, content.items);
     completion.tool_calls = try materializeToolCalls(alloc, tools.items, callback_ctx, on_tool_start);
@@ -1757,7 +1818,7 @@ const SseLineReader = struct {
     }
 };
 
-fn deinitCompletion(alloc: Allocator, completion: *types.GatewayCompletion) void {
+fn deinitCompletion(alloc: Allocator, completion: *types.ModelCompletion) void {
     if (completion.content) |content| alloc.free(@constCast(content));
     types.freeToolCallSlice(alloc, @constCast(completion.tool_calls));
     completion.* = .{};
@@ -1792,6 +1853,20 @@ fn appendCatalogEntry(
         .max_tokens = 32_000,
     });
 }
+
+const test_read_file_properties = [_]model_tool_schema.Property{.{
+    .name = "path",
+    .json_type = .string,
+}};
+const test_read_file_required = [_][]const u8{"path"};
+const test_read_file_schema = model_tool_schema.FunctionSchema{
+    .name = "read_file",
+    .description = "Read",
+    .input_schema = .{
+        .properties = &test_read_file_properties,
+        .required = &test_read_file_required,
+    },
+};
 
 test "direct provider endpoint validation and protocol selection" {
     try validateEndpointUrl("https://api.openai.com/v1/chat/completions");
@@ -1863,7 +1938,7 @@ test "OpenAI-compatible request converts messages and flattened tools" {
         std.testing.allocator,
         .{
             .model = "local/test-model",
-            .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}]",
+            .tools = .{ .additional_functions = &.{test_read_file_schema} },
             .messages = &messages,
             .tool_choice = .auto,
             .provider_options = .{},
@@ -1897,7 +1972,7 @@ test "Responses request converts history tools and tool results" {
         std.testing.allocator,
         .{
             .model = "local/responses-model",
-            .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}]",
+            .tools = .{ .additional_functions = &.{test_read_file_schema} },
             .messages = &messages,
             .tool_choice = .auto,
             .provider_options = .{},
@@ -1934,7 +2009,7 @@ test "Anthropic request converts system tools and tool results" {
         std.testing.allocator,
         .{
             .model = "claude-local",
-            .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}]",
+            .tools = .{ .additional_functions = &.{test_read_file_schema} },
             .messages = &messages,
             .tool_choice = .auto,
             .provider_options = .{},
@@ -1971,7 +2046,6 @@ test "Anthropic request groups parallel tool results into one user message" {
         std.testing.allocator,
         .{
             .model = "deepseek-v4-flash",
-            .serialized_tools = "[]",
             .messages = &messages,
             .tool_choice = .none,
             .provider_options = .{},

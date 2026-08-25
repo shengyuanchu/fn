@@ -192,7 +192,7 @@ jobs:
         working-directory: tests/e2e
 
       - name: Run legacy stdio MCP tool lifecycle test
-        run: bun test gateway-stream-lifecycle.test.ts --test-name-pattern "selected dynamic MCP automatic review asks with zero sends and allows exactly once"
+        run: bun test gateway-stream-lifecycle.test.ts --test-name-pattern "selected dynamic MCP review cautions with zero sends and clears exactly once"
         working-directory: tests/e2e
 
       - name: Run stdio MCP dispatcher lifecycle tests

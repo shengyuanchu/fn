@@ -60,6 +60,20 @@ export MODEL="your-model"
 fn
 ```
 
+### Subscription providers
+
+`fn login codex` and `fn login grok` select that provider and a model from its
+authenticated catalog. Inside fn, open `/setup` and choose **Model provider**
+to move between Gateway, Codex, and Grok. `/model` lists the active provider's
+fetched models. Use `/logout codex` or `/logout grok` to remove that
+subscription session without affecting other providers.
+
+The OpenAI Codex route uses ChatGPT subscription access directly and never sends its OAuth token to Vercel AI Gateway. The session is stored privately at `~/.fx/chatgpt-auth.json` and refreshed when needed. On supported Codex models, `/fast` requests OpenAI's priority service tier and consumes ChatGPT credits at the higher Fast mode rate.
+
+The Grok route uses subscription access directly at xAI and never sends its OAuth token to Vercel AI Gateway or OpenAI. Its session is stored privately at `~/.fx/grok-auth.json`, refreshed when needed, and used only with the authenticated xAI catalog and Responses API.
+
+To use a Vercel AI Gateway API key instead, run `fn setup`.
+
 ### Local models
 
 ```bash
@@ -80,7 +94,64 @@ fn update                           # Update fn
 fn --help                           # Show all options
 ```
 
-`fn` asks before sensitive actions. `--yolo` disables approvals.
+`fn` starts in `auto` permission mode. Routine understood development actions
+run directly; unresolved actions receive a narrow safety review. Use
+`--prompt-permissions` to allow configured approval prompts for interactive
+JSON or quiet requests, or `--yolo` to disable approvals.
+
+The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
+
+The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "workspace": true
+  }
+}
+```
+
+List saved sessions with `fn sessions`. Resume the latest session for the current workspace, or select an exact session ID, through the same command group:
+
+```bash
+fn session resume last
+fn session resume --id <id>
+```
+
+Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fn-owned title. Noninteractive commands do not emit terminal-title controls.
+
+Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fn copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
+
+Use `fn ask` for a single request:
+
+```bash
+fn ask "explain the changes in this repository"
+```
+
+Foreground terminal commands run with an explicit finite deadline. fn uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
+
+Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
+
+## Embed fn
+
+fn builds as a native binary or WebAssembly. Applications embedding fn can provide network transport, session storage, configuration, permission handling, and terminal I/O. The SDK retains its upstream fx symbol and artifact names.
+
+| Surface | Use |
+| --- | --- |
+| `fn acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
+| `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
+| `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
+
+The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md).
+
+## Extend fn
+
+Add reusable instructions with skills, connect external tools through MCP, or
+delegate independent work to subagents. Inside fn,
+`/mcp add <name> <command> [args...]` saves a local server and
+`/mcp add --transport http <name> <url>` saves a remote Streamable HTTP server.
+`fn status` and `fn doctor` report an invalid trusted MCP profile without
+starting its servers.
 
 ## Build from source
 

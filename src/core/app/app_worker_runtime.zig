@@ -826,23 +826,9 @@ pub fn Runtime(comptime App: type) type {
                     },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
-                        if (comptime @hasField(App, "session_persistence")) {
-                            app_session_runtime.Runtime(App).recordAppliedCommandOutput(
-                                app,
-                                chunk.lifecycle_id,
-                                chunk.stream,
-                                chunk.text,
-                            );
-                        }
                     },
                     .command_output_complete => |lifecycle_id| {
                         try handlers.command_output_complete(handlers.ctx, lifecycle_id);
-                        if (comptime @hasField(App, "session_persistence")) {
-                            app_session_runtime.Runtime(App).recordCommandOutputComplete(
-                                app,
-                                lifecycle_id,
-                            );
-                        }
                     },
                     .turn_token_update => |update| {
                         applyTurnTokenProgress(app, update);
@@ -908,12 +894,6 @@ pub fn Runtime(comptime App: type) type {
                 .{},
             );
             try handlers.command_output_complete(handlers.ctx, lifecycle_id);
-            if (comptime @hasField(App, "session_persistence")) {
-                app_session_runtime.Runtime(App).recordCommandOutputComplete(
-                    app,
-                    lifecycle_id,
-                );
-            }
         }
 
         fn requireAssistantTextDrain(handlers: WorkerEventHandlers) !bool {
@@ -1364,7 +1344,6 @@ const FakeShell = struct {
     shimmer_active: bool = false,
     render_requests: render_request.RenderRequestState = .{},
     lifecycle: transcript_runtime.TranscriptRuntime = .{
-        .maxxing_mode = .legacy,
         .layout = .{
             .rows = 24,
             .cols = 80,
@@ -2603,17 +2582,7 @@ test "core.app_worker_runtime queued command completion preserves three thousand
 
     block = &app.shell.lifecycle.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 3_000), block.total_lines);
-    var compact = try app.shell.lifecycle.prepareTranscriptSource(alloc, null);
-    defer compact.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(usize, 5),
-        std.mem.count(u8, compact.bytes, "\n"),
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        compact.bytes,
-        "│ … 2995 lines more (ctrl o to view)",
-    ) != null);
+    try std.testing.expectEqualStrings("unterminated", block.lines.items[2_999].text);
 }
 
 test "core.app_worker_runtime syncState mirrors approvals without opening a pending question" {
@@ -4160,11 +4129,7 @@ test "core.app_worker_runtime records accepted command output once and drops rej
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunk_count);
     try std.testing.expectEqual(@as(usize, 1), capture.completion_count);
-    const pending = app.session_persistence.pending_cancelled_command orelse
-        return error.MissingCancelledCommandCapture;
-    try std.testing.expectEqualStrings(lifecycle_id.call_id, pending.lifecycle_id.call_id);
-    try std.testing.expect(pending.completed);
-    try std.testing.expect(pending.capture.?.hasOutput());
+    try std.testing.expect(app.session_persistence.pending_cancelled_command == null);
 
     app.worker.worker_cancel_requested.store(true, .seq_cst);
     try Runtime(FakeApp).pushCommandOutput(&app, lifecycle_id, .stdout, "late-stdout\n");

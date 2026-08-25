@@ -6,10 +6,11 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const responses_protocol = @import("responses_protocol.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
-const generation_origin = "https://cli-chat-proxy.grok.com/v1";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const proxy_compatibility_version = "1.0.6";
 const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
@@ -25,7 +26,6 @@ const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
 
 pub const agent_stream_provider = stream_provider.Provider{
-    .build_fn = buildRequest,
     .stream_fn = streamCompletion,
 };
 
@@ -36,10 +36,9 @@ fn validateModel(model: []const u8) !void {
     }
 }
 
-fn buildRequest(
-    _: ?*anyopaque,
+pub fn buildRequest(
     alloc: Allocator,
-    request: stream_provider.BuildRequest,
+    request: stream_provider.RequestData,
 ) ![]u8 {
     try validateModel(request.model);
     if (request.budget) |budget| {
@@ -66,24 +65,22 @@ fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeInput(writer, alloc, request.messages, request.verified_images);
+    try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
     try writer.writeByte(']');
 
-    _ = try writeTools(writer, alloc, request.serialized_tools, request.selected_dynamic_tool_schemas);
+    _ = try responses_protocol.writeTools(writer, alloc, request.tools);
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
-        var schema = try std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{});
-        defer schema.deinit();
-        if (schema.value != .object) return error.InvalidStructuredResponseSchema;
+        if (format.schema != .object) return error.InvalidStructuredResponseSchema;
         try writer.writeAll(",\"format\":{\"type\":\"json_schema\",\"name\":");
         try std.json.Stringify.value(format.name, .{}, writer);
         try writer.writeAll(",\"description\":");
         try std.json.Stringify.value(format.description, .{}, writer);
         try writer.writeAll(",\"schema\":");
-        try std.json.Stringify.value(schema.value, .{}, writer);
+        try std.json.Stringify.value(format.schema, .{}, writer);
         try writer.writeAll(",\"strict\":true}");
     }
     try writer.writeByte('}');
@@ -98,162 +95,42 @@ fn buildRequest(
     return out.toOwnedSlice();
 }
 
-fn writeInput(
+fn writeResponsesInput(
     writer: *std.Io.Writer,
     alloc: Allocator,
     messages: []const types.ChatMessage,
-    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    images: ?[]const image_attachments.VerifiedSnapshot,
 ) !void {
-    var first = true;
-    for (messages, 0..) |message, message_index| {
-        switch (message.role) {
-            .system => continue,
-            .user => {
-                try writeComma(writer, &first);
-                try writer.writeAll("{\"role\":\"user\",\"content\":[");
-                var first_part = true;
-                if (message.content) |content| if (content.len > 0) {
-                    try writer.writeAll("{\"type\":\"input_text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
-                    try writer.writeByte('}');
-                    first_part = false;
-                };
-                if (verified_images) |images| {
-                    if (message_index == messages.len - 1) {
-                        for (images) |image| {
-                            if (!first_part) try writer.writeByte(',');
-                            try writeInputImage(writer, alloc, image);
-                            first_part = false;
-                        }
-                    }
-                }
-                try writer.writeAll("]}");
-            },
-            .assistant => {
-                if (message.provider_state_json) |state_json| {
-                    if (state_json.len > max_provider_state_bytes) return error.XaiGrokProviderStateTooLarge;
-                    var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
-                        return error.InvalidXaiGrokProviderState;
-                    defer state.deinit();
-                    if (state.value != .array) return error.InvalidXaiGrokProviderState;
-                    for (state.value.array.items) |item| {
-                        if (item != .object) return error.InvalidXaiGrokProviderState;
-                        try writeComma(writer, &first);
-                        try std.json.Stringify.value(item, .{}, writer);
-                    }
-                }
-                if (message.content) |content| if (content.len > 0) {
-                    try writeComma(writer, &first);
-                    try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
-                    try writer.writeAll(",\"annotations\":[]}]}");
-                };
-                for (message.tool_calls) |call| {
-                    if (call.id.len == 0 or call.id.len > max_tool_identity_bytes or
-                        call.name.len == 0 or call.name.len > max_tool_identity_bytes or
-                        call.arguments_json.len > max_tool_arguments_bytes)
-                    {
-                        return error.XaiGrokToolCallLimitExceeded;
-                    }
-                    try writeComma(writer, &first);
-                    try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
-                    try std.json.Stringify.value(call.id, .{}, writer);
-                    try writer.writeAll(",\"name\":");
-                    try std.json.Stringify.value(call.name, .{}, writer);
-                    try writer.writeAll(",\"arguments\":");
-                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
-                    try writer.writeByte('}');
-                }
-            },
-            .tool => {
-                try writeComma(writer, &first);
-                try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-                try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
-                try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
-                try writer.writeByte('}');
-            },
-        }
-    }
-}
-
-fn writeInputImage(writer: *std.Io.Writer, alloc: Allocator, image: image_attachments.VerifiedSnapshot) !void {
-    const encoded_len = std.base64.standard.Encoder.calcSize(image.bytes.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, image.bytes);
-    try writer.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
-    try writer.writeAll(image.media_type);
-    try writer.writeAll(";base64,");
-    try writer.writeAll(encoded);
-    try writer.writeAll("\"}");
-}
-
-fn writeTools(
-    writer: *std.Io.Writer,
-    alloc: Allocator,
-    serialized_tools: []const u8,
-    selected_dynamic_schemas: []const []const u8,
-) !usize {
-    var count: usize = 0;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, serialized_tools, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidToolSchema,
+    return responses_protocol.writeInput(writer, alloc, messages, images, .{
+        .tool_calls = max_tool_calls,
+        .tool_identity_bytes = max_tool_identity_bytes,
+        .tool_arguments_bytes = max_tool_arguments_bytes,
+        .provider_state_bytes = max_provider_state_bytes,
+    }) catch |err| switch (err) {
+        error.ProviderStateTooLarge => error.XaiGrokProviderStateTooLarge,
+        error.InvalidProviderState => error.InvalidXaiGrokProviderState,
+        error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
+        error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
+        else => err,
     };
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.InvalidToolSchema;
-
-    var tools_out: std.Io.Writer.Allocating = .init(alloc);
-    defer tools_out.deinit();
-    try tools_out.writer.writeAll(",\"tools\":[");
-    for (parsed.value.array.items) |tool| {
-        if (try writeFunctionTool(&tools_out.writer, tool, count != 0)) count += 1;
-    }
-    for (selected_dynamic_schemas) |schema_json| {
-        var selected = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidToolSchema,
-        };
-        defer selected.deinit();
-        if (try writeFunctionTool(&tools_out.writer, selected.value, count != 0)) count += 1;
-    }
-    try tools_out.writer.writeByte(']');
-    if (count > 0) try writer.writeAll(tools_out.written());
-    return count;
-}
-
-fn writeFunctionTool(writer: *std.Io.Writer, value: std.json.Value, comma: bool) !bool {
-    if (value != .object) return false;
-    const kind = value.object.get("type") orelse return false;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "function")) return false;
-    const name = value.object.get("name") orelse return false;
-    if (name != .string or name.string.len == 0) return false;
-    const parameters = value.object.get("inputSchema") orelse value.object.get("parameters") orelse return false;
-    if (parameters != .object) return false;
-    if (comma) try writer.writeByte(',');
-    try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(name.string, .{}, writer);
-    if (value.object.get("description")) |description| if (description == .string) {
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(description.string, .{}, writer);
-    };
-    try writer.writeAll(",\"parameters\":");
-    try std.json.Stringify.value(parameters, .{}, writer);
-    try writer.writeAll(",\"strict\":false}");
-    return true;
-}
-
-fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
-    if (!first.*) try writer.writeByte(',');
-    first.* = false;
 }
 
 fn streamCompletion(
     _: ?*anyopaque,
     alloc: Allocator,
-    request: stream_provider.Request,
+    request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
-    var result = streamCompletionCore(alloc, request) catch |err| {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.credential.source != .grok_subscription) {
+        return error.GrokSubscriptionCredentialRequired;
+    }
+    const account_id = request.credential.account_id orelse
+        return error.GrokSubscriptionAccountRequired;
+    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokSubscriptionAccount;
+    try validateModel(request.model);
+    const payload = try buildRequest(alloc, request.data());
+    defer alloc.free(payload);
+    var result = streamPrepared(alloc, request, payload) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (requestDeadlineExpired(request)) return error.Timeout;
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
@@ -266,7 +143,7 @@ fn streamCompletion(
     return result;
 }
 
-fn requestDeadlineExpired(request: stream_provider.Request) bool {
+fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
     const deadline = request.deadline orelse return false;
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
@@ -308,15 +185,14 @@ const OpenRequestOperation = struct {
     }
 };
 
-fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !stream_provider.Result {
+pub fn streamPrepared(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (request.credential_source != .grok_subscription) {
-        return error.GrokSubscriptionCredentialRequired;
-    }
-    const account_id = request.account_id orelse return error.GrokSubscriptionAccountRequired;
-    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokSubscriptionAccount;
-    try validateModel(request.model);
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
+    const account_id = request.credential.account_id.?;
+    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.credential.secret});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
         if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EXaiGrokEndpoint;
@@ -362,6 +238,7 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
             connect_deadline = deadline;
         }
     }
+    try request.admission.admit();
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
@@ -394,11 +271,11 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     }
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    http_request.transfer_encoding = .{ .content_length = request.payload.len };
+    http_request.transfer_encoding = .{ .content_length = payload.len };
     var send_buffer: [8192]u8 = undefined;
     request.delivery.markPossiblySent();
     var body_writer = try http_request.sendBodyUnflushed(&send_buffer);
-    try body_writer.writer.writeAll(request.payload);
+    try body_writer.writer.writeAll(payload);
     try body_writer.end();
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -415,47 +292,70 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
             alloc.free(bounded_body);
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
-        return .{
-            .status = response.head.status,
-            .err_body = body,
+        return .{ .failed = .{
+            .kind = failureKind(response.head.status),
+            .detail = body,
             .ownership = .owned,
-        };
+        } };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
+    var events = request.events;
     const completion = try consumeSse(
         alloc,
         reader,
-        request.callback_ctx,
-        request.on_content_chunk,
-        request.on_tool_start,
-        request.on_reasoning_chunk,
-        request.on_tool_input_chunk,
+        &events,
+        EventBridge.content,
+        EventBridge.toolStart,
+        EventBridge.reasoning,
+        EventBridge.toolInput,
         request.cancel_flag,
         request.content_capture_limit,
     );
-    return .{
-        .status = .ok,
+    return .{ .completed = .{
         .completion = completion,
-        .generation_origin = generation_origin,
+        .usage = .{ .immediate = null },
         .ownership = .owned,
-    };
+    } };
 }
 
-const ToolAccumulator = struct {
-    output_index: i64,
-    id: []u8,
-    name: []u8,
-    arguments: std.ArrayList(u8) = .empty,
+const EventBridge = struct {
+    fn sink(raw: *anyopaque) *stream_provider.EventSink {
+        return @ptrCast(@alignCast(raw));
+    }
 
-    fn deinit(self: *ToolAccumulator, alloc: Allocator) void {
-        alloc.free(self.id);
-        alloc.free(self.name);
-        self.arguments.deinit(alloc);
-        self.* = undefined;
+    fn content(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .content_delta = chunk });
+    }
+
+    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .reasoning_delta = chunk });
+    }
+
+    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
+        sink(raw).emit(.{ .tool_input_delta = chunk });
+    }
+
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
     }
 };
+
+fn failureKind(status: std.http.Status) stream_provider.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
+}
 
 const SseReader = struct {
     pending_line: std.ArrayList(u8) = .empty,
@@ -477,11 +377,11 @@ const SseReader = struct {
     fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
         while (true) {
             const line = try self.readLine(alloc, reader) orelse return null;
-            self.aggregate_bytes = try checkedAccumulatedSize(
+            self.aggregate_bytes = responses_protocol.checkedAccumulatedSize(
                 self.aggregate_bytes,
                 line.wire_bytes,
                 max_sse_aggregate_bytes,
-            );
+            ) catch return error.XaiGrokResourceLimitExceeded;
             const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == ':') {
                 self.release();
@@ -548,295 +448,60 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-) !types.GatewayCompletion {
-    var content: std.ArrayList(u8) = .empty;
-    errdefer content.deinit(alloc);
-    var provider_state: std.Io.Writer.Allocating = .init(alloc);
-    defer provider_state.deinit();
-    var provider_state_count: usize = 0;
-    var tools: std.ArrayList(ToolAccumulator) = .empty;
-    defer {
-        for (tools.items) |*tool| tool.deinit(alloc);
-        tools.deinit(alloc);
-    }
+) !types.ModelCompletion {
+    var reducer = responses_protocol.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
     var sse: SseReader = .{};
     defer sse.deinit(alloc);
-    var finish_reason: ?types.ProviderFinishReason = null;
-    var usage: types.Usage = .{};
-    var generation_id: ?[]u8 = null;
-    errdefer if (generation_id) |id| alloc.free(id);
-    var terminal_seen = false;
-    var saw_content_delta = false;
-    var event_count: usize = 0;
-
+    const callbacks = responses_protocol.StreamCallbacks{
+        .context = callback_ctx,
+        .on_content = on_content_chunk,
+        .on_tool_start = on_tool_start,
+        .on_reasoning = on_reasoning_chunk,
+        .on_tool_input = on_tool_input_chunk,
+    };
+    const stream_limits = responses_protocol.StreamLimits{
+        .aggregate_bytes = max_sse_aggregate_bytes,
+        .count_json_bytes = false,
+        .events = max_sse_events,
+        .tool_calls = max_tool_calls,
+        .tool_identity_bytes = max_tool_identity_bytes,
+        .tool_arguments_bytes = max_tool_arguments_bytes,
+        .provider_state_bytes = max_provider_state_bytes,
+    };
     while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        event_count = try checkedAccumulatedSize(event_count, 1, max_sse_events);
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
-            return error.InvalidXaiGrokSseEvent;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-        const event_type = stringField(parsed.value.object, "type") orelse continue;
-
-        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse continue;
-            const item = parsed.value.object.get("item") orelse continue;
-            if (item != .object) continue;
-            const item_type = stringField(item.object, "type") orelse continue;
-            if (std.mem.eql(u8, item_type, "function_call")) {
-                const call_id = stringField(item.object, "call_id") orelse continue;
-                const name = stringField(item.object, "name") orelse continue;
-                if (findTool(tools.items, output_index) == null) {
-                    try appendTool(alloc, &tools, output_index, call_id, name);
-                    if (on_tool_start) |callback| callback(callback_ctx, call_id, name, null);
-                }
-            }
-        } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
-            std.mem.eql(u8, event_type, "response.refusal.delta"))
-        {
-            const delta = stringField(parsed.value.object, "delta") orelse continue;
-            saw_content_delta = true;
-            on_content_chunk(callback_ctx, delta);
-            try appendCaptured(alloc, &content, delta, content_capture_limit);
-        } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
-            std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
-        {
-            const delta = stringField(parsed.value.object, "delta") orelse continue;
-            if (on_reasoning_chunk) |callback| callback(callback_ctx, delta);
-        } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
-            if (on_reasoning_chunk) |callback| callback(callback_ctx, "\n\n");
-        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse continue;
-            const delta = stringField(parsed.value.object, "delta") orelse continue;
-            const index = findTool(tools.items, output_index) orelse continue;
-            try appendToolArguments(alloc, &tools.items[index].arguments, delta);
-            if (on_tool_input_chunk) |callback| callback(callback_ctx, delta);
-        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse continue;
-            const arguments = stringField(parsed.value.object, "arguments") orelse continue;
-            const index = findTool(tools.items, output_index) orelse continue;
-            const previous_len = tools.items[index].arguments.items.len;
-            if (std.mem.startsWith(u8, arguments, tools.items[index].arguments.items)) {
-                const suffix = arguments[previous_len..];
-                try appendToolArguments(alloc, &tools.items[index].arguments, suffix);
-                if (suffix.len > 0) if (on_tool_input_chunk) |callback| callback(callback_ctx, suffix);
-            } else {
-                tools.items[index].arguments.clearRetainingCapacity();
-                try appendToolArguments(alloc, &tools.items[index].arguments, arguments);
-            }
-        } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse continue;
-            const item = parsed.value.object.get("item") orelse continue;
-            if (item != .object) continue;
-            const item_type = stringField(item.object, "type") orelse continue;
-            if (std.mem.eql(u8, item_type, "function_call")) {
-                if (findTool(tools.items, output_index)) |index| {
-                    if (stringField(item.object, "arguments")) |arguments| {
-                        if (tools.items[index].arguments.items.len == 0) {
-                            try appendToolArguments(alloc, &tools.items[index].arguments, arguments);
-                        }
-                    }
-                }
-            } else if (std.mem.eql(u8, item_type, "reasoning") and
-                stringField(item.object, "encrypted_content") != null)
-            {
-                var encoded: std.Io.Writer.Allocating = .init(alloc);
-                defer encoded.deinit();
-                try std.json.Stringify.value(item, .{}, &encoded.writer);
-                const separators: usize = if (provider_state_count == 0) 2 else 1;
-                const encoded_size = try checkedAccumulatedSize(encoded.written().len, separators, max_provider_state_bytes);
-                _ = try checkedAccumulatedSize(provider_state.written().len, encoded_size, max_provider_state_bytes);
-                if (provider_state_count == 0) {
-                    try provider_state.writer.writeByte('[');
-                } else {
-                    try provider_state.writer.writeByte(',');
-                }
-                try provider_state.writer.writeAll(encoded.written());
-                provider_state_count += 1;
-            } else if (std.mem.eql(u8, item_type, "message") and !saw_content_delta) {
-                if (item.object.get("content")) |parts| if (parts == .array) {
-                    for (parts.array.items) |part| {
-                        if (part != .object) continue;
-                        const text = stringField(part.object, "text") orelse stringField(part.object, "refusal") orelse continue;
-                        on_content_chunk(callback_ctx, text);
-                        try appendCaptured(alloc, &content, text, content_capture_limit);
-                    }
-                };
-            }
-        } else if (std.mem.eql(u8, event_type, "response.completed") or
-            std.mem.eql(u8, event_type, "response.done") or
-            std.mem.eql(u8, event_type, "response.incomplete"))
-        {
-            const response_value = parsed.value.object.get("response") orelse continue;
-            if (response_value != .object) continue;
-            terminal_seen = true;
-            const status = stringField(response_value.object, "status");
-            finish_reason = finishReason(status, response_value.object, tools.items.len > 0);
-            usage = parseUsage(response_value.object);
-            if (stringField(response_value.object, "id")) |id| {
-                generation_id = try alloc.dupe(u8, id);
-            }
-            break;
-        } else if (std.mem.eql(u8, event_type, "response.failed") or
-            std.mem.eql(u8, event_type, "error"))
-        {
-            return error.XaiGrokResponseFailed;
-        }
+        if (reducer.applyJson(
+            alloc,
+            json_text,
+            callbacks,
+            cancel_flag,
+            content_capture_limit,
+            stream_limits,
+        ) catch |err| return mapReducerError(err)) break;
     }
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (!terminal_seen) return error.XaiGrokStreamIncomplete;
+    return reducer.finish(alloc, cancel_flag, stream_limits) catch |err|
+        return mapReducerError(err);
+}
 
-    const owned_content = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
-    if (owned_content != null) content = .empty;
-    errdefer if (owned_content) |value| alloc.free(value);
-    const owned_provider_state = if (provider_state_count > 0) state: {
-        try provider_state.writer.writeByte(']');
-        if (provider_state.written().len > max_provider_state_bytes) {
-            return error.XaiGrokResourceLimitExceeded;
-        }
-        break :state try provider_state.toOwnedSlice();
-    } else null;
-    errdefer if (owned_provider_state) |value| alloc.free(value);
-    const owned_tools: []types.ToolCall = if (tools.items.len > 0)
-        try alloc.alloc(types.ToolCall, tools.items.len)
-    else
-        &.{};
-    errdefer if (owned_tools.len > 0) alloc.free(owned_tools);
-    var initialized: usize = 0;
-    errdefer for (owned_tools[0..initialized]) |call| {
-        alloc.free(call.id);
-        alloc.free(call.name);
-        alloc.free(call.arguments_json);
+fn mapReducerError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidEvent => error.InvalidXaiGrokSseEvent,
+        error.ResponseFailed => error.XaiGrokResponseFailed,
+        error.StreamIncomplete => error.XaiGrokStreamIncomplete,
+        error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
+        error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
+        error.ResourceLimitExceeded => error.XaiGrokResourceLimitExceeded,
+        else => err,
     };
-    for (tools.items, 0..) |*tool, index| {
-        const arguments = if (tool.arguments.items.len > 0)
-            try tool.arguments.toOwnedSlice(alloc)
-        else
-            try alloc.dupe(u8, "{}");
-        tool.arguments = .empty;
-        owned_tools[index] = .{
-            .id = tool.id,
-            .name = tool.name,
-            .arguments_json = arguments,
-        };
-        tool.id = &.{};
-        tool.name = &.{};
-        initialized += 1;
-    }
-    return .{
-        .content = owned_content,
-        .tool_calls = owned_tools,
-        .generation_id = generation_id,
-        .provider_state_json = owned_provider_state,
-        .finish_reason = finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
-        .usage = usage,
-    };
-}
-
-fn appendTool(
-    alloc: Allocator,
-    tools: *std.ArrayList(ToolAccumulator),
-    output_index: i64,
-    call_id: []const u8,
-    name: []const u8,
-) !void {
-    if (tools.items.len >= max_tool_calls or call_id.len == 0 or call_id.len > max_tool_identity_bytes or
-        name.len == 0 or name.len > max_tool_identity_bytes)
-    {
-        return error.XaiGrokToolCallLimitExceeded;
-    }
-    const id = try alloc.dupe(u8, call_id);
-    errdefer alloc.free(id);
-    const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
-    try tools.append(alloc, .{
-        .output_index = output_index,
-        .id = id,
-        .name = owned_name,
-    });
-}
-
-fn appendToolArguments(
-    alloc: Allocator,
-    arguments: *std.ArrayList(u8),
-    delta: []const u8,
-) !void {
-    _ = checkedAccumulatedSize(arguments.items.len, delta.len, max_tool_arguments_bytes) catch
-        return error.XaiGrokToolArgumentsTooLarge;
-    try arguments.appendSlice(alloc, delta);
-}
-
-fn checkedAccumulatedSize(current: usize, additional: usize, maximum: usize) !usize {
-    const next = std.math.add(usize, current, additional) catch
-        return error.XaiGrokResourceLimitExceeded;
-    if (next > maximum) return error.XaiGrokResourceLimitExceeded;
-    return next;
-}
-
-fn appendCaptured(
-    alloc: Allocator,
-    content: *std.ArrayList(u8),
-    delta: []const u8,
-    limit: ?usize,
-) !void {
-    const remaining = if (limit) |maximum| maximum -| @min(maximum, content.items.len) else delta.len;
-    try content.appendSlice(alloc, delta[0..@min(delta.len, remaining)]);
-}
-
-fn findTool(tools: []const ToolAccumulator, output_index: i64) ?usize {
-    for (tools, 0..) |tool, index| if (tool.output_index == output_index) return index;
-    return null;
-}
-
-fn finishReason(
-    status: ?[]const u8,
-    response: std.json.ObjectMap,
-    has_tools: bool,
-) types.ProviderFinishReason {
-    const value = status orelse return if (has_tools) .tool_calls else .stop;
-    if (std.mem.eql(u8, value, "completed")) return if (has_tools) .tool_calls else .stop;
-    if (std.mem.eql(u8, value, "incomplete")) {
-        if (response.get("incomplete_details")) |details| if (details == .object) {
-            if (stringField(details.object, "reason")) |reason| {
-                if (std.mem.eql(u8, reason, "max_output_tokens")) return .length;
-                if (std.mem.eql(u8, reason, "content_filter")) return .content_filter;
-            }
-        };
-        return .provider_error;
-    }
-    if (std.mem.eql(u8, value, "failed") or std.mem.eql(u8, value, "cancelled")) return .provider_error;
-    return if (has_tools) .tool_calls else .other;
-}
-
-fn parseUsage(response: std.json.ObjectMap) types.Usage {
-    const value = response.get("usage") orelse return .{};
-    if (value != .object) return .{};
-    return .{
-        .input_tokens = unsignedField(value.object, "input_tokens"),
-        .output_tokens = unsignedField(value.object, "output_tokens"),
-    };
-}
-
-fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return null;
-    return value.string;
-}
-
-fn integerField(object: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return null;
-    return value.integer;
-}
-
-fn unsignedField(object: std.json.ObjectMap, key: []const u8) ?u64 {
-    const value = integerField(object, key) orelse return null;
-    if (value < 0) return null;
-    return @intCast(value);
 }
 
 test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
+    const read_file_schema = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read",
+        .input_schema = .{},
+    };
     const messages = [_]types.ChatMessage{
         .{ .role = .system, .content = "Be concise." },
         .{ .role = .user, .content = "Read it." },
@@ -847,10 +512,10 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildRequest(std.testing.allocator, .{
         .model = "grok-4.20",
-        .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\"}}]",
         .messages = &messages,
+        .tools = .{ .additional_functions = &.{read_file_schema} },
         .tool_choice = .auto,
         .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
         .max_output_tokens = 4096,
@@ -861,7 +526,7 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
     try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
@@ -869,9 +534,8 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
 
 test "xAI Grok standard requests omit the priority service tier" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildRequest(std.testing.allocator, .{
         .model = "grok-4.20",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .none,
         .provider_options = .{},
@@ -887,9 +551,8 @@ test "xAI Grok serializes each verified image directly once" {
         .bytes = @constCast(&[_]u8{ 1, 2, 3, 4 }),
         .media_type = "image/png",
     }};
-    const body = try agent_stream_provider.build(std.testing.allocator, .{
+    const body = try buildRequest(std.testing.allocator, .{
         .model = "grok-4.20",
-        .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .none,
         .provider_options = .{},
@@ -910,76 +573,72 @@ test "xAI Grok rejects wrong-origin and invalid-account credentials before netwo
     var callback_context: u8 = 0;
     try std.testing.expectError(
         error.GrokSubscriptionCredentialRequired,
-        agent_stream_provider.stream(std.testing.allocator, .{
-            .api_key = "gateway-key",
-            .credential_source = .ai_gateway_api_key,
-            .team = null,
-            .model = "grok-4.20",
-            .retry_count = 1,
-            .chat_url = "",
-            .payload = "{}",
-            .trace_ctx = .{},
-            .content_capture_limit = null,
-            .delivery = &delivery,
-            .attempt_evidence = &evidence,
-            .callback_ctx = @ptrCast(&callback_context),
-            .on_content_chunk = struct {
-                fn ignore(_: *anyopaque, _: []const u8) void {}
-            }.ignore,
-            .on_tool_start = null,
-            .on_reasoning_chunk = null,
-            .cancel_flag = &cancelled,
-        }),
+        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
+            "gateway-key",
+            .ai_gateway_api_key,
+            null,
+            &delivery,
+            &evidence,
+            &cancelled,
+            &callback_context,
+        )),
     );
     try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
     try std.testing.expectError(
         error.GrokSubscriptionAccountRequired,
-        agent_stream_provider.stream(std.testing.allocator, .{
-            .api_key = "grok-token",
-            .credential_source = .grok_subscription,
-            .team = null,
-            .model = "grok-4.20",
-            .retry_count = 1,
-            .chat_url = "",
-            .payload = "{}",
-            .trace_ctx = .{},
-            .content_capture_limit = null,
-            .delivery = &delivery,
-            .attempt_evidence = &evidence,
-            .callback_ctx = @ptrCast(&callback_context),
-            .on_content_chunk = struct {
-                fn ignore(_: *anyopaque, _: []const u8) void {}
-            }.ignore,
-            .on_tool_start = null,
-            .on_reasoning_chunk = null,
-            .cancel_flag = &cancelled,
-        }),
+        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
+            "grok-token",
+            .grok_subscription,
+            null,
+            &delivery,
+            &evidence,
+            &cancelled,
+            &callback_context,
+        )),
     );
     try std.testing.expectError(
         error.InvalidGrokSubscriptionAccount,
-        agent_stream_provider.stream(std.testing.allocator, .{
-            .api_key = "grok-token",
-            .credential_source = .grok_subscription,
-            .account_id = "acct\r\ninjected",
-            .team = null,
-            .model = "grok-4.20",
-            .retry_count = 1,
-            .chat_url = "",
-            .payload = "{}",
-            .trace_ctx = .{},
-            .content_capture_limit = null,
-            .delivery = &delivery,
-            .attempt_evidence = &evidence,
-            .callback_ctx = @ptrCast(&callback_context),
-            .on_content_chunk = struct {
-                fn ignore(_: *anyopaque, _: []const u8) void {}
-            }.ignore,
-            .on_tool_start = null,
-            .on_reasoning_chunk = null,
-            .cancel_flag = &cancelled,
-        }),
+        agent_stream_provider.stream(std.testing.allocator, testModelRequest(
+            "grok-token",
+            .grok_subscription,
+            "acct\r\ninjected",
+            &delivery,
+            &evidence,
+            &cancelled,
+            &callback_context,
+        )),
     );
     try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
+}
+
+fn testModelRequest(
+    secret_value: []const u8,
+    source: types.CredentialSource,
+    account_id: ?[]const u8,
+    delivery: *stream_provider.DeliveryCertainty,
+    evidence: *stream_provider.AttemptEvidence,
+    cancelled: *std.atomic.Value(bool),
+    callback_context: *u8,
+) stream_provider.ModelRequest {
+    return .{
+        .credential = .{
+            .secret = secret_value,
+            .source = source,
+            .account_id = account_id,
+        },
+        .model = "grok-4.20",
+        .retry_count = 1,
+        .messages = &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = delivery,
+        .attempt_evidence = evidence,
+        .events = .{ .context = callback_context, .emit_fn = ignoreTestEvent },
+        .admission = .{ .context = callback_context, .admit_fn = admitTestRequest },
+        .cancel_flag = cancelled,
+    };
 }
 
 test "xAI Grok SSE maps text reasoning tools and usage" {
@@ -1224,26 +883,18 @@ fn runXaiTestStream(deadline: ?std.Io.Clock.Timestamp) !stream_provider.Result {
     var evidence: stream_provider.AttemptEvidence = .{};
     var cancelled = std.atomic.Value(bool).init(false);
     var callback_context: u8 = 0;
-    return agent_stream_provider.stream(std.testing.allocator, .{
-        .api_key = "grok-test-token",
-        .credential_source = .grok_subscription,
-        .account_id = "acct_grok_test",
-        .team = null,
-        .model = "grok-4.20",
-        .retry_count = 1,
-        .chat_url = "",
-        .payload = "{}",
-        .trace_ctx = .{},
-        .content_capture_limit = 1024,
-        .deadline = deadline,
-        .delivery = &delivery,
-        .attempt_evidence = &evidence,
-        .callback_ctx = @ptrCast(&callback_context),
-        .on_content_chunk = ignoreTestChunk,
-        .on_tool_start = null,
-        .on_reasoning_chunk = null,
-        .cancel_flag = &cancelled,
-    });
+    var request = testModelRequest(
+        "grok-test-token",
+        .grok_subscription,
+        "acct_grok_test",
+        &delivery,
+        &evidence,
+        &cancelled,
+        &callback_context,
+    );
+    request.content_capture_limit = 1024;
+    request.deadline = deadline;
+    return agent_stream_provider.stream(std.testing.allocator, request);
 }
 
 test "xAI Grok request deadline closes slow headers and stalled SSE" {
@@ -1278,6 +929,8 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
 }
 
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
+fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
+fn admitTestRequest(_: *anyopaque) !void {}
 
 test "xAI Grok error-body reader accepts the exact bound and replaces one beyond" {
     inline for (.{ TestResponseMode.error_body_exact, TestResponseMode.error_body_excess }) |mode| {
@@ -1297,19 +950,19 @@ test "xAI Grok error-body reader accepts the exact bound and replaces one beyond
         defer result.deinit(std.testing.allocator);
         fixture.deinit();
         if (fixture.failure) |err| return err;
-        try std.testing.expectEqual(std.http.Status.too_many_requests, result.status);
+        try std.testing.expectEqual(stream_provider.FailureKind.rate_limited, result.failed.kind);
         if (mode == .error_body_exact) {
-            try std.testing.expectEqual(max_error_body_bytes, result.err_body.?.len);
+            try std.testing.expectEqual(max_error_body_bytes, result.failed.detail.?.len);
         } else {
             try std.testing.expectEqualStrings(
                 "xAI Grok error response exceeded the local limit",
-                result.err_body.?,
+                result.failed.detail.?,
             );
         }
     }
 }
 
-fn deinitTestCompletion(completion: *types.GatewayCompletion) void {
+fn deinitTestCompletion(completion: *types.ModelCompletion) void {
     if (completion.content) |value| std.testing.allocator.free(@constCast(value));
     if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
     types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
@@ -1317,7 +970,7 @@ fn deinitTestCompletion(completion: *types.GatewayCompletion) void {
     completion.* = .{};
 }
 
-fn consumeTestSse(bytes: []const u8) !types.GatewayCompletion {
+fn consumeTestSse(bytes: []const u8) !types.ModelCompletion {
     var reader: std.Io.Reader = .fixed(bytes);
     var cancelled = std.atomic.Value(bool).init(false);
     var callback_context: u8 = 0;

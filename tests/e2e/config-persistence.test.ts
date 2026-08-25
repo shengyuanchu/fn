@@ -64,7 +64,7 @@ async function disablePromptHistory(
 ): Promise<void> {
   await session.sendText("/settings");
   await session.waitForText("←→ Change", TIMEOUT);
-  for (let index = 0; index < 12; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     await session.sendKeys("Down");
   }
   await session.sendKeys("Left");
@@ -122,77 +122,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
-
-  serialTest(
-    "appearance settings persist independently across launches",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-input-appearance-persistence-"));
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const stderrAPath = join(root, "stderr-a.log");
-        const stderrBPath = join(root, "stderr-b.log");
-        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
-        mkdirSync(workspace);
-        const workspaceRoot = realpathSync(workspace);
-
-        session = await TmuxSession.create({
-          cwd: workspaceRoot,
-          env: { ...NO_AUTH, HOME: home },
-          stderrPath: stderrAPath,
-        });
-        await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/appearance");
-        await session.waitForText("Input appearance", TIMEOUT);
-        expect(await session.capturePane()).toContain("lines  tint");
-        expect(await session.capturePane()).toContain("minimal  legacy");
-        await session.sendKeys("Escape");
-        await session.waitForComposer(TIMEOUT);
-        await session.sendText("/appearance input lines");
-        await session.waitForText("● Input: switched to lines", TIMEOUT);
-        await session.sendText("/appearance presentation normal");
-        await session.waitForText("● Maxxing: switched to legacy", TIMEOUT);
-        await session.waitForStableComposer(TIMEOUT);
-        await session.sendText("/quit");
-        await session.waitForSessionEnd(TIMEOUT);
-        session = null;
-
-        let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.input_appearance).toBe("lines");
-        expect(stored.maxxing_mode).toBe("legacy");
-
-        secondSession = await TmuxSession.create({
-          cwd: workspaceRoot,
-          env: { ...NO_AUTH, HOME: home },
-          stderrPath: stderrBPath,
-        });
-        await secondSession.waitForText("Run /help", TIMEOUT);
-        await secondSession.sendText("/appearance");
-        await secondSession.waitForText("Input appearance", TIMEOUT);
-        expect(await secondSession.capturePane()).toContain("lines  tint");
-        expect(await secondSession.capturePane()).toContain("minimal  legacy");
-        await secondSession.sendKeys("Escape");
-        await secondSession.waitForComposer(TIMEOUT);
-        await secondSession.sendText("/appearance input tint");
-        await secondSession.waitForText("● Input: switched to tint", TIMEOUT);
-        await secondSession.sendText("/appearance presentation minimal");
-        await secondSession.waitForText("● Maxxing: switched to minimal", TIMEOUT);
-        await secondSession.waitForStableComposer(TIMEOUT);
-        await secondSession.sendText("/quit");
-        await secondSession.waitForSessionEnd(TIMEOUT);
-        secondSession = null;
-
-        stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.input_appearance).toBe("tint");
-        expect(stored.maxxing_mode).toBe("minimal");
-        expect(readFileSync(stderrAPath, "utf8")).toBe("");
-        expect(readFileSync(stderrBPath, "utf8")).toBe("");
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    60_000,
-  );
 
   serialTest(
     "user preferences migrate globally and load in another project",
@@ -300,7 +229,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         session = null;
 
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.model).toBe("anthropic/claude-opus-4.7");
+        expect(stored.models.gateway).toBe("anthropic/claude-opus-4.7");
         expect(stored.permission_mode).toBe("auto");
         expect(stored.effort).toBe("auto");
         expect(stored.fast_mode).toBe(true);
@@ -395,7 +324,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const afterOverride = JSON.parse(
           readFileSync(join(home, ".fx", "settings.json"), "utf8"),
         );
-        expect(afterOverride.model).toBe("anthropic/claude-opus-4.7");
+        expect(afterOverride.models.gateway).toBe("anthropic/claude-opus-4.7");
         expect(readFileSync(stderrAPath, "utf8")).toBe("");
         expect(readFileSync(stderrBPath, "utf8")).toBe("");
       } finally {
@@ -997,7 +926,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         const stored = JSON.parse(readFileSync(settingsPath, "utf8"));
         expect(stored).toMatchObject({
-          model: "anthropic/claude-opus-4.8",
+          models: { gateway: "anthropic/claude-opus-4.8" },
           effort: "xhigh",
           fast_mode: true,
         });
@@ -1127,7 +1056,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           readFileSync(settingsPath, "utf8"),
         );
         expect(stored).toMatchObject({
-          model: "openai/gpt-5.6-sol",
+          models: { gateway: "openai/gpt-5.6-sol" },
           effort: "max",
           fast_mode: true,
         });
@@ -1206,7 +1135,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored).toMatchObject({
-          model: "anthropic/claude-fable-5",
+          models: { gateway: "anthropic/claude-fable-5" },
           effort: "xhigh",
         });
         expect(stored).not.toHaveProperty("fast_mode");
@@ -1269,7 +1198,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(await session.capturePane()).not.toContain("saved to user settings");
 
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.model).toBe("xai/grok-build-1");
+        expect(stored.models.gateway).toBe("xai/grok-build-1");
         expect(stored).not.toHaveProperty("effort");
         expect(stored).not.toHaveProperty("fast_mode");
 
@@ -1349,7 +1278,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("● Switched to provider/new-reasoning-model", TIMEOUT);
 
         let stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
-        expect(stored.model).toBe("provider/new-reasoning-model");
+        expect(stored.models.gateway).toBe("provider/new-reasoning-model");
         expect(stored).not.toHaveProperty("fast_mode");
 
         await session.sendText("Use portable auto.");
@@ -1383,7 +1312,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         }
         expect(stored).toMatchObject({
-          model: "provider/new-reasoning-model",
+          models: { gateway: "provider/new-reasoning-model" },
           effort: "future-tier",
         });
 
@@ -1408,7 +1337,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
         stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored).toMatchObject({
-          model: "provider/new-reasoning-model",
+          models: { gateway: "provider/new-reasoning-model" },
           effort: "future-tier",
         });
         expect(stored).not.toHaveProperty("fast_mode");

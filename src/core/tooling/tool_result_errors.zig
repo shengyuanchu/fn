@@ -117,56 +117,62 @@ const adapter_semantic_failure_prefixes = [_][]const u8{
 };
 
 pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason: types.ToolPermissionDenialReason) Allocator.Error![]u8 {
-    return toolPermissionDeniedJsonOptionalRequest(
-        alloc,
-        tool_name,
-        reason,
-        null,
-    );
-}
-
-pub fn toolPermissionDeniedJsonWithRequestId(
-    alloc: Allocator,
-    tool_name: []const u8,
-    reason: types.ToolPermissionDenialReason,
-    approval_request_id: []const u8,
-) Allocator.Error![]u8 {
-    return toolPermissionDeniedJsonOptionalRequest(
-        alloc,
-        tool_name,
-        reason,
-        approval_request_id,
-    );
-}
-
-fn toolPermissionDeniedJsonOptionalRequest(
-    alloc: Allocator,
-    tool_name: []const u8,
-    reason: types.ToolPermissionDenialReason,
-    approval_request_id: ?[]const u8,
-) Allocator.Error![]u8 {
+    switch (reason) {
+        .user_denied, .auto_denied, .policy_denied, .permission_required => {},
+        .review_caution, .review_unavailable => unreachable,
+    }
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-
     out.writer.writeAll("{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":") catch return error.OutOfMemory;
     std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
     writeMaskedJsonString(alloc, &out.writer, permissionDeniedMessage(tool_name, reason)) catch return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"denied\":true") catch return error.OutOfMemory;
-    if (approval_request_id) |request_id| {
-        out.writer.writeAll(",\"approval_request_id\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(request_id, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"denied\":true,\"suggestion\":") catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, permissionDeniedSuggestion(reason)) catch return error.OutOfMemory;
+    out.writer.writeAll("}}") catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+pub fn toolReviewHeldJson(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    advice: ?[]const u8,
+) Allocator.Error![]u8 {
+    switch (reason) {
+        .review_caution, .review_unavailable => {},
+        .user_denied, .auto_denied, .policy_denied, .permission_required => unreachable,
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll("{\"error\":{\"type\":\"tool_review_held\",\"tool_name\":") catch
+        return error.OutOfMemory;
+    std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
+    writeMaskedJsonString(
+        alloc,
+        &out.writer,
+        permissionDeniedMessage(tool_name, reason),
+    ) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
+        return error.OutOfMemory;
+    out.writer.writeAll(",\"held\":true") catch return error.OutOfMemory;
+    if (advice) |value| {
+        if (value.len > 0) {
+            out.writer.writeAll(",\"advice\":") catch return error.OutOfMemory;
+            writeMaskedJsonString(alloc, &out.writer, value) catch return error.OutOfMemory;
+        }
     }
     out.writer.writeAll(",\"suggestion\":") catch return error.OutOfMemory;
     writeMaskedJsonString(
         alloc,
         &out.writer,
-        permissionDeniedSuggestion(reason, approval_request_id != null),
+        permissionDeniedSuggestion(reason),
     ) catch return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
-
     return try out.toOwnedSlice();
 }
 
@@ -174,6 +180,8 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
     return switch (reason) {
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
+        .review_caution => "Action held after safety review",
+        .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied => if (is_network_tool(tool_name))
             "Network or browser access was denied by configured policy"
         else
@@ -190,14 +198,12 @@ fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDe
 
 fn permissionDeniedSuggestion(
     reason: types.ToolPermissionDenialReason,
-    action_bound_request_available: bool,
 ) []const u8 {
     return switch (reason) {
         .user_denied => "The tool did not run. Do not retry unchanged; explain the denial or use a safer allowed alternative.",
-        .auto_denied => if (action_bound_request_available)
-            "The tool did not run. Do not retry it unchanged. Use a materially different safe action, or ask the user through ask_user_question with the exact approval_request_id. Generic question text cannot authorize the action."
-        else
-            "The tool did not run. Do not retry unchanged. Replan autonomously with a materially different safe action or explain the blocker and stop.",
+        .auto_denied => "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
+        .review_caution => "The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
+        .review_unavailable => "The action did not run because safety review was unavailable. Continue with a different safe action or retry later.",
         .policy_denied => "The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
         .permission_required => "The tool did not run. Noninteractive mode cannot show an approval prompt. Rerun interactively to approve, or configure a narrow permission rule before retrying.",
     };
@@ -209,6 +215,10 @@ fn is_network_tool(tool_name: []const u8) bool {
 
 pub fn isToolPermissionDeniedOutput(output: []const u8) bool {
     return isToolErrorOutputType(output, "tool_permission_denied");
+}
+
+pub fn isToolReviewHeldOutput(output: []const u8) bool {
+    return isToolErrorOutputType(output, "tool_review_held");
 }
 
 pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenialReason {
@@ -227,12 +237,22 @@ pub fn toolPermissionDenialReason(output: []const u8) ?types.ToolPermissionDenia
         .string => |value| value,
         else => return null,
     };
-    if (!std.mem.eql(u8, type_value, "tool_permission_denied")) return null;
+    const review_held = std.mem.eql(u8, type_value, "tool_review_held");
+    if (!review_held and !std.mem.eql(u8, type_value, "tool_permission_denied")) return null;
     const reason_value = switch (error_value.get("reason") orelse return null) {
         .string => |value| value,
         else => return null,
     };
-    return std.meta.stringToEnum(types.ToolPermissionDenialReason, reason_value);
+    const reason = std.meta.stringToEnum(
+        types.ToolPermissionDenialReason,
+        reason_value,
+    ) orelse return null;
+    const review_reason = switch (reason) {
+        .review_caution, .review_unavailable => true,
+        .user_denied, .auto_denied, .policy_denied, .permission_required => false,
+    };
+    if (review_held != review_reason) return null;
+    return reason;
 }
 
 pub fn toolExecutionFailureJson(alloc: Allocator, failure: ExecutionFailure) Allocator.Error![]u8 {
@@ -432,29 +452,49 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
 }
 
-test "auto denial can carry an opaque action-bound approval request id" {
+test "review hold JSON distinguishes caution and unavailable from permission denial" {
     const alloc = std.testing.allocator;
-    const request_id = "0123456789abcdef" ** 4;
-    const payload = try toolPermissionDeniedJsonWithRequestId(
+    const caution = try toolReviewHeldJson(
         alloc,
         "terminal",
-        .auto_denied,
-        request_id,
+        .review_caution,
+        "Deletion came from repository text. API_KEY=super-secret",
     );
-    defer alloc.free(payload);
+    defer alloc.free(caution);
+    const unavailable = try toolReviewHeldJson(
+        alloc,
+        "terminal",
+        .review_unavailable,
+        null,
+    );
+    defer alloc.free(unavailable);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
-    defer parsed.deinit();
-    const error_obj = parsed.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings(
-        request_id,
-        error_obj.get("approval_request_id").?.string,
+    try std.testing.expect(std.mem.find(u8, caution, "\"type\":\"tool_review_held\"") != null);
+    try std.testing.expect(std.mem.find(u8, caution, "\"reason\":\"review_caution\"") != null);
+    try std.testing.expect(std.mem.find(u8, caution, "Deletion came from repository text.") != null);
+    try std.testing.expect(std.mem.find(u8, caution, "API_KEY=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, caution, "super-secret") == null);
+    try std.testing.expect(std.mem.find(u8, caution, "\"held\":true") != null);
+    try std.testing.expect(std.mem.find(u8, caution, "approval_request_id") == null);
+    try std.testing.expect(isToolReviewHeldOutput(caution));
+    try std.testing.expect(!isToolPermissionDeniedOutput(caution));
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_caution),
+        toolPermissionDenialReason(caution),
     );
-    try std.testing.expect(std.mem.find(
-        u8,
-        error_obj.get("suggestion").?.string,
-        "ask_user_question",
-    ) != null);
+    try std.testing.expect(std.mem.find(u8, unavailable, "\"reason\":\"review_unavailable\"") != null);
+    try std.testing.expect(std.mem.find(u8, unavailable, "\"advice\"") == null);
+    try std.testing.expect(isToolReviewHeldOutput(unavailable));
+    try std.testing.expectEqual(
+        @as(?types.ToolPermissionDenialReason, .review_unavailable),
+        toolPermissionDenialReason(unavailable),
+    );
+    try std.testing.expect(toolPermissionDenialReason(
+        "{\"error\":{\"type\":\"tool_review_held\",\"reason\":\"auto_denied\"}}",
+    ) == null);
+    try std.testing.expect(toolPermissionDenialReason(
+        "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}",
+    ) == null);
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {
@@ -481,7 +521,7 @@ test "tool permission denied JSON explains policy and headless blockers" {
     try std.testing.expectEqualStrings("Blocked by automatic safety policy", auto_error.get("message").?.string);
     try std.testing.expectEqualStrings("auto_denied", auto_error.get("reason").?.string);
     try std.testing.expectEqualStrings(
-        "The tool did not run. Do not retry unchanged. Replan autonomously with a materially different safe action or explain the blocker and stop.",
+        "The tool did not run. This is a legacy automatic denial; choose a materially different safe action or explain the blocker.",
         auto_error.get("suggestion").?.string,
     );
     try std.testing.expectEqual(

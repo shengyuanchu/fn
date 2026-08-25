@@ -506,7 +506,7 @@ pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator
 pub fn finishLengthLimitedToolCallCompletion(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
-    completion: types.GatewayCompletion,
+    completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
     const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";

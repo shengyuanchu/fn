@@ -1,6 +1,6 @@
 const std = @import("std");
-const gateway_json = @import("gateway_json.zig");
-const gateway_error_format = @import("../shared/gateway_error_format.zig");
+const vercel_protocol = @import("vercel_protocol.zig");
+const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +27,6 @@ pub const FailureDiagnostics = struct {
 pub fn collect(alloc: Allocator, payload: []const u8, err_body: ?[]const u8) FailureDiagnostics {
     return .{
         .schema = if (err_body) |body| gateway_error_format.formatSchemaDiagnostic(alloc, body) catch null else null,
-        .request_shape = gateway_json.formatGatewayRequestShapeSummary(alloc, payload) catch null,
+        .request_shape = vercel_protocol.formatGatewayRequestShapeSummary(alloc, payload) catch null,
     };
 }

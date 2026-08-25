@@ -5,9 +5,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
-const input_appearance = @import("input_appearance.zig");
 const model_provider = @import("model_provider.zig");
-const presentation_mode = @import("presentation_mode.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -87,10 +85,8 @@ pub const WorkspaceDirectoryMutation = struct {
 };
 
 pub const UserSettingsPatch = struct {
-    model: ?[]const u8 = null,
+    model_preference: ?ModelPreferencePatch = null,
     provider: ?model_provider.ProviderId = null,
-    codex_model: ?[]const u8 = null,
-    grok_model: ?[]const u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     /// Removes the key entirely so resolution returns to plain precedence.
@@ -99,8 +95,6 @@ pub const UserSettingsPatch = struct {
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
-    input_appearance: ?[]const u8 = null,
-    maxxing_mode: ?[]const u8 = null,
     slash_menu_categories: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
@@ -111,18 +105,14 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
-        return self.model == null and
+        return self.model_preference == null and
             self.provider == null and
-            self.codex_model == null and
-            self.grok_model == null and
             self.permission_mode == null and
             self.credential_source == null and
             !self.clear_credential_source and
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
-            self.input_appearance == null and
-            self.maxxing_mode == null and
             self.slash_menu_categories == null and
             self.update_channel == null and
             self.startup_scrollback == null and
@@ -132,6 +122,11 @@ pub const UserSettingsPatch = struct {
             self.notification_attention_required == null and
             self.notification_max == null;
     }
+};
+
+pub const ModelPreferencePatch = struct {
+    provider: model_provider.ProviderId,
+    model: []const u8,
 };
 
 pub const SettingsScope = enum {
@@ -208,8 +203,6 @@ const UserPreferenceField = enum(u4) {
     permission_mode,
     effort,
     fast_mode,
-    input_appearance,
-    maxxing_mode,
     slash_menu_categories,
     update_channel,
     startup_scrollback,
@@ -227,8 +220,6 @@ const UserPreferenceField = enum(u4) {
             .permission_mode => "settings.json.preference-migration.permission_mode.json",
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
-            .input_appearance => "settings.json.preference-migration.input_appearance.json",
-            .maxxing_mode => "settings.json.preference-migration.maxxing_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
             .startup_scrollback => "settings.json.preference-migration.startup_scrollback.json",
@@ -244,8 +235,6 @@ const user_preference_fields = [_]UserPreferenceField{
     .permission_mode,
     .effort,
     .fast_mode,
-    .input_appearance,
-    .maxxing_mode,
     .slash_menu_categories,
     .update_channel,
     .startup_scrollback,
@@ -861,23 +850,13 @@ pub fn validateModel(model: []const u8) !void {
 }
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
-    if (patch.model) |model| try validateModel(model);
-    if (patch.input_appearance) |appearance| try validateInputAppearance(appearance);
-    if (patch.maxxing_mode) |mode| try validateMaxxingMode(mode);
+    if (patch.model_preference) |preference| try validateModel(preference.model);
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
     return path.len > 0 and path.len <= std.fs.max_path_bytes and
         std.fs.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
         std.mem.findScalar(u8, path, 0) == null;
-}
-
-pub fn validateInputAppearance(appearance: []const u8) !void {
-    if (!input_appearance.InputAppearance.isPersistedLabel(appearance)) return error.InvalidDurableField;
-}
-
-pub fn validateMaxxingMode(mode: []const u8) !void {
-    if (!presentation_mode.MaxxingMode.isPersistedLabel(mode)) return error.InvalidDurableField;
 }
 
 test "clearing the credential choice removes the key rather than blanking it" {
@@ -900,7 +879,7 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
-test "provider patch keeps independent provider models" {
+test "provider patch writes one bounded provider model collection" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -913,27 +892,14 @@ test "provider patch keeps independent provider models" {
     );
     const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
         .provider = .codex,
-        .codex_model = "gpt-5.4-mini",
-        .grok_model = "grok-4.20-0309-non-reasoning",
+        .model_preference = .{ .provider = .codex, .model = "gpt-5.4-mini" },
     });
     try std.testing.expect(application.changed);
     try std.testing.expectEqualStrings("gateway/model", root.object.get("model").?.string);
     try std.testing.expectEqualStrings("codex", root.object.get("provider").?.string);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("codex_model").?.string);
-    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", root.object.get("grok_model").?.string);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", root.object.get("models").?.object.get("codex").?.string);
+    try std.testing.expect(!root.object.contains("codex_model"));
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
-}
-
-test "input appearance validation keeps experiment labels private" {
-    try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("minimal-maxxing"));
-    try std.testing.expectError(error.InvalidDurableField, validateInputAppearance("no-lines"));
-}
-
-test "maxxing mode validation accepts only public modes" {
-    try validateMaxxingMode("minimal");
-    try validateMaxxingMode("legacy");
-    try validateMaxxingMode("normal");
-    try std.testing.expectError(error.InvalidDurableField, validateMaxxingMode("bare"));
 }
 
 fn applyMutationToRoot(
@@ -941,7 +907,8 @@ fn applyMutationToRoot(
     root: *std.json.Value,
     mutation: SettingsMutation,
 ) !PatchApplication {
-    return switch (mutation) {
+    const retired_settings_removed = removeRetiredPresentationSettings(&root.object);
+    var application = try switch (mutation) {
         .user => |patch| applyUserPatchToRoot(arena, root, patch),
         .workspace_directory => |workspace| applyWorkspaceDirectoryMutationToRoot(
             arena,
@@ -950,6 +917,8 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
     };
+    application.changed = application.changed or retired_settings_removed;
+    return application;
 }
 
 fn applyUserPatchToRoot(
@@ -958,10 +927,10 @@ fn applyUserPatchToRoot(
     patch: UserSettingsPatch,
 ) !PatchApplication {
     var application = PatchApplication{};
-    if (patch.model) |value| application.changed = try putString(arena, &root.object, "model", value) or application.changed;
+    if (patch.model_preference) |preference| {
+        application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
+    }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", @tagName(value)) or application.changed;
-    if (patch.codex_model) |value| application.changed = try putString(arena, &root.object, "codex_model", value) or application.changed;
-    if (patch.grok_model) |value| application.changed = try putString(arena, &root.object, "grok_model", value) or application.changed;
     if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
@@ -971,8 +940,6 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
-    if (patch.input_appearance) |value| application.changed = try putString(arena, &root.object, "input_appearance", value) or application.changed;
-    if (patch.maxxing_mode) |value| application.changed = try putString(arena, &root.object, "maxxing_mode", value) or application.changed;
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
@@ -1024,6 +991,30 @@ fn applyUserPatchToRoot(
     return application;
 }
 
+fn removeRetiredPresentationSettings(root: *std.json.ObjectMap) bool {
+    var changed = false;
+    inline for (&.{ "input_appearance", "maxxing_mode" }) |key| {
+        if (root.contains(key)) {
+            _ = root.orderedRemove(key);
+            changed = true;
+        }
+    }
+
+    const workspaces = root.getPtr("workspaces") orelse return changed;
+    if (workspaces.* != .object) return changed;
+    var iterator = workspaces.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        inline for (&.{ "input_appearance", "maxxing_mode" }) |key| {
+            if (entry.value_ptr.object.contains(key)) {
+                _ = entry.value_ptr.object.orderedRemove(key);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 fn cleanupLegacyWorkspacePreferences(
     arena: Allocator,
     root: *std.json.Value,
@@ -1044,7 +1035,7 @@ fn cleanupLegacyWorkspacePreferences(
             &entry.value_ptr.object,
             "model",
             .model,
-            patch.model != null,
+            patch.model_preference != null and patch.model_preference.?.provider == .gateway,
             application,
         );
         removeLegacyLeaf(
@@ -1066,20 +1057,6 @@ fn cleanupLegacyWorkspacePreferences(
             "fast_mode",
             .fast_mode,
             patch.fast_mode != null,
-            application,
-        );
-        removeLegacyLeaf(
-            &entry.value_ptr.object,
-            "input_appearance",
-            .input_appearance,
-            patch.input_appearance != null,
-            application,
-        );
-        removeLegacyLeaf(
-            &entry.value_ptr.object,
-            "maxxing_mode",
-            .maxxing_mode,
-            patch.maxxing_mode != null,
             application,
         );
         removeLegacyLeaf(
@@ -1414,6 +1391,34 @@ fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, val
     return true;
 }
 
+fn putModelPreference(
+    arena: Allocator,
+    root: *std.json.ObjectMap,
+    preference: ModelPreferencePatch,
+) !bool {
+    try validateModel(preference.model);
+    var changed = false;
+    const models = if (root.getPtr("models")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk &value.object;
+    } else blk: {
+        try root.put(arena, "models", .{ .object = .empty });
+        changed = true;
+        break :blk &root.getPtr("models").?.object;
+    };
+    changed = try putString(arena, models, @tagName(preference.provider), preference.model) or changed;
+    const legacy_key = switch (preference.provider) {
+        .gateway => "model",
+        .codex => "codex_model",
+        .grok => "grok_model",
+    };
+    if (root.contains(legacy_key)) {
+        _ = root.orderedRemove(legacy_key);
+        changed = true;
+    }
+    return changed;
+}
+
 fn putBool(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !bool {
     if (object.get(key)) |existing| {
         if (existing == .bool and existing.bool == value) return false;
@@ -1642,6 +1647,20 @@ fn validateKnownSettingsObject(
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }
+    if (object.get("models")) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider = model_provider.parse(entry.key_ptr.*) orelse
+                return error.InvalidSettingsFormat;
+            if (!std.mem.eql(u8, entry.key_ptr.*, @tagName(provider)) or
+                entry.value_ptr.* != .string)
+            {
+                return error.InvalidSettingsFormat;
+            }
+            try validateModel(entry.value_ptr.string);
+        }
+    }
     if (object.get("permission_mode")) |value| {
         if (value != .string or
             (!std.ascii.eqlIgnoreCase(value.string, "ask") and
@@ -1674,14 +1693,6 @@ fn validateKnownSettingsObject(
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
-    }
-    if (object.get("input_appearance")) |value| {
-        if (value != .string) return error.InvalidSettingsFormat;
-        validateInputAppearance(value.string) catch return error.InvalidSettingsFormat;
-    }
-    if (object.get("maxxing_mode")) |value| {
-        if (value != .string) return error.InvalidSettingsFormat;
-        validateMaxxingMode(value.string) catch return error.InvalidSettingsFormat;
     }
     if (object.get("update_channel")) |value| {
         if (value != .string or update_target.Channel.parse(value.string) == null) {
@@ -1887,13 +1898,11 @@ test "user patch writes user preferences at top level" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .permission_mode = .yolo,
         .yolo_acknowledged = true,
         .effort = types.ReasoningEffort.literal("high"),
         .fast_mode = true,
-        .input_appearance = "tint",
-        .maxxing_mode = "minimal",
         .slash_menu_categories = false,
         .update_channel = .dev,
         .startup_scrollback = false,
@@ -1910,13 +1919,11 @@ test "user patch writes user preferences at top level" {
 
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"models\":{\"gateway\":\"openai/gpt-5.4\"}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"yolo\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"fast_mode\":true") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"input_appearance\":\"tint\"") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"maxxing_mode\":\"minimal\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"slash_menu_categories\":false") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"update_channel\":\"dev\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"startup_scrollback\":false") != null);
@@ -1925,6 +1932,34 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"notifications\":{\"turn_end\":true,\"attention_required\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "user patch retires presentation settings without rejecting their values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"input_appearance\":false,\"maxxing_mode\":7,\"future\":{\"profile\":1},\"workspaces\":{\"/workspace\":{\"input_appearance\":[],\"maxxing_mode\":{},\"future\":{\"workspace\":2}}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "input_appearance") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "maxxing_mode") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"profile\":1}") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"workspace\":2}") != null);
 }
 
 test "workspace statusline patch writes globally and preserves nested leaf" {
@@ -2050,22 +2085,21 @@ test "user patch snapshots and removes legacy workspace copies" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .permission_mode = .auto,
-        .input_appearance = "tint",
     });
     defer outcome.deinit(alloc);
 
     try std.testing.expect(outcome == .committed);
-    try std.testing.expectEqual(@as(usize, 6), outcome.committed.cleanup.fields_removed);
+    try std.testing.expectEqual(@as(usize, 4), outcome.committed.cleanup.fields_removed);
     try std.testing.expectEqual(@as(usize, 2), outcome.committed.cleanup.workspaces_changed);
-    try std.testing.expectEqual(@as(usize, 3), outcome.committed.cleanup.recovery_paths.len);
+    try std.testing.expectEqual(@as(usize, 2), outcome.committed.cleanup.recovery_paths.len);
 
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"models\":{\"gateway\":\"openai/gpt-5.4\"}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"auto\"") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"input_appearance\":\"tint\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "input_appearance") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"workspace/a\"") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"model\":\"workspace/b\"") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"ask\"") == null);
@@ -2166,7 +2200,7 @@ test "later migration refreshes the bounded field recovery snapshot" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    var first = try store.applyUserPatch(alloc, .{ .model = "user/one" });
+    var first = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/one" } });
     defer first.deinit(alloc);
     const first_path = try alloc.dupe(
         u8,
@@ -2177,7 +2211,7 @@ test "later migration refreshes the bounded field recovery snapshot" {
     const second_original =
         "{\"model\":\"user/one\",\"workspaces\":{\"/workspace/b\":{\"model\":\"legacy/two\"}}}\n";
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", second_original);
-    var second = try store.applyUserPatch(alloc, .{ .model = "user/two" });
+    var second = try store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/two" } });
     defer second.deinit(alloc);
 
     try std.testing.expect(std.mem.eql(
@@ -2268,7 +2302,7 @@ test "migration snapshot failure leaves primary byte identical" {
 
     try std.testing.expectError(
         error.SettingsMigrationSnapshotFailed,
-        store.applyUserPatch(alloc, .{ .model = "openai/gpt-5.4" }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" } }),
     );
 
     const bytes = try store.readPrimaryForTest(alloc);
@@ -2371,7 +2405,7 @@ test "oversized migration candidate fails before creating recovery snapshot" {
 
     try std.testing.expectError(
         error.SettingsTooLarge,
-        store.applyUserPatch(alloc, .{ .model = model }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = model } }),
     );
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
@@ -2593,7 +2627,7 @@ test "user patch traces metadata without settings content" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "FX_MODEL_SECRET",
+        .model_preference = .{ .provider = .gateway, .model = "FX_MODEL_SECRET" },
         .fast_mode = true,
     });
     defer outcome.deinit(alloc);
@@ -2661,10 +2695,9 @@ test "multi-value user patch commits model effort and fast mode once" {
     defer store.deinit(alloc);
 
     var outcome = try store.applyUserPatch(alloc, .{
-        .model = "openai/gpt-5.4",
+        .model_preference = .{ .provider = .gateway, .model = "openai/gpt-5.4" },
         .effort = types.ReasoningEffort.literal("high"),
         .fast_mode = false,
-        .input_appearance = "lines",
     });
     defer outcome.deinit(alloc);
     try std.testing.expect(outcome == .committed);
@@ -2747,7 +2780,7 @@ test "oversized candidate leaves prior primary unchanged" {
     @memset(oversized_model, 'm');
     try std.testing.expectError(
         error.InvalidDurableField,
-        store.applyUserPatch(alloc, .{ .model = oversized_model }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = oversized_model } }),
     );
     const primary = try store.readPrimaryForTest(alloc);
     defer alloc.free(primary);
@@ -3023,7 +3056,7 @@ test "indeterminate migration retains recovery metadata for the caller" {
 
     try std.testing.expectError(
         error.SettingsCommitIndeterminate,
-        store.applyUserPatch(alloc, .{ .model = "user/model" }),
+        store.applyUserPatch(alloc, .{ .model_preference = .{ .provider = .gateway, .model = "user/model" } }),
     );
     var cleanup = store.takeFailureCleanup();
     defer cleanup.deinit(alloc);

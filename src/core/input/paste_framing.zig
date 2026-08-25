@@ -11,6 +11,7 @@ pub const Owner = enum {
     decision_prompt,
     question_freeform,
     approval_amendment,
+    auth_code,
 };
 
 pub const InputLimits = struct {
@@ -27,7 +28,7 @@ pub const InputLimits = struct {
     pub fn forOwner(self: InputLimits, owner: Owner) usize {
         return switch (owner) {
             .composer => self.composer_bytes,
-            .none, .decision_prompt, .question_freeform, .approval_amendment => self.decision_bytes,
+            .none, .decision_prompt, .question_freeform, .approval_amendment, .auth_code => self.decision_bytes,
         };
     }
 };
@@ -110,7 +111,7 @@ pub const State = struct {
         switch (self.owner) {
             .none => return,
             .decision_prompt => self.decision_bytes +|= 1,
-            .composer, .question_freeform, .approval_amendment => {
+            .composer, .question_freeform, .approval_amendment, .auth_code => {
                 if (byte == 0x1b) {
                     self.end_candidate_buffer_len = self.buffer.items.len;
                     self.end_candidate_overflow_bytes = self.overflow_bytes;
@@ -124,6 +125,7 @@ pub const State = struct {
                     .composer => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
                     .question_freeform => captured_byte == '\r' or captured_byte == '\n' or is_printable,
                     .approval_amendment => captured_byte == '\r' or captured_byte == '\n' or captured_byte == '\t' or is_printable,
+                    .auth_code => is_printable,
                     .none, .decision_prompt => false,
                 };
                 if (accepts_byte) {
@@ -141,7 +143,7 @@ pub const State = struct {
         switch (self.owner) {
             .none => {},
             .decision_prompt => self.decision_bytes -|= paste_end_marker.len,
-            .composer, .question_freeform, .approval_amendment => {
+            .composer, .question_freeform, .approval_amendment, .auth_code => {
                 self.buffer.items.len = @min(
                     self.buffer.items.len,
                     self.end_candidate_buffer_len,
@@ -168,7 +170,7 @@ pub const State = struct {
         return switch (self.owner) {
             .none => 0,
             .decision_prompt => self.decision_bytes,
-            .composer, .question_freeform, .approval_amendment => self.buffer.items.len,
+            .composer, .question_freeform, .approval_amendment, .auth_code => self.buffer.items.len,
         };
     }
 
@@ -208,8 +210,19 @@ pub const State = struct {
         self.clearRetainingCapacity();
     }
 
+    pub fn finishSecretHandled(self: *State) void {
+        self.clearRetainingCapacity();
+        if (self.buffer.capacity > 0) @memset(self.buffer.allocatedSlice(), 0);
+    }
+
+    pub fn resetSecretWithTrace(self: *State, reason: ResetReason) void {
+        std.debug.assert(self.owner == .auth_code);
+        self.resetWithTrace(reason);
+    }
+
     /// Logs any discarded capture before returning to the inactive state.
     pub fn resetWithTrace(self: *State, reason: ResetReason) void {
+        const clear_secret = self.owner == .auth_code;
         switch (reason) {
             .finalize_failed => |failure| {
                 if (self.buffer.items.len > 0) {
@@ -268,7 +281,7 @@ pub const State = struct {
                         "decision prompt paste dropped bytes={d} reason={s}",
                         .{ self.decision_bytes, resetReasonName(reason) },
                     ),
-                    .composer, .question_freeform, .approval_amendment => {
+                    .composer, .question_freeform, .approval_amendment, .auth_code => {
                         if (self.buffer.items.len > 0) {
                             debug_trace.logf(
                                 "input",
@@ -283,6 +296,9 @@ pub const State = struct {
         }
 
         self.clearRetainingCapacity();
+        if (clear_secret and self.buffer.capacity > 0) {
+            @memset(self.buffer.allocatedSlice(), 0);
+        }
     }
 
     fn clearRetainingCapacity(self: *State) void {
@@ -333,7 +349,26 @@ fn ownerLabel(owner: Owner) []const u8 {
         .decision_prompt => "decision prompt",
         .question_freeform => "question freeform",
         .approval_amendment => "approval amendment",
+        .auth_code => "authorization code",
     };
+}
+
+test "authorization code paste zeroes retained capacity after handling and reset" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+
+    state.begin(.auth_code, 64);
+    for ("temporary-code") |byte| try state.consumeByte(std.testing.allocator, byte);
+    try std.testing.expect(state.buffer.capacity > 0);
+    try std.testing.expectEqual(@as(u8, 't'), state.buffer.allocatedSlice()[0]);
+    state.beginHandling();
+    state.finishSecretHandled();
+    for (state.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    state.begin(.auth_code, 64);
+    for ("second-code") |byte| try state.consumeByte(std.testing.allocator, byte);
+    state.resetSecretWithTrace(.session_reset);
+    for (state.buffer.allocatedSlice()) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "decision paste counts content bytes and exact end marker only" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const result_store = @import("../../core/session/result_store.zig");
+const command_replay_store = @import("../../core/session/command_replay_store.zig");
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
@@ -87,7 +88,10 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
-    if (ctx.session_child_capability == null and ctx.tool_result_dir == null) {
+    if (ctx.session_child_capability == null and
+        ctx.ephemeral_command_replay == null and
+        ctx.tool_result_dir == null)
+    {
         return .{ .failure = try ctx.allocator.dupe(u8, "No active session tool-result store is available.") };
     }
 
@@ -99,10 +103,48 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 
 fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
     if (ctx.session_child_capability) |capability| {
-        return if (input.query) |query|
+        const ordinary = if (input.query) |query|
             result_store.searchByQueryManaged(ctx.allocator, capability, input.handle, query)
         else
             result_store.readByRangeManaged(ctx.allocator, capability, input.handle, input.start_byte, input.byte_count);
+        return ordinary catch |err| switch (err) {
+            error.ResultHandleNotFound => if (input.query) |query|
+                command_replay_store.searchAgentQueryManaged(
+                    ctx.allocator,
+                    capability,
+                    input.handle,
+                    query,
+                    result_store.read_max_bytes,
+                )
+            else
+                command_replay_store.readAgentPageManaged(
+                    ctx.allocator,
+                    capability,
+                    input.handle,
+                    input.start_byte,
+                    input.byte_count,
+                ),
+            else => return err,
+        };
+    }
+
+    if (ctx.ephemeral_command_replay) |store| {
+        return if (input.query) |query|
+            command_replay_store.searchAgentQueryEphemeral(
+                ctx.allocator,
+                store,
+                input.handle,
+                query,
+                result_store.read_max_bytes,
+            )
+        else
+            command_replay_store.readAgentPageEphemeral(
+                ctx.allocator,
+                store,
+                input.handle,
+                input.start_byte,
+                input.byte_count,
+            );
     }
 
     const dir = ctx.tool_result_dir.?;
@@ -205,6 +247,69 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
         .failure => |body| try std.testing.expectEqualStrings(expected, body),
         .success => return error.TestExpectedFailure,
     }
+}
+
+test "read_tool_result pages and searches saved command replay handles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(
+        io_mod.getIo(),
+        "session",
+        std.Io.File.Permissions.fromMode(0o700),
+    );
+    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer session_dir.close(io_mod.getIo());
+    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
+    defer alloc.free(session_path);
+    var capability = try session_child_store.SessionChildCapability.initForTesting(
+        alloc,
+        session_dir,
+        session_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const capture = try command_replay_store.Capture.create(arena, 64 * 1024, &capability);
+    try capture.appendAcceptedRequired(arena, .stdout, "TOKEN=secret-value\nneedle tail\n");
+    const descriptor = (try capture.retainRequired(arena)) orelse
+        return error.TestExpectedReplay;
+    defer capture.releaseRetained(arena);
+
+    var page_input = Input{
+        .handle = try alloc.dupe(u8, descriptor.handle),
+        .start_byte = 1,
+        .byte_count = 4096,
+    };
+    defer page_input.deinit(alloc);
+    const page = try readOutput(.{
+        .allocator = alloc,
+        .session_child_capability = &capability,
+    }, &page_input);
+    defer alloc.free(page);
+    try std.testing.expect(std.mem.find(u8, page, "[stdout]") != null);
+    try std.testing.expect(std.mem.find(u8, page, "TOKEN=[redacted]") != null);
+    try std.testing.expect(std.mem.find(u8, page, "secret-value") == null);
+    try std.testing.expect(std.mem.find(u8, page, "needle tail") != null);
+
+    var query_input = Input{
+        .handle = try alloc.dupe(u8, descriptor.handle),
+        .query = try alloc.dupe(u8, "needle"),
+    };
+    defer query_input.deinit(alloc);
+    const query = try readOutput(.{
+        .allocator = alloc,
+        .session_child_capability = &capability,
+    }, &query_input);
+    defer alloc.free(query);
+    try std.testing.expect(std.mem.find(u8, query, "needle tail") != null);
 }
 
 test "large web_search result is previewed and available through read_tool_result" {

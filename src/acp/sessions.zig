@@ -13,6 +13,7 @@ const js_host_session_store = @import("../core/session/js_host_session_store.zig
 const session_runtime = @import("../core/session/session.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -43,9 +44,9 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
     const model = try alloc.dupe(u8, durable.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model);
-    var session_rt = session_runtime.SessionRuntime.init(
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
         state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
+        state.cfg.provider_set.deferredUsageProviders(),
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -193,9 +194,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (model_owned) alloc.free(model_copy);
     const session_dir = try session_store.sessionDirPath(alloc, store.sessions_dir, writable.active_id);
     defer alloc.free(session_dir);
-    var session_rt = session_runtime.SessionRuntime.init(
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
         state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
+        state.cfg.provider_set.deferredUsageProviders(),
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -320,7 +321,7 @@ pub fn handleLoadWasmSession(state: *server.ServerState, alloc: Allocator, msg: 
     const model_copy = try alloc.dupe(u8, loaded.state.preferences.model);
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
-    var session_rt = session_runtime.SessionRuntime.init(state.cfg.max_history_turns, state.cfg.gateway_provider.generation_usage);
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(state.cfg.max_history_turns, state.cfg.provider_set.deferredUsageProviders());
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
     try session_rt.restoreWithPermissionState(
@@ -574,9 +575,9 @@ fn handleRestoreSession(
     var model_owned = true;
     defer if (model_owned) alloc.free(model_copy);
 
-    var session_rt = session_runtime.SessionRuntime.init(
+    var session_rt = session_runtime.SessionRuntime.initWithProviders(
         state.cfg.max_history_turns,
-        state.cfg.gateway_provider.generation_usage,
+        state.cfg.provider_set.deferredUsageProviders(),
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
@@ -795,13 +796,18 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    if (state.credential_source == .chatgpt_subscription or state.credential_source == .grok_subscription) {
+    if (state.cfg.provider_set.select(activation.provider).deferred_usage == null) {
         state.active_session.?.session_rt.usage.clearReconciliationCredential();
-    } else {
-        state.active_session.?.session_rt.usage.startReconciliation(
+    } else if (state.credential_source) |source| {
+        state.active_session.?.session_rt.usage.replaceProviderReconciliationCredential(
             state.alloc,
+            activation.provider,
+            source,
+            state.account_id,
             state.api_key,
         );
+    } else {
+        state.active_session.?.session_rt.usage.clearReconciliationCredential();
     }
     activateManagedBackground(state, store);
 }
@@ -1451,6 +1457,7 @@ fn acpSessionTestConfig() server.Config {
         .gateway_chat_url = "http://127.0.0.1/unused",
         .gateway_models_path = "/v1/models",
         .gateway_provider = test_builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "test" },
         .ignored_list_entries = &.{},
@@ -1546,8 +1553,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expectEqualStrings("review", new_active.mode);
         try std.testing.expect(new_writable.state.usage != null);
         try std.testing.expect(
-            new_active.session_rt.usage.generation_usage_provider.lookup_fn ==
-                state.cfg.gateway_provider.generation_usage.lookup_fn,
+            new_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
+                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
         );
         io_mod.sleep(10 * std.time.ns_per_ms);
         var live_usage = try new_active.session_rt.usage.snapshot(alloc);
@@ -1585,8 +1592,8 @@ test "ACP new and loaded sessions provide a writable subagent host" {
         try std.testing.expect(state.subagent_store != null);
         try std.testing.expect(state.subagent_host != null);
         try std.testing.expect(
-            loaded_active.session_rt.usage.generation_usage_provider.lookup_fn ==
-                state.cfg.gateway_provider.generation_usage.lookup_fn,
+            loaded_active.session_rt.usage.generation_usage_providers.select(.gateway).?.lookup_fn ==
+                state.cfg.provider_set.deferredUsageProviders().select(.gateway).?.lookup_fn,
         );
 
         try capture.sync(io_mod.getIo());

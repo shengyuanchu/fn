@@ -34,7 +34,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
-            .{ .flag = "--yolo", .description = "Disable fx permission checks" },
+            .{ .flag = "--yolo", .description = "Disable fn permission checks" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             json_option,
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
@@ -121,7 +121,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Modes:",
             "  ask    Prompt before sensitive tool calls",
             "  auto   Apply rules, then review unresolved sensitive tool calls (default)",
-            "  yolo   Disable fx permission checks",
+            "  yolo   Disable fn permission checks",
             "",
             "Change the mode from the interactive shell with `/permissions [ask|auto|yolo|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
@@ -138,7 +138,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <gateway|codex|grok>",
-        .summary = "Choose the model provider used by fx",
+        .summary = "Choose the model provider used by fn",
     },
     .{
         .kind = .doctor,
@@ -227,7 +227,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             json_option,
         },
         .details = &.{
-            "Reports only usage recorded by fx on this machine.",
+            "Reports only usage recorded by fn on this machine.",
             "This command reads local state and does not query account-wide Gateway reports.",
         },
     },
@@ -436,13 +436,13 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
-    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
+    .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fn is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
-    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout]", .completion_description = "manage MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
+    .{ .kind = .mcp, .command = "/mcp", .help_entry = "/mcp [list|resource|prompt|add|remove|path|reload|auth|logout]", .completion_description = "manage local and remote MCP servers, resources, and prompts", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .skills, .command = "/skills", .help_entry = "/skills [list|add|install|show|create|remove|path] [name|url|path] ($ opens skill search)", .completion_description = "browse and manage skills", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .copy, .command = "/copy", .help_entry = "/copy", .completion_description = "copy the last assistant response", .presentation_category = .session },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fx feedback form", .presentation_category = .product, .show_in_welcome = true },
+    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the fn issue tracker", .presentation_category = .product, .show_in_welcome = true },
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "compact older conversation turns", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
@@ -450,7 +450,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
-    .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance [input lines|tint|presentation normal|minimal]", .completion_description = "choose input and transcript presentation", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
@@ -511,9 +510,6 @@ pub fn slashCompletionHasArgs(command: []const u8) bool {
 pub const argCompletionAnchor = command_specs.argCompletionAnchor;
 pub const argCompletionIndexForLabel = command_specs.argCompletionIndexForLabel;
 pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPrefix;
-pub const appearanceArgCompletionPrefix = command_specs.appearanceArgCompletionPrefix;
-pub const inputArgCompletionPrefix = command_specs.inputArgCompletionPrefix;
-pub const maxxingArgCompletionPrefix = command_specs.maxxingArgCompletionPrefix;
 pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
@@ -555,7 +551,6 @@ test "built-in slash commands register exact active order" {
         "/credits",
         "/paste",
         "/fast",
-        "/appearance",
         "/statusline",
         "/sound",
         "/workspace",
@@ -594,10 +589,10 @@ test "built-in slash registry resolves primary commands and aliases" {
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }
 
-test "exact slash command matching includes hidden completion aliases" {
-    try std.testing.expect(isExactSlashCommand("/appearance"));
-    try std.testing.expect(isExactSlashCommand("/input"));
-    try std.testing.expect(isExactSlashCommand("/maxxing\t"));
+test "retired appearance slash commands are not registered" {
+    try std.testing.expect(!isExactSlashCommand("/appearance"));
+    try std.testing.expect(!isExactSlashCommand("/input"));
+    try std.testing.expect(!isExactSlashCommand("/maxxing\t"));
     try std.testing.expect(!isExactSlashCommand("/input lines"));
     try std.testing.expect(!isExactSlashCommand("/unknown"));
 }

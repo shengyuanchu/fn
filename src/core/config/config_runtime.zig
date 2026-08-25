@@ -8,6 +8,7 @@ const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const model_provider = @import("model_provider.zig");
+const model_preferences = @import("model_preferences.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -35,10 +36,8 @@ pub const Paths = struct {
 };
 
 pub const Settings = struct {
-    model: ?[]u8 = null,
+    models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
-    codex_model: ?[]u8 = null,
-    grok_model: ?[]u8 = null,
     permission_mode: ?types.PermissionMode = null,
     credential_source: ?types.CredentialSource = null,
     yolo_acknowledged: ?bool = null,
@@ -48,8 +47,6 @@ pub const Settings = struct {
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
-    input_appearance: ?[]u8 = null,
-    maxxing_mode: ?[]u8 = null,
     slash_menu_categories: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -66,11 +63,7 @@ pub const Settings = struct {
     has_permission_rules: bool = false,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
-        if (self.model) |value| alloc.free(value);
-        if (self.codex_model) |value| alloc.free(value);
-        if (self.grok_model) |value| alloc.free(value);
-        if (self.input_appearance) |value| alloc.free(value);
-        if (self.maxxing_mode) |value| alloc.free(value);
+        self.models.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -103,15 +96,11 @@ pub const ConfigSource = enum {
 pub const ModelSource = ConfigSource;
 
 pub const ConfigSources = struct {
-    model: ConfigSource = .compiled_default,
+    models: ProviderModelSources = .{},
     provider: ConfigSource = .compiled_default,
-    codex_model: ConfigSource = .compiled_default,
-    grok_model: ConfigSource = .compiled_default,
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
-    input_appearance: ConfigSource = .compiled_default,
-    maxxing_mode: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
@@ -120,6 +109,19 @@ pub const ConfigSources = struct {
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
+};
+
+pub const ProviderModelSources = struct {
+    values: [std.meta.fields(model_provider.ProviderId).len]ConfigSource =
+        [_]ConfigSource{.compiled_default} ** std.meta.fields(model_provider.ProviderId).len,
+
+    pub fn get(self: ProviderModelSources, provider: model_provider.ProviderId) ConfigSource {
+        return self.values[@intFromEnum(provider)];
+    }
+
+    pub fn set(self: *ProviderModelSources, provider: model_provider.ProviderId, source: ConfigSource) void {
+        self.values[@intFromEnum(provider)] = source;
+    }
 };
 
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
@@ -443,14 +445,14 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     if (io_mod.getenv("MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            sources.model = .process_override;
+            sources.models.set(settings.provider orelse .gateway, .process_override);
         }
     }
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.model,
+        .model_source = sources.models.get(settings.provider orelse .gateway),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
@@ -516,8 +518,6 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "model",
             "effort",
             "fast_mode",
-            "input_appearance",
-            "maxxing_mode",
             "slash_menu_categories",
             "startup_scrollback",
         }) |key| {
@@ -541,13 +541,12 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
 fn isProfileOnlySettingKey(key: []const u8) bool {
     inline for (&.{
         "model",
+        "models",
         "provider",
         "codex_model",
         "grok_model",
         "effort",
         "fast_mode",
-        "input_appearance",
-        "maxxing_mode",
         "slash_menu_categories",
         "startup_scrollback",
         "prompt_history",
@@ -587,15 +586,13 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
 }
 
 fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
-    if (settings.model != null) sources.model = source;
+    inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
+        if (settings.models.get(provider) != null) sources.models.set(provider, source);
+    }
     if (settings.provider != null) sources.provider = source;
-    if (settings.codex_model != null) sources.codex_model = source;
-    if (settings.grok_model != null) sources.grok_model = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
-    if (settings.input_appearance != null) sources.input_appearance = source;
-    if (settings.maxxing_mode != null) sources.maxxing_mode = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
@@ -1000,7 +997,7 @@ fn readOptionalUserSettingsFile(alloc: Allocator, paths: Paths) !?[]u8 {
 
 fn startupStatusSettingsFromSettings(alloc: Allocator, settings: Settings) !StartupStatusSettings {
     return .{
-        .model = if (settings.model) |model| try alloc.dupe(u8, model) else null,
+        .model = if (settings.models.get(.gateway)) |model| try alloc.dupe(u8, model) else null,
         .permission_mode = settings.permission_mode,
         .max_agent_steps = settings.max_agent_steps,
     };
@@ -1272,7 +1269,7 @@ fn parseProfileOnlyFields(
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
         settings_store.validateModel(value.string) catch return error.InvalidModelValue;
-        settings.model = try alloc.dupe(u8, value.string);
+        try settings.models.putCopy(alloc, .gateway, value.string);
     }
 
     if (root.object.get("provider")) |provider_value| {
@@ -1284,13 +1281,24 @@ fn parseProfileOnlyFields(
     if (root.object.get("codex_model")) |model_value| {
         if (model_value != .string) return error.InvalidCodexModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidCodexModelValue;
-        settings.codex_model = try alloc.dupe(u8, model_value.string);
+        try settings.models.putCopy(alloc, .codex, model_value.string);
     }
 
     if (root.object.get("grok_model")) |model_value| {
         if (model_value != .string) return error.InvalidGrokModelType;
         settings_store.validateModel(model_value.string) catch return error.InvalidGrokModelValue;
-        settings.grok_model = try alloc.dupe(u8, model_value.string);
+        try settings.models.putCopy(alloc, .grok, model_value.string);
+    }
+
+    if (root.object.get("models")) |models_value| {
+        if (models_value != .object) return error.InvalidModelType;
+        inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
+            if (models_value.object.get(@tagName(provider))) |model_value| {
+                if (model_value != .string) return error.InvalidModelType;
+                settings_store.validateModel(model_value.string) catch return error.InvalidModelValue;
+                try settings.models.putCopy(alloc, provider, model_value.string);
+            }
+        }
     }
 
     if (root.object.get("permission_mode")) |permission_mode_value| {
@@ -1329,20 +1337,6 @@ fn parseProfileOnlyFields(
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
-    }
-
-    if (root.object.get("input_appearance")) |input_appearance_value| {
-        const value = input_appearance_value;
-        if (value != .string) return error.InvalidInputAppearanceType;
-        settings_store.validateInputAppearance(value.string) catch return error.InvalidInputAppearanceValue;
-        settings.input_appearance = try alloc.dupe(u8, value.string);
-    }
-
-    if (root.object.get("maxxing_mode")) |maxxing_mode_value| {
-        const value = maxxing_mode_value;
-        if (value != .string) return error.InvalidMaxxingModeType;
-        settings_store.validateMaxxingMode(value.string) catch return error.InvalidMaxxingModeValue;
-        settings.maxxing_mode = try alloc.dupe(u8, value.string);
     }
 
     if (root.object.get("slash_menu_categories")) |slash_menu_categories_value| {
@@ -1456,22 +1450,8 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
 }
 
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
-    if (incoming.model) |value| {
-        if (target.model) |current| alloc.free(current);
-        target.model = value;
-        incoming.model = null;
-    }
+    target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
-    if (incoming.codex_model) |value| {
-        if (target.codex_model) |current| alloc.free(current);
-        target.codex_model = value;
-        incoming.codex_model = null;
-    }
-    if (incoming.grok_model) |value| {
-        if (target.grok_model) |current| alloc.free(current);
-        target.grok_model = value;
-        incoming.grok_model = null;
-    }
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
@@ -1481,16 +1461,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
-    if (incoming.input_appearance) |value| {
-        if (target.input_appearance) |current| alloc.free(current);
-        target.input_appearance = value;
-        incoming.input_appearance = null;
-    }
-    if (incoming.maxxing_mode) |value| {
-        if (target.maxxing_mode) |current| alloc.free(current);
-        target.maxxing_mode = value;
-        incoming.maxxing_mode = null;
-    }
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
@@ -1878,7 +1848,7 @@ test "loadMergedSettings merges project defaults before profile layers" {
     var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
     defer settings.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("override-model", settings.model.?);
+    try std.testing.expectEqualStrings("override-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
@@ -2013,9 +1983,18 @@ test "provider settings keep independent provider models" {
     );
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(model_provider.ProviderId.grok, settings.provider.?);
-    try std.testing.expectEqualStrings("gateway/model", settings.model.?);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", settings.codex_model.?);
-    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.grok_model.?);
+    try std.testing.expectEqualStrings("gateway/model", settings.models.get(.gateway).?);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", settings.models.get(.codex).?);
+    try std.testing.expectEqualStrings("grok-4.20-0309-non-reasoning", settings.models.get(.grok).?);
+
+    var current = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"model\":\"legacy/gateway\",\"codex_model\":\"legacy-codex\",\"models\":{\"gateway\":\"current/gateway\",\"codex\":\"current-codex\",\"grok\":\"current-grok\"}}",
+    );
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("current/gateway", current.models.get(.gateway).?);
+    try std.testing.expectEqualStrings("current-codex", current.models.get(.codex).?);
+    try std.testing.expectEqualStrings("current-grok", current.models.get(.grok).?);
 }
 
 test "max_agent_steps explicit zero survives serialization round trip" {
@@ -2065,6 +2044,15 @@ test "skill_match_fuzzy returns a migration-specific parse error" {
         error.RetiredSkillMatchFuzzy,
         parseSettingsJson(std.testing.allocator, "{\"skill_match_fuzzy\":true}"),
     );
+}
+
+test "retired presentation settings are ignored regardless of type" {
+    var settings = try parseSettingsJson(
+        std.testing.allocator,
+        "{\"model\":\"openai/gpt-5.4\",\"input_appearance\":false,\"maxxing_mode\":7}",
+    );
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", settings.models.get(.gateway).?);
 }
 
 test "startup_scrollback parses merges rejects invalid type and round trips" {
@@ -2142,7 +2130,7 @@ test "first_call_tool_choice ignores unknown strings and rejects invalid types" 
 test "obsolete web_fetch worker model setting is ignored" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"web_fetch_worker_model\":false,\"model\":\"provider/model\"}");
     defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("provider/model", parsed.model.?);
+    try std.testing.expectEqualStrings("provider/model", parsed.models.get(.gateway).?);
 }
 
 test "workspace override can change effort from high to auto" {
@@ -2609,7 +2597,7 @@ test "addPermissionRule preserves unrelated workspace override keys" {
 
     var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.model.?);
+    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
 }
@@ -2770,7 +2758,7 @@ test "user effort preference preserves unrelated workspace override keys" {
 
     var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.model.?);
+    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expect(settings.effort.?.eql(types.ReasoningEffort.literal("future-tier")));
 
@@ -2812,7 +2800,7 @@ test "user fast mode preference writes bool and preserves unrelated keys" {
 
     var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.model.?);
+    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(true, settings.fast_mode.?);
 
@@ -2854,7 +2842,7 @@ test "user startup scrollback preference writes bool and preserves unrelated key
 
     var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("my-model", settings.model.?);
+    try std.testing.expectEqualStrings("my-model", settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, settings.permission_mode.?);
     try std.testing.expectEqual(false, settings.startup_scrollback.?);
 
@@ -2890,7 +2878,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("profile/model", result.settings.model.?);
+    try std.testing.expectEqualStrings("profile/model", result.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.auto, result.settings.permission_mode.?);
     try std.testing.expectEqual(@as(usize, 17), result.settings.max_agent_steps.?);
     try std.testing.expectEqual(true, result.settings.prompt_history_enabled.?);
@@ -2899,15 +2887,13 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(false, result.settings.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, result.settings.update_channel.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
-    try std.testing.expectEqualStrings("tint", result.settings.input_appearance.?);
-    try std.testing.expectEqualStrings("minimal", result.settings.maxxing_mode.?);
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), result.settings.effort.?);
     try std.testing.expectEqual(false, result.settings.startup_scrollback.?);
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -2919,8 +2905,6 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "auto_upgrade",
         "update_channel",
         "fast_mode",
-        "input_appearance",
-        "maxxing_mode",
         "slash_menu_categories",
         "effort",
         "startup_scrollback",
@@ -2952,7 +2936,7 @@ test "malformed project profile-only settings are ignored before value parsing" 
 
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("profile/model", result.settings.model.?);
+    try std.testing.expectEqualStrings("profile/model", result.settings.models.get(.gateway).?);
     try std.testing.expectEqual(types.PermissionMode.ask, result.settings.permission_mode.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
     try std.testing.expectEqual(@as(usize, 12), result.settings.max_agent_steps.?);
@@ -3209,7 +3193,7 @@ test "detailed settings diagnose legacy workspace preferences" {
     );
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("legacy/model", result.settings.model.?);
+    try std.testing.expectEqualStrings("legacy/model", result.settings.models.get(.gateway).?);
     try std.testing.expectEqual(true, result.settings.statusline_session.?);
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.statusline_session);
     try std.testing.expectEqual(
@@ -3238,7 +3222,7 @@ test "detailed settings preserve model precedence and source" {
 
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("workspace/model", result.settings.model.?);
+    try std.testing.expectEqualStrings("workspace/model", result.settings.models.get(.gateway).?);
     try std.testing.expectEqual(ModelSource.user_workspace, result.model_source.?);
 }
 
@@ -3273,18 +3257,16 @@ test "detailed settings expose target sources and permission views" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.model);
+    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(.gateway));
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.input_appearance);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.startup_scrollback);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.prompt_history_enabled);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_context);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.statusline_session);
     try std.testing.expectEqual(true, result.settings.statusline_session.?);
     try std.testing.expectEqual(@as(usize, 33), result.settings.max_agent_steps.?);
-    try std.testing.expectEqualStrings("lines", result.settings.input_appearance.?);
 
     try std.testing.expectEqual(@as(usize, 1), result.permission_sources.user.rules.len);
     try expectPermissionRule(result.permission_sources.user.rules[0], "bash", "user *", .allow);
@@ -3317,9 +3299,9 @@ test "detailed settings report non-empty process model override as winning sourc
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.model);
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
-    try std.testing.expectEqualStrings("user/model", result.settings.model.?);
+    try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {
@@ -3336,7 +3318,7 @@ test "invalid user model emits typed diagnostic and project model is ignored" {
 
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.settings.model == null);
+    try std.testing.expect(result.settings.models.get(.gateway) == null);
     try std.testing.expectEqual(ModelSource.compiled_default, result.model_source.?);
     try expectIgnoredProjectKey(result.diagnostics, "model");
     try std.testing.expectEqual(ConfigDiagnosticCause.invalid_model_id, result.diagnostics[1].cause);
@@ -3415,7 +3397,7 @@ test "invalid user settings report newest valid manual recovery backup" {
         result.diagnostics[1].recovery_path.?,
         "settings.json.backup.100-0000000000000001-00000000000000000000000000000000",
     ));
-    try std.testing.expect(result.settings.model == null);
+    try std.testing.expect(result.settings.models.get(.gateway) == null);
 }
 
 test "update channel resolves only from the global user profile" {
@@ -3573,7 +3555,7 @@ test "malformed or duplicate additional directories do not discard sibling setti
         var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
         defer detailed.deinit(alloc);
 
-        try std.testing.expectEqualStrings("workspace/model", detailed.settings.model.?);
+        try std.testing.expectEqualStrings("workspace/model", detailed.settings.models.get(.gateway).?);
         try std.testing.expect(detailed.additional_directories == null);
         var found_diagnostic = false;
         for (detailed.diagnostics) |diagnostic| {

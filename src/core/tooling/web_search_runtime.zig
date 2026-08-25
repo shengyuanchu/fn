@@ -35,6 +35,7 @@ pub const Config = struct {
     clock: Clock = .{},
     policy: ?web_search_policy.WebSearchPolicy = null,
     api_key: []const u8 = "",
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8 = "",
     gateway_retry_count: usize = 3,
@@ -47,6 +48,7 @@ pub const Inputs = web_search_provider.Inputs;
 
 const OwnedInputs = struct {
     api_key: []u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]u8 = null,
     worker_model: []u8,
     gateway_retry_count: usize,
@@ -66,6 +68,7 @@ const OwnedInputs = struct {
     fn borrowed(self: *const OwnedInputs) Inputs {
         return .{
             .api_key = self.api_key,
+            .credential_source = self.credential_source,
             .gateway_team = self.gateway_team,
             .worker_model = self.worker_model,
             .gateway_retry_count = self.gateway_retry_count,
@@ -83,6 +86,7 @@ pub const Runtime = struct {
     clock: Clock,
     policy: web_search_policy.WebSearchPolicy,
     api_key: []const u8,
+    credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8,
     gateway_retry_count: usize,
@@ -98,6 +102,7 @@ pub const Runtime = struct {
             .clock = config.clock,
             .policy = config.policy orelse if (config.provider) |provider| provider.policy else .{},
             .api_key = config.api_key,
+            .credential_source = config.credential_source,
             .gateway_team = config.gateway_team,
             .worker_model = config.worker_model,
             .gateway_retry_count = config.gateway_retry_count,
@@ -113,6 +118,7 @@ pub const Runtime = struct {
         self.config_mutex.lockUncancelable(io_mod.getIo());
         defer self.config_mutex.unlock(io_mod.getIo());
         self.api_key = inputs.api_key;
+        self.credential_source = inputs.credential_source;
         self.gateway_team = inputs.gateway_team;
         self.worker_model = inputs.worker_model;
         self.gateway_retry_count = inputs.gateway_retry_count;
@@ -225,6 +231,7 @@ pub const Runtime = struct {
         const gateway_chat_url = try alloc.dupe(u8, self.gateway_chat_url);
         return .{
             .api_key = api_key,
+            .credential_source = self.credential_source,
             .gateway_team = gateway_team,
             .worker_model = worker_model,
             .gateway_retry_count = self.gateway_retry_count,

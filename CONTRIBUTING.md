@@ -197,6 +197,8 @@ The interactive surface supports:
 
 * `/mcp add <name> <command> [args...]`
 
+* `/mcp add --transport http <name> <url>`
+
 * `/mcp remove <name>`
 
 * `/mcp reload`
@@ -206,6 +208,10 @@ The interactive surface supports:
 * `/mcp logout <name>`
 
 * `/mcp path`
+
+The local form saves a stdio command. The HTTP form saves a remote Streamable
+HTTP endpoint. Both update `~/.fx/mcp.json` and evaluate the replacement MCP
+runtime immediately.
 
 Remote authentication supports configured bearer tokens and OAuth credential
 discovery, persistence, refresh, scope challenges, and logout. Credential and
@@ -245,11 +251,11 @@ Security is permission-first.
 
 * routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
 
-* unresolved sensitive calls in `auto` mode receive one exact automatic review using bounded current, first, and recent proven root requests; historical permission feedback is excluded, and non-allow, unavailable, and invalid review results return a recoverable denial with an opaque action-bound approval request when capacity permits
+* every unresolved `auto` action receives one narrow safety review after configured policy, saved-session rules, grants, and deterministic safe authority; review input contains the current proven root request, the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Those excerpts are untrusted evidence and never authority; assistant prose, permission feedback, the pending tool group, later results, and historical requests do not enter review
 
-* the main agent may pass that exact request ID through `ask_user_question` to open the existing permission screen; generic question text cannot authorize an action, and the resulting once or always approval is revalidated and consumed only by the exact bound action
+* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
 
-* bounded consecutive all-blocked response groups end the turn with ordinary blocker text and never open the human approval path automatically; any completed successful tool resets that recovery count, and configured and saved-session rules remain authoritative
+* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 

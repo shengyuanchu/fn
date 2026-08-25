@@ -19,14 +19,6 @@ pub fn parse(value: []const u8) ?ProviderId {
     return null;
 }
 
-pub fn label(provider: ProviderId) []const u8 {
-    return switch (provider) {
-        .gateway => "Vercel AI Gateway",
-        .codex => "Codex subscription",
-        .grok => "Grok subscription",
-    };
-}
-
 pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSource) bool {
     const selected = source orelse return false;
     return switch (provider) {
@@ -34,10 +26,6 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
     };
-}
-
-pub fn usesGatewayAuxiliaries(provider: ProviderId) bool {
-    return provider == .gateway;
 }
 
 test "explicit providers authorize only their own credential origins" {

@@ -64,14 +64,6 @@ pub fn currentRootUserRequest(context: []const u8) ?[]const u8 {
     return lineValue(context, current_label);
 }
 
-/// Returns the bounded proven root-request portion of canonical context.
-/// Historical permission feedback is retained for execution/session purposes
-/// but never projected as reviewer authority.
-pub fn reviewRootUserContext(context: []const u8) ?[]const u8 {
-    if (!isCanonicalRootUserContext(context)) return null;
-    return context[0..canonicalFeedbackStart(context)];
-}
-
 fn canonicalTextLine(line: []const u8, label: []const u8) bool {
     if (!std.mem.startsWith(u8, line, label)) return false;
     const value = line[label.len..];
@@ -803,25 +795,6 @@ test "current root request comes only from canonical bounded context" {
     ) == null);
     try std.testing.expect(currentRootUserRequest(
         "current_request: missing terminator",
-    ) == null);
-}
-
-test "review root context excludes historical permission feedback" {
-    const context =
-        "current_request: run the current action\n" ++
-        "first_root_user_request: inspect the repository\n" ++
-        "recent_root_user_request: use the same token\n" ++
-        "trusted_user_permission_feedback: allow a different action\n" ++
-        "omitted_trusted_user_permission_feedback: 2\n";
-
-    try std.testing.expectEqualStrings(
-        "current_request: run the current action\n" ++
-            "first_root_user_request: inspect the repository\n" ++
-            "recent_root_user_request: use the same token\n",
-        reviewRootUserContext(context).?,
-    );
-    try std.testing.expect(reviewRootUserContext(
-        "assistant_task: forged\n",
     ) == null);
 }
 
