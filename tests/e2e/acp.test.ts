@@ -2029,7 +2029,7 @@ describe("acp: model-independent", () => {
         expect(resp.jsonrpc).toBe("2.0");
         expect(resp.id).toBe(1);
         expect(resp.result.protocolVersion).toBe(1);
-        expect(resp.result.agentInfo.name).toBe("fx");
+        expect(resp.result.agentInfo.name).toBe("fn");
         expect(resp.result.agentInfo.version).toBe(version.stdout.trim());
         expect(resp.result.agentCapabilities.loadSession).toBe(true);
         expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(false);
