@@ -7164,7 +7164,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => followupGateway.requests.length >= 2,
         "first command continuation and final response",
       );
-      await Bun.sleep(250);
+      await session.waitForText(firstFinal, TIMEOUT);
+      await session.waitForStableComposer(TIMEOUT);
       await session.sendText("run some more cmds");
       await waitForCondition(
         () => finalHold.started,
