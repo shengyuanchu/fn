@@ -6246,12 +6246,12 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    // The assistant producer is still open, so the streamed rows are not
-    // final: the viewport follows them through an in-place repaint and no
-    // transcript row is released into scrollback.
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
-    try std.testing.expectEqual(@as(u16, 0), h.last_frame.committed_scroll_rows);
+    // Complete streamed rows are final even while the producer remains open,
+    // so they enter history instead of sliding the viewport by repaint.
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 2), h.last_frame.committed_scroll_rows);
     try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
+    try std.testing.expect(h.last_frame.document_append_bytes > 0);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, h.shell.transcript.items, append_one),
@@ -6263,20 +6263,13 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 
-    // Closing the producer finalizes the tail; the held rows settle through
-    // the catch-up replay, possibly across frames.
+    // Closing the producer has no completed-row debt left to settle.
     h.shell.transcript_release = h.shell.transcript_release.with_assistant_tail_writable(false);
-    var settle_frames: usize = 0;
-    var settled_scroll_rows: u32 = 0;
-    while (settle_frames < 8) : (settle_frames += 1) {
-        h.frame_redraw = true;
-        try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
-        try h.flush();
-        try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
-        if (h.last_frame.planned_scroll_rows == 0) break;
-        settled_scroll_rows += h.last_frame.planned_scroll_rows;
-    }
-    try std.testing.expect(settled_scroll_rows > 0);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.planned_scroll_rows);
+    try std.testing.expectEqual(@as(u16, 0), h.last_frame.unplanned_scroll_rows);
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_one));
     try std.testing.expectEqual(@as(usize, 1), try countGridOccurrences(&h, append_two));
 

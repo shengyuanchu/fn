@@ -597,10 +597,7 @@ pub fn slashMenuLayout(
     const result_count = mixedSlashCompletionCount(registry, prefix, skills);
     if (result_count == 0) return null;
 
-    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
-    const minimum_transcript_rows: u16 = 5;
-    const available_picker_rows = (terminal_rows -| fixed_rows) -| minimum_transcript_rows;
-    const row_budget = @min(input_presentation.max_model_picker_rows + 2, @max(available_picker_rows, 1));
+    const row_budget = inlinePickerRowBudget(terminal_rows, input_extra, banner_rows);
     const show_header = row_budget > 2;
     const header_rows: u16 = if (show_header) 2 else 0;
     const selectable_rows = row_budget - header_rows;
@@ -617,6 +614,13 @@ pub fn slashMenuLayout(
         .result_count = result_count,
         .window = window,
     };
+}
+
+pub fn inlinePickerRowBudget(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
+    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
+    const minimum_transcript_rows: u16 = 5;
+    const available_picker_rows = (terminal_rows -| fixed_rows) -| minimum_transcript_rows;
+    return @min(input_presentation.max_model_picker_rows + 2, @max(available_picker_rows, 1));
 }
 
 pub noinline fn composePickerOptionRow(
@@ -637,7 +641,7 @@ pub noinline fn composePickerOptionRow(
     // pickers keep the filled row.
     const selected_style = switch (kind) {
         .model_stage => ui_render.selected_completion_style,
-        .file, .slash, .auth => ui_render.approval_button_inactive_style,
+        .file, .slash, .skills, .auth => ui_render.approval_button_inactive_style,
     };
     try row.appendSlice(alloc, if (selected) selected_style else ui_render.dim_style);
 
@@ -706,6 +710,7 @@ pub fn composePickerStatusRow(
         else
             "no matching files",
         .slash => "no matching slash commands",
+        .skills => "no matching skills",
         .auth => "authentication actions unavailable",
     };
 
@@ -1223,6 +1228,13 @@ test "slash menu layout keeps six selectable rows below its header" {
     const scrolled = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 6, 0, 24, 0, 0).?;
     try std.testing.expectEqual(@as(usize, 1), scrolled.window.start);
     try std.testing.expectEqual(@as(usize, 7), scrolled.window.end);
+}
+
+test "inline picker row budget preserves six roomy choices and shrinks with height" {
+    try std.testing.expectEqual(@as(u16, 8), inlinePickerRowBudget(24, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), inlinePickerRowBudget(16, 0, 0));
+    try std.testing.expectEqual(@as(u16, 2), inlinePickerRowBudget(16, 0, 4));
+    try std.testing.expectEqual(@as(u16, 1), inlinePickerRowBudget(6, 0, 0));
 }
 
 test "slash menu layout prioritizes selection at short heights and excludes arguments" {

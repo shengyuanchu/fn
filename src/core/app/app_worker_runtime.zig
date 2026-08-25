@@ -579,9 +579,17 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (!app.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) return false;
+            const native_history_active = if (comptime @hasDecl(
+                @TypeOf(app.shell),
+                "nativeHistoryActive",
+            ))
+                app.shell.nativeHistoryActive()
+            else
+                false;
             if (app.approval_prompt.isActive() or
                 app.question_prompt.isActive() or
-                !app.shell.shimmer_active)
+                !app.shell.shimmer_active or
+                native_history_active)
             {
                 return false;
             }
@@ -1342,6 +1350,7 @@ const FakeCommandOutputDisplay = struct {
 const FakeShell = struct {
     command_output_display: FakeCommandOutputDisplay = .{},
     shimmer_active: bool = false,
+    native_history_active: bool = false,
     render_requests: render_request.RenderRequestState = .{},
     lifecycle: transcript_runtime.TranscriptRuntime = .{
         .layout = .{
@@ -1364,6 +1373,10 @@ const FakeShell = struct {
         self.lifecycle.deinit(alloc);
         for (self.raw_entries.items) |entry| alloc.free(entry);
         self.raw_entries.deinit(alloc);
+    }
+
+    fn nativeHistoryActive(self: *const FakeShell) bool {
+        return self.native_history_active;
     }
 
     fn trimTrailingBlankLines(self: *FakeShell) void {
@@ -2116,6 +2129,27 @@ test "core.app_worker_runtime advances visible animation exactly at its deadline
 
     try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(&app, NoopBridge.lifecyclePresenter(&app), 1_050));
     try std.testing.expectEqual(before, app.shell.render_requests.visibleAnimationPhase());
+}
+
+test "core.app_worker_runtime pauses visible animation after native history starts" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.stream = .{
+        .active = true,
+        .last_activity_kind = .ask,
+    };
+    app.shell.shimmer_active = true;
+    app.shell.native_history_active = true;
+    app.shell.render_requests.animation_visible = true;
+    app.shell.render_requests.animation_next_deadline_ms = 1;
+
+    try std.testing.expect(!Runtime(FakeApp).advanceVisibleAnimation(
+        &app,
+        NoopBridge.lifecyclePresenter(&app),
+        1,
+    ));
+    try std.testing.expect(!app.shell.render_requests.hasReason(.animation));
 }
 
 test "core.app_worker_runtime expires selected child worker status while idle" {

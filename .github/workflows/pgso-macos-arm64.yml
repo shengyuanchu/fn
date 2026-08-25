@@ -41,7 +41,7 @@ jobs:
       startup: ${{ steps.plan.outputs.startup }}
       heavy: ${{ steps.plan.outputs.heavy }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -88,7 +88,7 @@ jobs:
           echo "Heavy matrix: $heavy"
 
       - name: Upload immutable seed
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-seed-${{ github.sha }}
           path: |
@@ -111,7 +111,7 @@ jobs:
       max-parallel: 20
       matrix: ${{ fromJSON(needs.seed.outputs.training) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -130,7 +130,7 @@ jobs:
         working-directory: tests/e2e
 
       - name: Download immutable seed
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-seed-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-seed
@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload training evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-training-${{ github.sha }}-${{ matrix.id }}
           path: |
@@ -167,7 +167,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -181,13 +181,13 @@ jobs:
           llvm: "true"
 
       - name: Download immutable seed
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-seed-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-seed
 
       - name: Download all training shards
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pgso-training-${{ github.sha }}-*
           path: ${{ runner.temp }}/fx-pgso-training
@@ -205,7 +205,7 @@ jobs:
 
       - name: Upload candidate and build evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
           path: |
@@ -244,7 +244,7 @@ jobs:
       max-parallel: 20
       matrix: ${{ fromJSON(needs.seed.outputs.behavior) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -263,7 +263,7 @@ jobs:
         working-directory: tests/e2e
 
       - name: Download candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-candidate
@@ -282,7 +282,7 @@ jobs:
 
       - name: Upload behavior evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-behavior-${{ github.sha }}-${{ matrix.id }}
           path: |
@@ -304,7 +304,7 @@ jobs:
       max-parallel: 6
       matrix: ${{ fromJSON(needs.seed.outputs.startup) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -318,7 +318,7 @@ jobs:
           hyperfine: "true"
 
       - name: Download candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-candidate
@@ -338,7 +338,7 @@ jobs:
 
       - name: Upload startup evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-startup-${{ github.sha }}-${{ matrix.name }}
           path: |
@@ -359,7 +359,7 @@ jobs:
       max-parallel: 6
       matrix: ${{ fromJSON(needs.seed.outputs.heavy) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -367,7 +367,7 @@ jobs:
         run: test "$(uname -m)" = arm64
 
       - name: Download candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-candidate
@@ -395,7 +395,7 @@ jobs:
 
       - name: Upload heavy-workload evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pgso-heavy-${{ github.sha }}-${{ matrix.name }}
           path: |
@@ -412,7 +412,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -420,25 +420,25 @@ jobs:
         run: test "$(uname -m)" = arm64
 
       - name: Download candidate
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pgso-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/fx-pgso-candidate
 
       - name: Download behavior evidence
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pgso-behavior-${{ github.sha }}-*
           path: ${{ runner.temp }}/fx-pgso-behavior
 
       - name: Download startup evidence
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pgso-startup-${{ github.sha }}-*
           path: ${{ runner.temp }}/fx-pgso-startup
 
       - name: Download heavy-workload evidence
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pgso-heavy-${{ github.sha }}-*
           path: ${{ runner.temp }}/fx-pgso-heavy
@@ -455,10 +455,51 @@ jobs:
             --heavy-dir "$RUNNER_TEMP/fx-pgso-heavy" \
             --output-dir "$RUNNER_TEMP/fx-pgso-aggregate"
 
+      - name: Upload aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pgso-evidence-macos-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-aggregate
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-stable-release:
+    name: Sign stable macOS arm64 release
+    needs: aggregate
+    if: inputs.package_release
+    runs-on: macos-15
+    environment: apple-signing
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Download eligible candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pgso-evidence-macos-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/fx-pgso-aggregate
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
+
+      - name: Confirm release eligibility
+        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
+
+      - name: Sign and notarize stable release candidate
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/fx-pgso-aggregate/candidate/fx"
+
       - name: Package stable release candidate
-        if: inputs.package_release
         run: |
-          python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso-aggregate" >/dev/null
           archive="$RUNNER_TEMP/fx-macos-aarch64.tar.gz"
           package_dir="$RUNNER_TEMP/fx-release-package"
           mkdir -p "$package_dir"
@@ -468,20 +509,10 @@ jobs:
           shasum -a 256 fx-macos-aarch64.tar.gz > fx-macos-aarch64.tar.gz.sha256
 
       - name: Upload stable release artifact
-        if: inputs.package_release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fx-macos-aarch64
           path: |
             ${{ runner.temp }}/fx-macos-aarch64.tar.gz
             ${{ runner.temp }}/fx-macos-aarch64.tar.gz.sha256
           if-no-files-found: error
-
-      - name: Upload aggregate evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pgso-evidence-macos-arm64-${{ github.sha }}
-          path: ${{ runner.temp }}/fx-pgso-aggregate
-          if-no-files-found: error
-          retention-days: 14

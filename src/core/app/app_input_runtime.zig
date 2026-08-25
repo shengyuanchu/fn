@@ -887,7 +887,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (try routeUpgradeShortcut(app, byte)) return;
-            if (routePickerControlByte(app, byte)) return;
+            if (try routePickerControlByte(app, byte)) return;
 
             if (isComposerEditingByte(byte, raw.composer_shortcut) and
                 !activeCatalogMenuOwnsByte(app, byte) and
@@ -1127,10 +1127,10 @@ pub fn Runtime(comptime App: type) type {
             return .done;
         }
 
-        fn routePickerControlByte(app: *App, byte: u8) bool {
+        fn routePickerControlByte(app: *App, byte: u8) !bool {
             if (!composerPickerSurfaceVisible(app)) return false;
             const delta = pickerControlDelta(byte) orelse return false;
-            if (!routeVisiblePickerMove(app, delta)) return false;
+            if (!try routeVisiblePickerMove(app, delta)) return false;
             app.input_runtime.vertical_navigation.reset();
             app.shell.render_requests.request(.footer);
             return true;

@@ -183,6 +183,20 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
         review_entries.len == 0) return .{};
     const draft_count = review_entries.len;
 
+    const measurement = try input_queue_runtime.measureVisibleReviewRows(
+        app.alloc,
+        &app.queued_prompt_review,
+        .{
+            .input = app.input_runtime.edit_state.input.items,
+            .cursor = app.input_runtime.edit_state.cursor,
+            .terminal_cols = app.shell.layout.cols,
+            .images = app.pending_images.items,
+            .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
+            .image_tokens = app.input_runtime.entities.image_tokens.items,
+            .skill_tokens = app.input_runtime.entities.skill_tokens.items,
+        },
+    );
+
     const cards = try app.alloc.alloc(render_input.QueuedPromptCard, draft_count);
     var built: usize = 0;
     errdefer {
@@ -190,36 +204,15 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
         app.alloc.free(cards);
     }
 
-    const selected_turn_id: ?u64 = blk: {
-        const selected_index = app.queued_prompt_review.selected_index orelse break :blk null;
-        if (selected_index >= review_entries.len) break :blk null;
-        break :blk review_entries[selected_index].draft.turn_id;
-    };
-
-    var total_rows: u16 = 0;
-    var editor_active = false;
     while (built < draft_count) : (built += 1) {
         const draft = review_entries[built].draft;
-        const editing = selected_turn_id != null and draft.turn_id == selected_turn_id.?;
+        const editing = app.queued_prompt_review.selected_index != null and
+            app.queued_prompt_review.selected_index.? == built;
         if (editing) {
-            const source = input_visual_layout.Source{
-                .input = app.input_runtime.edit_state.input.items,
-                .cursor = app.input_runtime.edit_state.cursor,
-                .terminal_cols = app.shell.layout.cols,
-                .images = app.pending_images.items,
-                .pasted_blocks = app.input_runtime.entities.pasted_blocks.items,
-                .image_tokens = app.input_runtime.entities.image_tokens.items,
-                .skill_tokens = app.input_runtime.entities.skill_tokens.items,
-            };
-            const summary = input_visual_layout.summarize(source, null);
-            const row_count: u16 = @intCast(@min(summary.total_rows, std.math.maxInt(u16)));
             cards[built] = .{
                 .bytes = try app.alloc.dupe(u8, ""),
-                .row_count = @max(row_count, 1),
                 .editing = true,
             };
-            total_rows +|= cards[built].row_count;
-            editor_active = true;
             continue;
         }
 
@@ -253,15 +246,14 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
                 .skill_tokens = skill_tokens,
             },
         );
-        const row_count: u16 = @intCast(@min(
-            std.mem.count(u8, bytes, "\n"),
-            std.math.maxInt(u16),
-        ));
-        cards[built] = .{ .bytes = bytes, .row_count = row_count };
-        total_rows +|= row_count;
+        cards[built] = .{ .bytes = bytes };
     }
 
-    return .{ .cards = cards, .row_count = total_rows, .editor_active = editor_active };
+    return .{
+        .cards = cards,
+        .row_count = measurement.card_rows,
+        .editor_active = measurement.editor_active,
+    };
 }
 
 noinline fn approvalScreenNeedsClear(
@@ -1536,7 +1528,7 @@ pub fn Runtime(comptime App: type) type {
                 if (modelMenuActive(app)) return .models_screen;
                 if (sessionMenuActive(app)) return .resume_screen;
                 if (helpMenuActive(app)) return .help_screen;
-                return .skills_screen;
+                if (skillsCatalogMenuActive(app)) return .skills_screen;
             }
 
             if (app.terminal.catalogMenuScreenActive()) {
@@ -2666,6 +2658,13 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        fn skillsCatalogMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "skills")) {
+                return app.skills.menu.active and !app.skills.menu.origin.isMention();
+            }
+            return false;
+        }
+
         fn modelMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "model_cache")) return app.model_cache.menu.active;
             return false;
@@ -2689,7 +2688,7 @@ pub fn Runtime(comptime App: type) type {
         fn catalogMenuActive(app: *const App) bool {
             return settingsMenuActive(app) or
                 helpMenuActive(app) or
-                skillsMenuActive(app) or
+                skillsCatalogMenuActive(app) or
                 modelMenuActive(app) or
                 sessionMenuActive(app);
         }
@@ -4397,9 +4396,11 @@ test "core.app_render_runtime animation retry stays ahead of a newer fact" {
 
 const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
+    queued_count: usize = 0,
+    paused: bool = false,
 
-    fn queuePreview(_: *@This()) struct { count: usize = 0 } {
-        return .{};
+    pub fn queuePreview(self: *@This()) worker_runtime.QueuePreview {
+        return .{ .count = self.queued_count, .paused = self.paused };
     }
 
     pub fn submitPermissionResponse(
@@ -4483,6 +4484,7 @@ const CoordinatorTestApp = struct {
     shell: transcript_runtime.TranscriptRuntime,
     metrics: types.Metrics = .{},
     input_runtime: core_input_runtime.Runtime = .{},
+    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
     approval_screen: interaction_state.ApprovalScreenState = .{},
@@ -4516,6 +4518,7 @@ const CoordinatorTestApp = struct {
 
     fn deinit(self: *CoordinatorTestApp) void {
         self.shell.deinit(self.alloc);
+        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -4531,7 +4534,7 @@ const CoordinatorTestApp = struct {
         return 0;
     }
 
-    fn fileCompletions(
+    pub fn fileCompletions(
         _: *CoordinatorTestApp,
         _: []const u8,
         _: []file_index.SearchResult,
@@ -4540,6 +4543,8 @@ const CoordinatorTestApp = struct {
     ) file_index.SearchError!usize {
         return 0;
     }
+
+    pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
 
     fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
         return self.model_cache_loading;
@@ -4573,6 +4578,19 @@ const CoordinatorTestApp = struct {
         return false;
     }
 };
+
+fn makeCoordinatorReviewEntry(
+    alloc: std.mem.Allocator,
+    turn_id: u64,
+    text: []const u8,
+) !input_queue_runtime.ReviewEntry {
+    return .{ .draft = .{
+        .turn_id = turn_id,
+        .prompt = try alloc.dupe(u8, text),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+}
 
 fn initCoordinatorProjectionTestApp(
     alloc: std.mem.Allocator,
@@ -5187,7 +5205,7 @@ test "core.app_render_runtime first requested startup frame commits through the 
     try std.testing.expectEqual(first_len, try file.length(io_mod.getIo()));
 }
 
-test "core.app_render_runtime active skills menu owns a transcript-free alternate screen" {
+test "core.app_render_runtime mention skills stay inline while command skills retain the catalog screen" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5225,15 +5243,15 @@ test "core.app_render_runtime active skills menu owns a transcript-free alternat
     app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = app.input_runtime.edit_state.input.items.len }, "pure");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "transcript must stay behind the browser\n", true);
+    try app.shell.writeTranscript(alloc, &app.metrics, "transcript stays visible behind the picker\n", true);
 
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "$pure"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
-    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript must stay behind")));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "pure-core"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
         .id = 42,
@@ -5250,7 +5268,7 @@ test "core.app_render_runtime active skills menu owns a transcript-free alternat
     app.approval_prompt.clear(alloc);
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
 
     const options = [_]types.QuestionOption{
@@ -5269,14 +5287,14 @@ test "core.app_render_runtime active skills menu owns a transcript-free alternat
     app.question_prompt.discard(alloc, "test_cleanup");
     app.shell.render_requests.request(.modal);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
 
     try app.shell.writeTranscript(alloc, &app.metrics, "background transcript update\n", true);
     app.shell.render_requests.request(.transcript);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "background transcript update")));
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "background transcript update"));
 
     app.shell.layout = .{
         .rows = 10,
@@ -5290,24 +5308,109 @@ test "core.app_render_runtime active skills menu owns a transcript-free alternat
     app.shell.render_requests.request(.resize);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expectEqual(@as(u16, 48), app.shell.shadow_vt.?.cols);
     try std.testing.expectEqual(@as(u16, 10), app.shell.shadow_vt.?.rows);
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "pure-core"));
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript must stay behind"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "background transcript update"));
+
+    app.skills.openMenu();
+    app.shell.render_requests.request(.footer);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript stays visible")));
+
+    app.skills.closeMenu();
+    app.shell.render_requests.request(.footer);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     var read_offset: u64 = 0;
     const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(terminal_bytes);
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
+}
+
+test "core.app_render_runtime width-changed queued editor keeps mention navigation and render aligned" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "skills-queue-width.log", .{ .read = true });
+    defer file.close(io_mod.getIo());
+
+    const skills = [_]skill_runtime.Skill{
+        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_fx },
+        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_fx },
+        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_fx },
+        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_fx },
+        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_fx },
+        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_fx },
+        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_fx },
+    };
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = file,
+            .layout = .{
+                .rows = 24,
+                .cols = 40,
+                .content_bottom = 20,
+                .divider_top_row = 21,
+                .input_row = 22,
+                .divider_bottom_row = 23,
+                .hint_row = 24,
+            },
+            .owned_top_row = 1,
+            .viewport_top_row = 1,
+        },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    app.skills.items = @constCast(&skills);
+    app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = 1 }, "");
+    try app.input_runtime.textReplacementState().replace(alloc, "$" ++ "x" ** 59);
+
+    const entries = try alloc.alloc(input_queue_runtime.ReviewEntry, 2);
+    entries[0] = try makeCoordinatorReviewEntry(alloc, 1, "stored");
+    entries[1] = try makeCoordinatorReviewEntry(alloc, 2, "selected");
+    app.queued_prompt_review = .{
+        .entries = entries,
+        .selected_index = 1,
+        .reason = .manual,
+        .visible = true,
+    };
+    app.worker.queued_count = 2;
+
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "queue width transcript\n", true);
+    app.shell.render_requests.request(.footer);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    app.shell.layout.cols = 12;
+    const completion = input_completion_runtime.CompletionRuntime(CoordinatorTestApp);
+    try completion.routeModifiedHistory(&app, .down, 1);
+    try completion.routeModifiedHistory(&app, .down, 1);
+    try completion.routeModifiedHistory(&app, .down, 1);
+    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
+
+    app.shell.render_requests.request(.resize);
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+
+    try std.testing.expectEqual(@as(u16, 12), app.shell.shadow_vt.?.cols);
+    try std.testing.expectEqual(@as(usize, 3), app.skills.menu.selected_index);
+    try std.testing.expectEqual(@as(usize, 1), app.skills.menu.window_start);
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "four"));
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 }
 
 test "core.app_render_runtime active setup hub stays on the inline transcript surface" {
@@ -5423,7 +5526,7 @@ test "core.app_render_runtime model catalog survives modal preemption and restor
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
 }
 
-test "core.app_render_runtime file approval returns to the preserved skills catalog" {
+test "core.app_render_runtime file approval returns to the preserved inline skills menu" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5482,11 +5585,11 @@ test "core.app_render_runtime file approval returns to the preserved skills cata
     app.skills.openMenuWithQuery(.dollar, .{ .start = 0, .end = app.input_runtime.edit_state.input.items.len }, "pure");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "transcript behind catalog\n", true);
+    try app.shell.writeTranscript(alloc, &app.metrics, "transcript behind inline skills\n", true);
 
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
 
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, request));
     try std.testing.expect(app.approval_prompt.syncReview(&review));
@@ -5503,16 +5606,17 @@ test "core.app_render_runtime file approval returns to the preserved skills cata
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
 
-    try std.testing.expect(app.terminal.catalogMenuScreenActive());
+    try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
     try std.testing.expectEqualStrings("$pure", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings("pure", app.skills.menu.query());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Skills 1"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind inline skills"));
 
     app.skills.closeMenu();
     app.shell.render_requests.request(.footer);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
     try std.testing.expectEqual(shell_runtime.AlternateScreenOwner.none, app.terminal.alternate_screen_owner);
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind catalog"));
+    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "transcript behind inline skills"));
 }
 
 test "core.app_render_runtime file approvals commit the alternate screen for each request" {

@@ -6023,7 +6023,20 @@ pub const TranscriptRuntime = struct {
         metrics: *Metrics,
         text: []const u8,
     ) !u32 {
-        return transcript_store.streamAssistantChunk(self, alloc, metrics, text);
+        const transcript_was_pending = self.render_requests.hasReason(.transcript);
+        const entry_id = try transcript_store.streamAssistantChunk(self, alloc, metrics, text);
+        if (!transcript_was_pending and
+            self.nativeHistoryActive() and
+            std.mem.findScalar(u8, text, '\n') == null)
+        {
+            self.render_requests.clearReason(.transcript);
+            debug_trace.logf(
+                "scroll",
+                "assistant_partial_paint_deferred bytes={d} entry_id={d}",
+                .{ text.len, entry_id },
+            );
+        }
+        return entry_id;
     }
 
     pub fn retintEntriesForTheme(
@@ -9784,6 +9797,14 @@ pub const TranscriptRuntime = struct {
     pub fn markTranscriptDirty(self: *TranscriptRuntime) void {
         self.transcript_band_dirty = true;
         self.render_requests.request(.transcript);
+    }
+
+    pub fn nativeHistoryActive(self: *const TranscriptRuntime) bool {
+        return switch (self.transcript_commit_state) {
+            .invalid => false,
+            .stable => |anchor| anchor.history_visual_offset > 0,
+            .recovering => |receipt| receipt.accepted_history_visual_offset > 0,
+        };
     }
 
     pub fn markTranscriptContentDirty(self: *TranscriptRuntime) void {

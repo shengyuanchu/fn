@@ -481,11 +481,11 @@ fn prepareTranscriptSourceInternal(
         defer finality_nominations.deinit(alloc);
         const finality_entry_ids = try alloc.alloc(u32, finality_nominations.items.len);
         defer alloc.free(finality_entry_ids);
-        const finality_entry_start_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
-        defer alloc.free(finality_entry_start_bytes);
+        const finality_entry_floor_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
+        defer alloc.free(finality_entry_floor_bytes);
         for (finality_nominations.items, 0..) |nomination, index| {
             finality_entry_ids[index] = nomination.entry_id;
-            finality_entry_start_bytes[index] = null;
+            finality_entry_floor_bytes[index] = null;
         }
         const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
@@ -502,7 +502,7 @@ fn prepareTranscriptSourceInternal(
                 .target_entry_id = tracked_entry_id,
                 .target_byte_entry_id = replaceable_entry_id,
                 .finality_entry_ids = finality_entry_ids,
-                .finality_entry_start_bytes = finality_entry_start_bytes,
+                .finality_entry_floor_bytes = finality_entry_floor_bytes,
                 .omitted_entry_id = omitted_entry_id,
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
@@ -519,22 +519,28 @@ fn prepareTranscriptSourceInternal(
         var tool_turn_floors: std.ArrayList(transcript_release.ToolTurnFloor) = .empty;
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
-            const start_byte = finality_entry_start_bytes[index] orelse blk: {
-                // A nominated entry that produced no bytes cannot anchor the
-                // boundary; hold the whole flow rather than release past it.
+            const floor_byte = finality_entry_floor_bytes[index] orelse blk: {
+                // An empty assistant tail contributes no mutable rendered
+                // bytes, so the complete prepared flow is final. Other empty
+                // nominations remain conservative because their state may
+                // still mutate an earlier rendered entry.
+                const fallback = switch (nomination.kind) {
+                    .assistant_tail => bytes.len,
+                    .mutation_pin, .tool_turn => 0,
+                };
                 debug_trace.logf(
                     "scroll",
-                    "finality_nomination_unrecorded entry_id={d} kind={s}",
-                    .{ nomination.entry_id, @tagName(nomination.kind) },
+                    "finality_nomination_empty entry_id={d} kind={s} fallback={d}",
+                    .{ nomination.entry_id, @tagName(nomination.kind), fallback },
                 );
-                break :blk 0;
+                break :blk fallback;
             };
             switch (nomination.kind) {
-                .mutation_pin => finality.mutation_pin_start = start_byte,
-                .assistant_tail => finality.assistant_tail_start = start_byte,
+                .mutation_pin => finality.mutation_pin_start = floor_byte,
+                .assistant_tail => finality.assistant_tail_start = @min(bytes.len, floor_byte),
                 .tool_turn => try tool_turn_floors.append(alloc, .{
                     .turn_id = nomination.turn_id,
-                    .start_byte = start_byte,
+                    .start_byte = floor_byte,
                 }),
             }
         }

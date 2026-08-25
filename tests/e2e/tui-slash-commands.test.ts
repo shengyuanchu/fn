@@ -1,20 +1,36 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const TMUX_SKIP = !tmuxAvailable();
 const SKIP = TMUX_SKIP || !HAS_API_KEY;
 const TIMEOUT = 30_000;
 
 let session: TmuxSession | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | null = null;
 const tempDirs: string[] = [];
 
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
+  if (gateway) { gateway.stop(); gateway = null; }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -71,6 +87,81 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await session.sendText("/undo");
       const pane = await session.waitForText("Nothing to undo.", 5_000);
       expect(pane).toContain("Nothing to undo.");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/undo refuses an unavailable copy preimage before exposing older history",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-undo-unavailable-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const sourcePath = join(workspace, "source.txt");
+      const olderPath = join(workspace, "older.txt");
+      const destinationPath = join(workspace, "dest.bin");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      writeFileSync(stderrPath, "");
+      writeFileSync(sourcePath, "small source");
+      writeFileSync(destinationPath, Buffer.alloc(10 * 1024 * 1024 + 1, "D"));
+      tempDirs.push(root);
+
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("copy-older", "copy_file", {
+          source: "source.txt",
+          destination: "older.txt",
+          overwrite: true,
+        }),
+        fakeGatewayFinalText("older copy complete"),
+        fakeGatewayToolCall("copy-unavailable", "copy_file", {
+          source: "source.txt",
+          destination: "dest.bin",
+          overwrite: true,
+        }),
+        fakeGatewayFinalText("oversized copy complete"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "undo-e2e-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_PERMISSION_MODE: "yolo",
+        },
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Copy source.txt to older.txt.");
+      await session.waitForText("older copy complete", 10_000);
+      await session.sendText("Copy source.txt over dest.bin.");
+      await session.waitForText("oversized copy complete", 10_000);
+      expect(readFileSync(destinationPath, "utf8")).toBe("small source");
+      expect(existsSync(olderPath)).toBe(true);
+
+      await session.sendText("/undo");
+      await session.waitForText("Could not undo", 5_000);
+      const refused = await session.captureFullScrollback();
+      expect(refused).toContain("Could not undo");
+      expect(refused).toContain("dest.bin");
+      expect(readFileSync(destinationPath, "utf8")).toBe("small source");
+      expect(existsSync(olderPath)).toBe(true);
+
+      await session.sendText("/undo");
+      await session.waitForText("Deleted", 5_000);
+      expect(await session.captureFullScrollback()).toContain("older.txt");
+      expect(existsSync(olderPath)).toBe(false);
+      expect(readFileSync(destinationPath, "utf8")).toBe("small source");
+      expect(await session.waitForComposer(5_000)).toContain("Run /help for commands");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

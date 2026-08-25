@@ -2526,13 +2526,11 @@ test "ACP lifecycle resolves dynamic MCP availability through session context" {
     const mcp_server = &runtime.servers.items[0];
     mcp_server.state = .ready;
     try mcp_server.tool_catalog.tools.append(alloc, .{
-        .server_name = mcp_server.config.name,
         .original_name = try alloc.dupe(u8, "echo"),
         .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
         .description = try alloc.dupe(u8, "Echo input"),
         .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
         .tags = &.{},
-        .search_text = try alloc.dupe(u8, "echo input"),
     });
     state.active_session.?.mcp = runtime;
     runtime_owned = false;

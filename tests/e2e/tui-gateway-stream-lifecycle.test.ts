@@ -7508,6 +7508,35 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
     });
   }
 
+  function sbHistoryText(sessionName: string): string {
+    const historySize = Number.parseInt(
+      execFileSync(
+        "tmux",
+        ["list-panes", "-t", sessionName, "-F", "#{history_size}"],
+        { encoding: "utf8" },
+      ).trim(),
+      10,
+    );
+    if (!Number.isSafeInteger(historySize) || historySize < 0) {
+      throw new Error(`invalid tmux history size: ${historySize}`);
+    }
+    if (historySize === 0) return "";
+    return execFileSync(
+      "tmux",
+      [
+        "capture-pane",
+        "-p",
+        "-t",
+        sessionName,
+        "-S",
+        String(-historySize),
+        "-E",
+        "-1",
+      ],
+      { encoding: "utf8" },
+    );
+  }
+
   test(
     "closed tool groups enter native scrollback before the turn finishes",
     async () => {
@@ -7973,5 +8002,288 @@ describe.skipIf(!tmuxAvailable())("transcript scrollback release", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     SB_TIMEOUT + 60_000,
+  );
+
+  test(
+    "completed streamed UI blocks append without rewriting scrolled history",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-sb-ui-blocks-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "ui-blocks.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), sbSettings());
+      writeFileSync(stderrPath, "");
+
+      const phaseOneRows = Array.from(
+        { length: 48 },
+        (_, index) =>
+          `ANCHOR_PHASE_ONE_${String(index + 1).padStart(2, "0")} finalized row`,
+      );
+      const phaseTwoRows = Array.from(
+        { length: 24 },
+        (_, index) =>
+          `ANCHOR_PHASE_TWO_${String(index + 1).padStart(2, "0")} finalized row`,
+      );
+      const phaseOne = [
+        "# BLOCK_HEADING",
+        "BLOCK_PROSE with **bold**, *italic*, `inline code`, and [BLOCK_LINK](https://example.com).",
+        "",
+        "- BLOCK_BULLET",
+        "  1. BLOCK_NESTED_ORDERED",
+        "- [x] BLOCK_TASK_COMPLETE",
+        "",
+        "> QUOTE_BLOCK_FIRST",
+        "> QUOTE_BLOCK_SECOND",
+        "",
+        "BLOCK_DEFINITION_TERM",
+        ": BLOCK_DEFINITION_BODY",
+        "",
+        "BLOCK_FOOTNOTE_REFERENCE[^1]",
+        "",
+        "[^1]: BLOCK_FOOTNOTE_BODY",
+        "",
+        "BLOCK_BEFORE_RULE",
+        "",
+        "---",
+        "",
+        "BLOCK_AFTER_RULE",
+        "",
+        "```zig",
+        "const BLOCK_CODE_LINE = true;",
+        "```",
+        "",
+        "| BLOCK_TABLE_HEADER | State |",
+        "| --- | --- |",
+        "| row | BLOCK_TABLE_CELL |",
+        "",
+        `BLOCK_WRAPPED_LINE ${"wrapped content ".repeat(12)}`,
+        "",
+        ...phaseOneRows,
+      ].join("\n") + "\n";
+      const phaseTwo = `${phaseTwoRows.join("\n")}\n`;
+
+      let phaseOneResolve!: () => void;
+      const phaseOneSent = new Promise<void>((resolve) => {
+        phaseOneResolve = resolve;
+      });
+      let phaseTwoResolve!: () => void;
+      const phaseTwoSent = new Promise<void>((resolve) => {
+        phaseTwoResolve = resolve;
+      });
+      let releasePhaseTwo!: () => void;
+      const phaseTwoGate = new Promise<void>((resolve) => {
+        releasePhaseTwo = resolve;
+      });
+      let releaseFinish!: () => void;
+      const finishGate = new Promise<void>((resolve) => {
+        releaseFinish = resolve;
+      });
+
+      gateway = startDynamicFakeGateway(
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              async start(controller) {
+                const encoder = new TextEncoder();
+                controller.enqueue(
+                  encoder.encode(
+                    sbSseEvent({ type: "text-start", id: "answer_1" }),
+                  ),
+                );
+                for (const chunk of sbTokenChunks(phaseOne, 17)) {
+                  controller.enqueue(
+                    encoder.encode(
+                      sbSseEvent({
+                        type: "text-delta",
+                        id: "answer_1",
+                        delta: chunk,
+                      }),
+                    ),
+                  );
+                  await Bun.sleep(4);
+                }
+                phaseOneResolve();
+                await phaseTwoGate;
+                for (const chunk of sbTokenChunks(phaseTwo, 13)) {
+                  controller.enqueue(
+                    encoder.encode(
+                      sbSseEvent({
+                        type: "text-delta",
+                        id: "answer_1",
+                        delta: chunk,
+                      }),
+                    ),
+                  );
+                  await Bun.sleep(4);
+                }
+                phaseTwoResolve();
+                await finishGate;
+                controller.enqueue(
+                  encoder.encode(
+                    sbSseEvent({ type: "text-end", id: "answer_1" }),
+                  ),
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    sbSseEvent({
+                      type: "finish",
+                      finishReason: { unified: "stop", raw: "stop" },
+                      usage: {
+                        inputTokens: { total: 3 },
+                        outputTokens: { total: 120 },
+                      },
+                    }),
+                  ),
+                );
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      );
+      const fakeGateway = gateway as ReturnType<typeof startDynamicFakeGateway>;
+
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        width: 100,
+        height: 24,
+        minimumHistoryLines: 10_000,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-sb-ui-blocks-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      try {
+        await session.waitForComposer(SB_TIMEOUT);
+        await session.sendText("Render every prepared UI block.");
+        await phaseOneSent;
+        await session.waitForText("ANCHOR_PHASE_ONE_47", SB_TIMEOUT);
+        await Bun.sleep(500);
+
+        const phaseOneHistory = sbHistoryText(session.name);
+        expect(phaseOneHistory).toContain("ANCHOR_PHASE_ONE_01");
+        expect(phaseOneHistory).toContain("BLOCK_HEADING");
+        expect(phaseOneHistory).toContain("BLOCK_CODE_LINE");
+        expect(phaseOneHistory).toContain("BLOCK_TABLE_CELL");
+        expect(phaseOneHistory).toContain("• BLOCK_BULLET");
+        expect(phaseOneHistory).toContain("✓ BLOCK_TASK_COMPLETE");
+        expect(phaseOneHistory).toContain("│ QUOTE_BLOCK_FIRST");
+        expect(phaseOneHistory).toContain("┌ zig ");
+        expect(phaseOneHistory).toContain("┬");
+        expect(phaseOneHistory).toContain("┼");
+        expect(phaseOneHistory).toContain("┴");
+        const beforeRule = phaseOneHistory.indexOf("BLOCK_BEFORE_RULE");
+        const afterRule = phaseOneHistory.indexOf("BLOCK_AFTER_RULE");
+        expect(beforeRule).toBeGreaterThanOrEqual(0);
+        expect(afterRule).toBeGreaterThan(beforeRule);
+        expect(phaseOneHistory.slice(beforeRule, afterRule)).toContain("─");
+
+        execFileSync("tmux", ["copy-mode", "-t", session.name]);
+        execFileSync("tmux", [
+          "send-keys",
+          "-t",
+          session.name,
+          "-X",
+          "history-top",
+        ]);
+        await Bun.sleep(100);
+        const historyBeforePhaseTwo = phaseOneHistory;
+
+        releasePhaseTwo();
+        await phaseTwoSent;
+        await session.waitForText("ANCHOR_PHASE_TWO_23", SB_TIMEOUT);
+        await Bun.sleep(500);
+        const historyAfterPhaseTwo = sbHistoryText(session.name);
+        expect(historyAfterPhaseTwo.length).toBeGreaterThan(
+          historyBeforePhaseTwo.length,
+        );
+        expect(historyAfterPhaseTwo.startsWith(historyBeforePhaseTwo)).toBe(
+          true,
+        );
+        expect(historyAfterPhaseTwo).toContain("ANCHOR_PHASE_TWO_01");
+
+        execFileSync("tmux", [
+          "send-keys",
+          "-t",
+          session.name,
+          "-X",
+          "cancel",
+        ]);
+        releaseFinish();
+        await session.waitForPane(hasEmptyComposer, SB_TIMEOUT);
+        await Bun.sleep(250);
+
+        const scrollback = await session.captureFullScrollback();
+        const orderedMarkers = [
+          "BLOCK_HEADING",
+          "BLOCK_PROSE",
+          "BLOCK_LINK",
+          "BLOCK_BULLET",
+          "BLOCK_NESTED_ORDERED",
+          "BLOCK_TASK_COMPLETE",
+          "QUOTE_BLOCK_FIRST",
+          "QUOTE_BLOCK_SECOND",
+          "BLOCK_DEFINITION_TERM",
+          "BLOCK_DEFINITION_BODY",
+          "BLOCK_FOOTNOTE_REFERENCE",
+          "BLOCK_BEFORE_RULE",
+          "BLOCK_AFTER_RULE",
+          "BLOCK_CODE_LINE",
+          "BLOCK_TABLE_HEADER",
+          "BLOCK_TABLE_CELL",
+          "BLOCK_WRAPPED_LINE",
+          "ANCHOR_PHASE_ONE_01",
+          "ANCHOR_PHASE_ONE_48",
+          "ANCHOR_PHASE_TWO_01",
+          "ANCHOR_PHASE_TWO_24",
+        ];
+        let previous = -1;
+        for (const marker of orderedMarkers) {
+          expect(countOccurrences(scrollback, marker), marker).toBe(1);
+          const index = scrollback.indexOf(marker);
+          expect(index, marker).toBeGreaterThan(previous);
+          previous = index;
+        }
+        expect(countOccurrences(scrollback, "BLOCK_FOOTNOTE_BODY")).toBe(1);
+        expect(existsSync(tapePath)).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        session = undefined;
+
+        const replay = JSON.parse(
+          execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
+            encoding: "utf8",
+          }),
+        ) as { frame_count: number; stdout_bytes: number };
+        expect(replay.frame_count).toBeGreaterThan(0);
+        expect(replay.stdout_bytes).toBeGreaterThan(0);
+        const goldenPath = join(root, "ui-blocks-golden.txt");
+        execFileSync(FX_BIN, ["replay", tapePath, "--golden", goldenPath]);
+        expect(readFileSync(goldenPath, "utf8")).toContain(
+          "ANCHOR_PHASE_TWO_24",
+        );
+      } finally {
+        releasePhaseTwo();
+        releaseFinish();
+      }
+    },
+    SB_TIMEOUT + 30_000,
   );
 });

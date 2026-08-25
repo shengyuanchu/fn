@@ -904,16 +904,12 @@ fn appendTestMcpTool(runtime: *mcp_runtime.McpRuntime, server_index: usize, name
     errdefer alloc.free(tags);
     tags[0] = try alloc.dupe(u8, "test");
     errdefer alloc.free(tags[0]);
-    const search_text = try std.ascii.allocLowerString(alloc, name);
-    errdefer alloc.free(search_text);
     try runtime.servers.items[server_index].tool_catalog.tools.append(alloc, .{
-        .server_name = runtime.servers.items[server_index].config.name,
         .original_name = try alloc.dupe(u8, name),
         .prefixed_name = try alloc.dupe(u8, name),
         .description = description,
         .input_schema_json = input_schema,
         .tags = tags,
-        .search_text = search_text,
     });
 }
 
